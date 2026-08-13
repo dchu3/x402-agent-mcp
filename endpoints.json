@@ -20,17 +20,6 @@
       }
     },
     {
-      "name": "Tavily",
-      "description": "Real-time web search for AI agents — no API key needed",
-      "base_url": "https://api.tavily.com",
-      "chain": "base",
-      "category": "search",
-      "tags": ["news", "web", "search", "research"],
-      "endpoints": [
-        { "path": "/search", "method": "POST", "price_usdc": "0.001", "description": "Web search" }
-      ]
-    },
-    {
       "name": "2s.io",
       "description": "575+ pay-per-call endpoints — news, weather, data, AI gateway, storage",
       "base_url": "https://2s.io",
