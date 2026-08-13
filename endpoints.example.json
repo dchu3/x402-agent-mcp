@@ -1,0 +1,18 @@
+{
+  "endpoints": [],
+  "categories": [
+    "analysis",
+    "search",
+    "social",
+    "news",
+    "weather",
+    "travel",
+    "ai",
+    "media",
+    "blockchain",
+    "multi",
+    "storage",
+    "compute"
+  ],
+  "last_updated": "2026-08-13"
+}
