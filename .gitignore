@@ -4,3 +4,4 @@ dist/
 *.jsonl
 .DS_Store
 x402-payments.jsonl
+endpoints.json
