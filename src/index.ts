@@ -7,10 +7,11 @@ import { registerListCategoriesTool } from "./tools/categories.js";
 import { registerDiscoverUrlTool } from "./tools/discover-url.js";
 import { registerHealthCheckTool } from "./tools/health.js";
 import { registerBatchDiscoverTool } from "./tools/batch-discover.js";
+import { registerCrawlX402ScanTool } from "./tools/crawl-directory.js";
 
 const server = new McpServer({
   name: "x402-agent-mcp",
-  version: "1.2.0",
+  version: "1.3.0",
 });
 
 // Register tools
@@ -20,6 +21,7 @@ registerDescribeTool(server);
 registerDiscoverUrlTool(server);
 registerHealthCheckTool(server);
 registerBatchDiscoverTool(server);
+registerCrawlX402ScanTool(server);
 registerFetchTool(server);
 
 // Start server

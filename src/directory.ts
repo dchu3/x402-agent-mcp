@@ -32,9 +32,8 @@ let cachedDirectory: EndpointDirectory | null = null;
 export function loadDirectory(): EndpointDirectory {
   if (cachedDirectory) return cachedDirectory;
   const possiblePaths = [
-    join(__dirname, "..", "..", "endpoints.json"),
-    join(__dirname, "..", "endpoints.json"),
-    join(process.cwd(), "endpoints.json"),
+    join(__dirname, "..", "endpoints.json"),       // from dist/ → project root
+    join(process.cwd(), "endpoints.json"),          // from project root
     "/home/derekchudley/projects/x402-agent-mcp/endpoints.json",
   ];
   for (const p of possiblePaths) {
@@ -67,9 +66,8 @@ export function addToDirectory(entry: EndpointEntry): boolean {
 
   // Write back to file
   const possiblePaths = [
-    join(__dirname, "..", "..", "endpoints.json"),
-    join(__dirname, "..", "endpoints.json"),
-    join(process.cwd(), "endpoints.json"),
+    join(__dirname, "..", "endpoints.json"),       // from dist/ → project root
+    join(process.cwd(), "endpoints.json"),          // from project root
     "/home/derekchudley/projects/x402-agent-mcp/endpoints.json",
   ];
   for (const p of possiblePaths) {
