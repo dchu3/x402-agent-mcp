@@ -31,17 +31,42 @@ let cachedDirectory: EndpointDirectory | null = null;
 
 export function loadDirectory(): EndpointDirectory {
   if (cachedDirectory) return cachedDirectory;
-  const possiblePaths = [
-    join(__dirname, "..", "endpoints.json"),              // live directory (gitignored)
-    join(process.cwd(), "endpoints.json"),                 // from project root
+  // Try live file first, then template
+  const livePaths = [
+    join(__dirname, "..", "endpoints.json"),
+    join(process.cwd(), "endpoints.json"),
     "/home/derekchudley/projects/x402-agent-mcp/endpoints.json",
-    join(__dirname, "..", "endpoints.example.json"),       // template (shipped)
-    join(process.cwd(), "endpoints.example.json"),         // template from project root
   ];
-  for (const p of possiblePaths) {
+  const templatePaths = [
+    join(__dirname, "..", "endpoints.example.json"),
+    join(process.cwd(), "endpoints.example.json"),
+  ];
+
+  // Try live file first
+  for (const p of livePaths) {
     try {
       const raw = readFileSync(p, "utf-8");
       cachedDirectory = JSON.parse(raw) as EndpointDirectory;
+      return cachedDirectory;
+    } catch {
+      continue;
+    }
+  }
+
+  // Fall back to template, then copy it to live file
+  for (const p of templatePaths) {
+    try {
+      const raw = readFileSync(p, "utf-8");
+      cachedDirectory = JSON.parse(raw) as EndpointDirectory;
+      // Create live file from template so future writes go to the right place
+      for (const lp of livePaths) {
+        try {
+          writeFileSync(lp, raw, "utf-8");
+          break;
+        } catch {
+          continue;
+        }
+      }
       return cachedDirectory;
     } catch {
       continue;
