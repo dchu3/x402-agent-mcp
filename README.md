@@ -183,6 +183,55 @@ cp endpoints.example.json endpoints.json
 # Then run x402_crawl_directory to populate
 ```
 
+## Automated Directory Refresh
+
+The endpoint directory stays fresh by running `x402_crawl_directory` on a schedule. Here's how to set it up in popular agent frameworks:
+
+### Hermes Agent (cron job)
+
+Hermes supports scheduled cron jobs that can run the crawler automatically:
+
+```bash
+# Create a weekly cron job (every Monday at 03:00 UTC)
+hermes cron create \
+  --name "x402 Crawl Directory" \
+  --schedule "0 3 * * 1" \
+  --toolsets terminal \
+  --deliver local \
+  --prompt 'Run the x402-agent-mcp crawler to discover new endpoints from x402scan.com:
+
+cd /path/to/x402-agent-mcp && echo "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"hermes-cron\",\"version\":\"1.0\"}}}
+{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}
+{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"x402_crawl_directory\",\"arguments\":{\"max_results\":20}}}" | timeout 120 node dist/index.js 2>/dev/null | tail -1
+
+Parse the JSON response and report how many new services were added. If none found, say "No new x402 endpoints discovered this week."'
+```
+
+The `--deliver local` flag keeps the cron job silent (no chat messages) — it just updates `endpoints.json` in the background.
+
+### Other Agents (crontab)
+
+For agents without built-in scheduling, use system crontab:
+
+```bash
+# Add to crontab — runs every Monday at 03:00
+crontab -e
+
+# Add this line:
+0 3 * * 1 cd /path/to/x402-agent-mcp && echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"cron","version":"1.0"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"x402_crawl_directory","arguments":{"max_results":20}}}' | timeout 120 node dist/index.js >> /var/log/x402-crawl.log 2>&1
+```
+
+### Custom Scripts
+
+The crawler can also be called programmatically:
+
+```javascript
+import { registerCrawlX402ScanTool } from "./tools/crawl-directory.js";
+// Or call the MCP via stdio — see usage examples above
+```
+
 ## Disclaimer
 
 **This software is experimental and provided "as is", without warranty of any kind. Use at your own risk.**
