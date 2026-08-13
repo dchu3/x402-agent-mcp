@@ -8,20 +8,24 @@ Agents discover services, pay per call in USDC, and consume data — all autonom
 
 ```
 Agent: "I need news data"
-  → x402_search("news") → finds Tavily, 2s.io, glim.sh
-  → x402_describe("Tavily") → gets endpoint schema + price
-  → x402_fetch("https://api.tavily.com/search", "POST", body) → pays $0.001 USDC → gets results
+  → x402_search("news") → finds 2s.io
+  → x402_describe("2s.io") → gets endpoint schema + price
+  → x402_fetch("https://2s.io/api/news/search?q=x402&limit=3") → pays $0.003 USDC → gets results
 ```
 
-The agent never sees wallets, private keys, or x402 protocol details. Just search, describe, fetch.
+The agent never sees wallets, private keys, or x402 protocol details. Just search, discover, fetch.
 
-## Tools
+## Tools (8)
 
 | Tool | Cost | Description |
 |------|------|-------------|
 | `x402_search` | Free | Search x402 endpoints by keyword, category, or chain |
 | `x402_list_categories` | Free | List all endpoint categories with counts |
 | `x402_describe` | Free | Get detailed info for a specific service (paths, prices, schema) |
+| `x402_discover_url` | Free | Discover any x402 service by URL via well-known files + auto-add to directory |
+| `x402_health` | Free | Check if a service is live and responding with 402 |
+| `x402_discover_urls` | Free | Batch discover multiple x402 services in parallel |
+| `x402_crawl_directory` | Free | Crawl x402scan.com to discover new x402 services and auto-add to directory |
 | `x402_fetch` | Endpoint price | Fetch any x402 endpoint — handles 402 payment on Base or Solana |
 
 ## Multi-Chain Support
@@ -32,6 +36,16 @@ The agent never sees wallets, private keys, or x402 protocol details. Just searc
 | Base | `EVM_PRIVATE_KEY` or `BASE_PRIVATE_KEY` | USDC via @x402/evm |
 
 Chain is auto-detected from the 402 response. Override with `chain` parameter.
+
+## Spending Limits & Payment Logging
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `MAX_PAYMENT_PER_CALL` | 0.50 | Reject any single call above this amount (USDC) |
+| `MAX_DAILY_SPEND` | 10.00 | Reject after cumulative daily spend exceeded (USDC) |
+| `PAYMENT_LOG_PATH` | ./x402-payments.jsonl | Path to payment log file (gitignored) |
+
+Payments are logged to `x402-payments.jsonl` with timestamp, URL, chain, amount, tx hash, and status. Daily spend resets at UTC midnight.
 
 ## Quick Start
 
@@ -52,6 +66,8 @@ SOLANA_PRIVATE_KEY=your-base58-solana-key
 EVM_PRIVATE_KEY=your-hex-base-key
 SOLANA_RPC_URL=https://mainnet.helius-rpc.com/?api-key=your-key
 BASE_RPC_URL=https://mainnet.base.org
+MAX_PAYMENT_PER_CALL=0.50
+MAX_DAILY_SPEND=10.00
 ```
 
 You only need the key for chains you want to pay on. Solana-only? Just set `SOLANA_PRIVATE_KEY`.
@@ -109,10 +125,29 @@ x402_search({ category: "social" })
 x402_search({ chain: "solana" })
 ```
 
-### Describe a service
+### Discover a service by URL
 
 ```
-x402_describe({ name: "svm402" })
+x402_discover_url({ url: "https://svm402.com" })
+```
+
+### Batch discover multiple URLs
+
+```
+x402_discover_urls({ urls: ["https://svm402.com", "https://2s.io"] })
+```
+
+### Crawl x402scan for new services
+
+```
+x402_crawl_directory({ max_results: 20 })
+```
+
+### Check if a service is live
+
+```
+x402_health({ name: "svm402" })
+x402_health({ url: "https://svm402.com" })
 ```
 
 ### Fetch an x402 endpoint
@@ -127,26 +162,20 @@ x402_fetch({
 
 ```
 x402_fetch({
-  url: "https://api.tavily.com/search",
-  method: "POST",
-  body: '{"query": "latest AI news"}',
-  chain: "base"
+  url: "https://2s.io/api/news/search?q=x402&limit=3",
+  chain: "solana"
 })
 ```
 
 ## Endpoint Directory
 
-The `endpoints.json` file contains known x402 endpoints. To add a new service:
+The `endpoints.json` file contains known x402 endpoints. The directory is self-expanding:
 
-1. Edit `endpoints.json`
-2. Add your service with name, description, base_url, chain, category, tags, and endpoints
-3. Submit a PR
+- `x402_discover_url` auto-adds new services when discovered
+- `x402_crawl_directory` scrapes x402scan.com for new services
+- Only true x402 endpoints (no API keys) are included
 
-## Safety
-
-- Spending limits via env vars: `MAX_PAYMENT_PER_CALL` (default: $0.50), `MAX_DAILY_SPEND` (default: $10.00)
-- Payment logging to `x402-payments.jsonl`
-- Private keys never exposed to the agent — MCP handles payment internally
+To manually add a service, edit `endpoints.json` and submit a PR.
 
 ## Disclaimer
 
@@ -160,8 +189,8 @@ This software initiates real cryptocurrency transactions that are irreversible.
 - [@x402/fetch](https://www.npmjs.com/package/@x402/fetch) — x402 payment handling
 - [@x402/svm](https://www.npmjs.com/package/@x402/svm) — Solana x402 scheme
 - [@x402/evm](https://www.npmjs.com/package/@x402/evm) — Base/EVM x402 scheme
-- [@solana/web3.js](https://github.com/solana-labs/solana-web3.js) — Solana SDK
-- [ethers](https://github.com/ethers-io/ethers.js) — EVM SDK
+- [viem](https://viem.sh) — EVM account signing
+- [@solana/kit](https://github.com/solana-labs/solana-kit) — Solana SDK
 
 ## License
 
