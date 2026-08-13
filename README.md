@@ -169,13 +169,19 @@ x402_fetch({
 
 ## Endpoint Directory
 
-The `endpoints.json` file contains known x402 endpoints. The directory is self-expanding:
+The `endpoints.json` file contains known x402 endpoints. It is **gitignored** — each installation builds its own directory.
 
+- `endpoints.example.json` is shipped as a template (empty, with categories)
+- On first run, the MCP loads the template and populates from there
 - `x402_discover_url` auto-adds new services when discovered
 - `x402_crawl_directory` scrapes x402scan.com for new services
 - Only true x402 endpoints (no API keys) are included
 
-To manually add a service, edit `endpoints.json` and submit a PR.
+To bootstrap a fresh install:
+```bash
+cp endpoints.example.json endpoints.json
+# Then run x402_crawl_directory to populate
+```
 
 ## Disclaimer
 

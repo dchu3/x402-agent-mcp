@@ -32,9 +32,11 @@ let cachedDirectory: EndpointDirectory | null = null;
 export function loadDirectory(): EndpointDirectory {
   if (cachedDirectory) return cachedDirectory;
   const possiblePaths = [
-    join(__dirname, "..", "endpoints.json"),       // from dist/ → project root
-    join(process.cwd(), "endpoints.json"),          // from project root
+    join(__dirname, "..", "endpoints.json"),              // live directory (gitignored)
+    join(process.cwd(), "endpoints.json"),                 // from project root
     "/home/derekchudley/projects/x402-agent-mcp/endpoints.json",
+    join(__dirname, "..", "endpoints.example.json"),       // template (shipped)
+    join(process.cwd(), "endpoints.example.json"),         // template from project root
   ];
   for (const p of possiblePaths) {
     try {
