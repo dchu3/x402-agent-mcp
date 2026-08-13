@@ -5,10 +5,12 @@ import { registerFetchTool } from "./tools/fetch.js";
 import { registerDescribeTool } from "./tools/describe.js";
 import { registerListCategoriesTool } from "./tools/categories.js";
 import { registerDiscoverUrlTool } from "./tools/discover-url.js";
+import { registerHealthCheckTool } from "./tools/health.js";
+import { registerBatchDiscoverTool } from "./tools/batch-discover.js";
 
 const server = new McpServer({
   name: "x402-agent-mcp",
-  version: "1.1.0",
+  version: "1.2.0",
 });
 
 // Register tools
@@ -16,6 +18,8 @@ registerSearchTool(server);
 registerListCategoriesTool(server);
 registerDescribeTool(server);
 registerDiscoverUrlTool(server);
+registerHealthCheckTool(server);
+registerBatchDiscoverTool(server);
 registerFetchTool(server);
 
 // Start server
