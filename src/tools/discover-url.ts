@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { addToDirectory } from "../directory.js";
 
 interface WellKnownX402 {
   x402Version?: number;
@@ -212,6 +213,30 @@ export function registerDiscoverUrlTool(server: McpServer): void {
         discovered_at: new Date().toISOString(),
         errors: errors.length > 0 ? errors : undefined,
       };
+
+      // Auto-add to directory if service info was found
+      if (serviceInfo && serviceInfo.name) {
+        try {
+          addToDirectory({
+            name: serviceInfo.name,
+            description: serviceInfo.description || "",
+            base_url: baseUrl,
+            chain: chains[0] || "unknown",
+            category: serviceInfo.category || "other",
+            tags: serviceInfo.tags || [],
+            endpoints: (serviceInfo.endpoints || []).map((e: any) => ({
+              path: e.path,
+              method: e.method || "GET",
+              price_usdc: e.price_usdc || "",
+              description: e.description || "",
+            })),
+          });
+        } catch (err) {
+          // Best-effort — don't fail discovery if directory update fails
+          if (!result.errors) result.errors = [];
+          result.errors.push(`Auto-add to directory failed: ${err}`);
+        }
+      }
 
       return {
         content: [{
