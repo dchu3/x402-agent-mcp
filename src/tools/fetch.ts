@@ -6,6 +6,7 @@ import { ExactEvmScheme, toClientEvmSigner } from "@x402/evm";
 import { createKeyPairSignerFromBytes } from "@solana/kit";
 import bs58 from "bs58";
 import { privateKeyToAccount } from "viem/accounts";
+import { checkSpendingLimit, logPayment, getDailySpent, getMaxPerCall, getMaxDailySpend } from "../payment-utils.js";
 
 export function registerFetchTool(server: McpServer): void {
   server.tool(
@@ -28,6 +29,7 @@ export function registerFetchTool(server: McpServer): void {
 
       // Step 1: Probe to detect chain from 402 response
       let useChain = (args.chain || "").toLowerCase();
+      let probedAmountUsdc = 0; // captured from 402 response
 
       if (!useChain) {
         try {
@@ -56,6 +58,11 @@ export function registerFetchTool(server: McpServer): void {
           const accepts = paymentInfo.accepts || paymentInfo.accept || [];
           const firstAccept = Array.isArray(accepts) ? accepts[0] : accepts;
           const network = firstAccept?.network || "";
+
+          // Capture amount for spending limit check
+          if (firstAccept?.amount) {
+            probedAmountUsdc = Number(firstAccept.amount) / 1e6;
+          }
 
           if (network.includes("solana") || network.includes("5eykt4")) {
             useChain = "solana";
@@ -118,6 +125,27 @@ export function registerFetchTool(server: McpServer): void {
           client.register("eip155:8453" as `${string}:${string}`, scheme);
         }
 
+        // Step 3.5: Check spending limits before paying
+        const amountUsdc = probedAmountUsdc || 0.01; // use probed amount or default estimate
+
+        const limitCheck = checkSpendingLimit(amountUsdc);
+        if (!limitCheck.allowed) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                error: `Spending limit exceeded: ${limitCheck.reason}`,
+                url,
+                chain: useChain,
+                estimated_cost_usdc: amountUsdc,
+                daily_spent_usdc: getDailySpent(),
+                max_per_call: getMaxPerCall(),
+                max_daily: getMaxDailySpend(),
+              }),
+            }],
+          };
+        }
+
         // Step 4: Make the paid request
         const paidFetch = wrapFetchWithPayment(fetch, client);
         const resp = await paidFetch(url, {
@@ -136,6 +164,32 @@ export function registerFetchTool(server: McpServer): void {
 
         const paymentResponse = resp.headers.get("x-payment-response");
 
+        // Log the payment
+        let txHash: string | undefined;
+        if (paymentResponse) {
+          try {
+            const receipt = JSON.parse(Buffer.from(paymentResponse, "base64").toString());
+            txHash = receipt.settlement?.txHash || receipt.transactionHash || receipt.txHash;
+          } catch {}
+        }
+
+        // Extract actual cost from response body if available
+        let actualCost = amountUsdc;
+        if (bodyResult && typeof bodyResult === "object") {
+          const meta = (bodyResult as any).meta;
+          if (meta?.cost?.usd) actualCost = meta.cost.usd;
+        }
+
+        logPayment({
+          timestamp: new Date().toISOString(),
+          url,
+          method,
+          chain: useChain,
+          amount_usdc: actualCost,
+          tx_hash: txHash,
+          status: resp.status === 200 ? "success" : "failed",
+        });
+
         return {
           content: [{
             type: "text" as const,
@@ -144,12 +198,25 @@ export function registerFetchTool(server: McpServer): void {
               url,
               chain: useChain,
               paid: resp.status === 200,
+              cost_usdc: actualCost,
+              daily_spent_usdc: parseFloat(getDailySpent().toFixed(4)),
               payment_receipt: paymentResponse || null,
               body: bodyResult,
             }),
           }],
         };
       } catch (err: any) {
+        // Log failed payment attempt
+        logPayment({
+          timestamp: new Date().toISOString(),
+          url,
+          method,
+          chain: useChain,
+          amount_usdc: 0,
+          status: "failed",
+          error: err.message,
+        });
+
         return {
           content: [{
             type: "text" as const,
