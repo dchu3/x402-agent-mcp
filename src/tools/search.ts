@@ -9,7 +9,7 @@ export function registerSearchTool(server: McpServer): void {
     {
       query: z.string().optional().describe("Search keyword (matches name, description, tags)"),
       category: z.string().optional().describe("Filter by category: analysis, search, social, news, travel, ai, media, blockchain, multi"),
-      chain: z.string().optional().describe("Filter by chain: base, solana"),
+      chain: z.string().optional().describe("Filter by chain: base, solana, casper"),
     },
     async (args) => {
       const dir = loadDirectory();

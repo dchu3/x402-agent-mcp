@@ -1,8 +1,8 @@
 # x402-agent-mcp
 
-**Universal x402 MCP for AI agents — discover and pay for any x402 endpoint on Base or Solana.**
+**Universal x402 MCP for AI agents — discover and pay for any x402 endpoint on Base, Solana or Casper.**
 
-Agents discover services, pay per call in USDC, and consume data — all autonomously. No API keys, no subscriptions, no signup. Just a wallet.
+Agents discover services, pay per call, and consume data — all autonomously. No API keys, no subscriptions, no signup. Just a wallet.
 
 ## What It Does
 
@@ -26,7 +26,7 @@ The agent never sees wallets, private keys, or x402 protocol details. Just searc
 | `x402_health` | Free | Check if a service is live and responding with 402 |
 | `x402_discover_urls` | Free | Batch discover multiple x402 services in parallel |
 | `x402_crawl_directory` | Free | Crawl x402scan.com to discover new x402 services and auto-add to directory |
-| `x402_fetch` | Endpoint price | Fetch any x402 endpoint — handles 402 payment on Base or Solana |
+| `x402_fetch` | Endpoint price | Fetch any x402 endpoint — handles 402 payment on Base, Solana or Casper |
 
 ## Multi-Chain Support
 
@@ -34,8 +34,25 @@ The agent never sees wallets, private keys, or x402 protocol details. Just searc
 |-------|---------|---------|
 | Solana | `SOLANA_PRIVATE_KEY` | USDC via @x402/svm |
 | Base | `EVM_PRIVATE_KEY` or `BASE_PRIVATE_KEY` | USDC via @x402/evm |
+| Casper | `CASPER_PRIVATE_KEY` | wCSPR via @make-software/casper-x402 |
 
 Chain is auto-detected from the 402 response. Override with `chain` parameter.
+
+### Casper
+
+Casper endpoints advertise CAIP-2 networks `casper:casper` (mainnet) and `casper:casper-test` (testnet), and settle in **wCSPR**, a CEP-18 token with 9 decimals (motes). Amounts are handled as exact integer motes — a requirement with sub-mote precision is rejected rather than rounded.
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `CASPER_PRIVATE_KEY` | — | Hex secret key, PEM file path, or PEM contents |
+| `CASPER_KEY_ALGORITHM` | ed25519 | `ed25519` or `secp256k1` |
+| `CASPER_NETWORK` | auto | Force `casper:casper` or `casper:casper-test` when a server offers both |
+| `CASPER_FACILITATOR_URL` | https://x402-facilitator.cspr.cloud | Facilitator base URL (`/verify`, `/settle`, `/supported`) |
+| `CASPER_FACILITATOR_API_KEY` | — | Sent as the `Authorization` header when the facilitator requires one |
+
+```
+x402_fetch({ url: "https://some-casper-endpoint.example/api", chain: "casper" })
+```
 
 ## Spending Limits & Payment Logging
 
@@ -64,6 +81,7 @@ npm run build
 # .env
 SOLANA_PRIVATE_KEY=your-base58-solana-key
 EVM_PRIVATE_KEY=your-hex-base-key
+CASPER_PRIVATE_KEY=your-hex-casper-key-or-pem-path
 SOLANA_RPC_URL=https://mainnet.helius-rpc.com/?api-key=your-key
 BASE_RPC_URL=https://mainnet.base.org
 MAX_PAYMENT_PER_CALL=0.50
@@ -244,8 +262,10 @@ This software initiates real cryptocurrency transactions that are irreversible.
 - [@x402/fetch](https://www.npmjs.com/package/@x402/fetch) — x402 payment handling
 - [@x402/svm](https://www.npmjs.com/package/@x402/svm) — Solana x402 scheme
 - [@x402/evm](https://www.npmjs.com/package/@x402/evm) — Base/EVM x402 scheme
+- [@make-software/casper-x402](https://www.npmjs.com/package/@make-software/casper-x402) — Casper x402 scheme
 - [viem](https://viem.sh) — EVM account signing
 - [@solana/kit](https://github.com/solana-labs/solana-kit) — Solana SDK
+- [casper-js-sdk](https://github.com/casper-ecosystem/casper-js-sdk) — Casper SDK
 
 ## License
 
@@ -256,3 +276,4 @@ MIT
 - [x402 Protocol](https://x402.org) — Payment standard
 - [x402scan](https://x402scan.com) — Endpoint explorer
 - [MCP Protocol](https://modelcontextprotocol.io) — Agent tool protocol
+- [Casper x402 docs](https://docs.cspr.cloud) — Casper facilitator and integration docs
