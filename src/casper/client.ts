@@ -1,8 +1,12 @@
-import { ExactCasperScheme } from "@make-software/casper-x402";
-import { toClientCasperSigner } from "@make-software/casper-x402";
-import { KeyAlgorithm, PrivateKey } from "casper-js-sdk";
+import { ExactCasperScheme, toClientCasperSigner } from "@make-software/casper-x402";
+// casper-js-sdk ships CommonJS — import the default export so the compiled ESM
+// output resolves KeyAlgorithm/PrivateKey at runtime as well as at type time.
+import casperSdk from "casper-js-sdk";
+import type { KeyAlgorithm as KeyAlgorithmType, PrivateKey as PrivateKeyType } from "casper-js-sdk";
 import { readFileSync } from "fs";
 import { CASPER_MAINNET_CAIP2, toCasperCaip2 } from "./networks.js";
+
+const { KeyAlgorithm, PrivateKey } = casperSdk;
 
 /**
  * Loads the Casper payer key and registers the exact-scheme client on an
@@ -15,7 +19,7 @@ import { CASPER_MAINNET_CAIP2, toCasperCaip2 } from "./networks.js";
 
 export type CasperKeyAlgorithm = "ed25519" | "secp256k1";
 
-export function getCasperKeyAlgorithm(): KeyAlgorithm {
+export function getCasperKeyAlgorithm(): KeyAlgorithmType {
   const raw = (process.env.CASPER_KEY_ALGORITHM || "ed25519").toLowerCase().replace(/[-_]/g, "");
   if (raw === "secp256k1") return KeyAlgorithm.SECP256K1;
   if (raw === "ed25519") return KeyAlgorithm.ED25519;
@@ -32,7 +36,10 @@ export function classifyCasperKey(value: string): "pem" | "pem-path" | "hex" {
   throw new Error("CASPER_PRIVATE_KEY must be a hex secret key, a PEM file path, or PEM contents");
 }
 
-export function loadCasperPrivateKey(value: string, algorithm: KeyAlgorithm = getCasperKeyAlgorithm()): PrivateKey {
+export function loadCasperPrivateKey(
+  value: string,
+  algorithm: KeyAlgorithmType = getCasperKeyAlgorithm(),
+): PrivateKeyType {
   const trimmed = value.trim();
   switch (classifyCasperKey(trimmed)) {
     case "hex":
