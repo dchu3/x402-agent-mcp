@@ -6,9 +6,10 @@ import { ExactEvmScheme, toClientEvmSigner } from "@x402/evm";
 import { createKeyPairSignerFromBytes } from "@solana/kit";
 import bs58 from "bs58";
 import { privateKeyToAccount } from "viem/accounts";
-import { registerCasperScheme } from "../casper/client.js";
-import { selectCasperAccept, assertPayableCasperAccept } from "../casper/accepts.js";
-import { CASPER_CHAIN, isCasperNetwork, motesToCspr, parseMaxAmountRequired, toCasperCaip2 } from "../casper/networks.js";
+import { fetchCasper, boundedText } from "./casper-fetch.js";
+import { casperBudget } from "../casper/budget.js";
+import { selectCasperAccept, assertPayableCasperAccept, casperAmountMotes } from "../casper/accepts.js";
+import { CASPER_CHAIN, isCasperNetwork, toCasperCaip2 } from "../casper/networks.js";
 import { checkSpendingLimit, logPayment, getDailySpent, getMaxPerCall, getMaxDailySpend } from "../payment-utils.js";
 
 export function registerFetchTool(server: McpServer): void {
@@ -36,16 +37,18 @@ export function registerFetchTool(server: McpServer): void {
       let probedAmountUsdc = 0; // captured from 402 response
       let casperNetwork = process.env.CASPER_NETWORK || "";
 
-      if (!useChain) {
+      if (!useChain || useChain === CASPER_CHAIN) {
         try {
           const probeResp = await fetch(url, {
             method,
+            signal: AbortSignal.timeout(30000),
+            redirect: "error",
             headers: args.body ? { "Content-Type": "application/json" } : {},
             body: args.body || undefined,
           });
 
           if (probeResp.status !== 402) {
-            const text = await probeResp.text();
+            const text = await boundedText(probeResp);
             return {
               content: [{
                 type: "text" as const,
@@ -59,7 +62,9 @@ export function registerFetchTool(server: McpServer): void {
             };
           }
 
-          const paymentInfo = await probeResp.json();
+          const encoded = probeResp.headers.get("payment-required");
+          if (encoded && encoded.length > 65536) throw new Error("Payment header exceeds size limit");
+          const paymentInfo = JSON.parse(encoded ? Buffer.from(encoded, "base64").toString("utf8") : await boundedText(probeResp));
           const accepts = paymentInfo.accepts || paymentInfo.accept || [];
           const firstAccept = Array.isArray(accepts) ? accepts[0] : accepts;
           const network = firstAccept?.network || "";
@@ -69,7 +74,9 @@ export function registerFetchTool(server: McpServer): void {
             probedAmountUsdc = Number(firstAccept.amount) / 1e6;
           }
 
-          if (network.includes("solana") || network.includes("5eykt4")) {
+          if (useChain === CASPER_CHAIN) {
+            // Forced Casper still probes and validates a real offer below.
+          } else if (network.includes("solana") || network.includes("5eykt4")) {
             useChain = "solana";
           } else if (network.includes("eip155") || network.includes("8453")) {
             useChain = "base";
@@ -81,7 +88,7 @@ export function registerFetchTool(server: McpServer): void {
                 type: "text" as const,
                 text: JSON.stringify({
                   error: "Could not auto-detect chain from 402 response",
-                  payment_info: paymentInfo,
+                  payment_info: JSON.stringify(paymentInfo).slice(0, 1000),
                   hint: "Specify chain parameter: 'solana', 'base' or 'casper'",
                 }),
               }],
@@ -91,16 +98,17 @@ export function registerFetchTool(server: McpServer): void {
           // Casper settles in wCSPR motes (9 decimals), not 6-decimal USDC.
           if (useChain === CASPER_CHAIN) {
             const casperAccept = selectCasperAccept(paymentInfo, casperNetwork);
+            if (!casperAccept) throw new Error("No matching exact Casper payment offer");
             if (casperAccept) {
               casperNetwork = toCasperCaip2(casperAccept.network);
               try {
                 assertPayableCasperAccept(casperAccept);
-                probedAmountUsdc = Number(motesToCspr(parseMaxAmountRequired(casperAccept.maxAmountRequired)));
+                casperBudget.check(casperAmountMotes(casperAccept));
               } catch (err: any) {
                 return {
                   content: [{
                     type: "text" as const,
-                    text: JSON.stringify({ error: err.message, url, chain: CASPER_CHAIN, payment_info: paymentInfo }),
+                    text: JSON.stringify({ error: err.message, url, chain: CASPER_CHAIN, payment_info: JSON.stringify(paymentInfo).slice(0, 1000) }),
                   }],
                 };
               }
@@ -110,7 +118,7 @@ export function registerFetchTool(server: McpServer): void {
           return {
             content: [{
               type: "text" as const,
-              text: JSON.stringify({ error: `Failed to probe endpoint: ${err.message}` }),
+              text: JSON.stringify({ error: `Failed to probe endpoint: ${String(err.message).slice(0, 1000)}` }),
             }],
           };
         }
@@ -142,6 +150,10 @@ export function registerFetchTool(server: McpServer): void {
         };
       }
 
+      if (useChain === CASPER_CHAIN) {
+        return fetchCasper(url, method, args.body, casperKey!, casperNetwork);
+      }
+
       // Step 3: Create x402 client with the right scheme
       try {
         const client = new x402Client();
@@ -152,8 +164,7 @@ export function registerFetchTool(server: McpServer): void {
           const svmSigner = toClientSvmSigner(keypairSigner);
           const scheme = new ExactSvmScheme(svmSigner, { rpcUrl: solanaRpc });
           client.register(SOLANA_MAINNET_CAIP2 as `${string}:${string}`, scheme);
-        } else if (useChain === CASPER_CHAIN) {
-          registerCasperScheme(client, casperKey!, casperNetwork || undefined);
+
         } else {
           const account = privateKeyToAccount(evmKey! as `0x${string}`);
           const evmSigner = toClientEvmSigner(account as any);

@@ -29,9 +29,9 @@ export const CASPER_CHAIN = "casper";
  * some facilitators emit.
  */
 export function isCasperNetwork(network: string): boolean {
-  if (!network) return false;
+  if (typeof network !== "string" || !network) return false;
   const n = network.toLowerCase().trim();
-  return n === "casper" || n === "casper-test" || n.startsWith("casper:");
+  return ["casper", "casper-test", "casper:mainnet", "casper:testnet", ...CASPER_NETWORKS].includes(n);
 }
 
 /** Normalise any Casper network spelling to its CAIP-2 id. */
