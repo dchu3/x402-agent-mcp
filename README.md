@@ -47,8 +47,10 @@ Casper endpoints advertise CAIP-2 networks `casper:casper` (mainnet) and `casper
 | `CASPER_PRIVATE_KEY` | — | Hex secret key, PEM file path, or PEM contents |
 | `CASPER_KEY_ALGORITHM` | ed25519 | `ed25519` or `secp256k1` |
 | `CASPER_NETWORK` | auto | Force `casper:casper` or `casper:casper-test` when a server offers both |
-| `CASPER_FACILITATOR_URL` | https://x402-facilitator.cspr.cloud | Facilitator base URL (`/verify`, `/settle`, `/supported`) |
-| `CASPER_FACILITATOR_API_KEY` | — | Sent as the `Authorization` header when the facilitator requires one |
+| `CASPER_MAX_PAYMENT_PER_CALL` | disabled | Maximum per authorization in decimal wCSPR (e.g. `1.5`) |
+| `CASPER_MAX_DAILY_SPEND` | disabled | Daily authorization budget in decimal wCSPR (e.g. `10`) |
+
+Both budgets must be explicitly set and positive. No USD conversion is performed. Only the network-specific wCSPR package hashes from [Casper Wallet Core](https://github.com/make-software/casper-wallet-core/blob/master/src/domain/constants/casperNetwork.ts) are accepted. `scheme: "exact"` and x402 v2 are required. Forced-chain calls still probe payment requirements, and the SDK checks the actual requirements again before signing. Settlement is performed by the endpoint's facilitator; this client does not configure a separate facilitator.
 
 ```
 x402_fetch({ url: "https://some-casper-endpoint.example/api", chain: "casper" })
@@ -62,7 +64,11 @@ x402_fetch({ url: "https://some-casper-endpoint.example/api", chain: "casper" })
 | `MAX_DAILY_SPEND` | 10.00 | Reject after cumulative daily spend exceeded (USDC) |
 | `PAYMENT_LOG_PATH` | ./x402-payments.jsonl | Path to payment log file (gitignored) |
 
-Payments are logged to `x402-payments.jsonl` with timestamp, URL, chain, amount, tx hash, and status. Daily spend resets at UTC midnight.
+Payments share one `x402-payments.jsonl` ledger with timestamp, URL, chain, amount, tx hash, and status. USDC entries use `amount_usdc`; Casper entries use `currency: "wCSPR"` and an exact `amount_motes` string. Base/Solana counters are tracked by chain and summed for the existing USD daily limit. Casper has an independent mote counter.
+
+Casper reserves budget synchronously before signing to prevent concurrent overspending. Failed or ambiguous requests retain that reservation; it represents authorized spend, not confirmed settlement. Only one authorization is permitted per fetch. A server-provided settlement receipt is not independently verified on-chain. Payment response bodies/headers are size-bounded and Casper redirects are refused.
+
+Counters are process-local and reset at UTC midnight or process restart. They are not a durable, multi-instance wallet limit.
 
 ## Quick Start
 

@@ -1,8 +1,8 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
-import { assertPayableCasperAccept, findCasperAccepts, selectCasperAccept } from "./accepts.js";
+import { assertPayableCasperAccept, findCasperAccepts, selectCasperAccept, WCSPR_ASSETS } from "./accepts.js";
 
-const wcspr = "0f2a1cd0c2a2f4e6a0b8d1e2f3a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6";
+const wcspr = WCSPR_ASSETS["casper:casper"];
 
 function response(...accepts: any[]) {
   return { x402Version: 2, accepts };
@@ -20,7 +20,7 @@ const casperMainnet = {
   scheme: "exact",
   network: "casper:casper",
   maxAmountRequired: "1000000000",
-  payTo: "00a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90",
+  payTo: "00" + "ab".repeat(32),
   asset: wcspr,
   maxTimeoutSeconds: 60,
 };
@@ -61,9 +61,9 @@ describe("casper accepts parsing", () => {
     assert.equal(picked?.maxAmountRequired, "250000000");
   });
 
-  it("falls back to what is on offer when the hint is unavailable", () => {
+  it("rejects fallback when the requested network is unavailable", () => {
     const picked = selectCasperAccept(response(casperTestnet), "casper:casper");
-    assert.equal(picked?.network, "casper:casper-test");
+    assert.equal(picked, undefined);
   });
 
   it("returns undefined when there is nothing to pay", () => {
