@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { addToDirectory } from "../directory.js";
+import { CASPER_CHAIN, isCasperNetwork } from "../casper/networks.js";
 
 interface WellKnownX402 {
   x402Version?: number;
@@ -89,6 +90,7 @@ async function fetchText(url: string, timeoutMs: number = 10000): Promise<string
 function parseChainFromNetwork(network: string): string {
   if (network.includes("solana") || network.includes("5eykt4")) return "solana";
   if (network.includes("eip155") || network.includes("8453")) return "base";
+  if (isCasperNetwork(network)) return CASPER_CHAIN;
   return network;
 }
 

@@ -6,7 +6,9 @@ export interface PaymentLogEntry {
   url: string;
   method: string;
   chain: string;
-  amount_usdc: number;
+  amount_usdc?: number;
+  amount_motes?: string;
+  currency?: "USDC" | "wCSPR";
   tx_hash?: string;
   status: "success" | "failed";
   error?: string;
@@ -15,13 +17,13 @@ export interface PaymentLogEntry {
 const LOG_PATH = process.env.PAYMENT_LOG_PATH || "./x402-payments.jsonl";
 
 // Track daily spending in memory
-let dailySpent = 0;
+const dailySpentByChain = new Map<string, number>();
 let dailyDate = new Date().toISOString().slice(0, 10);
 
 function resetDailyIfNewDay(): void {
   const today = new Date().toISOString().slice(0, 10);
   if (today !== dailyDate) {
-    dailySpent = 0;
+    dailySpentByChain.clear();
     dailyDate = today;
   }
 }
@@ -37,6 +39,7 @@ export function getMaxDailySpend(): number {
 export function checkSpendingLimit(amountUsdc: number): { allowed: boolean; reason?: string } {
   resetDailyIfNewDay();
 
+  const dailySpent = getDailySpent();
   const maxPerCall = getMaxPerCall();
   if (amountUsdc > maxPerCall) {
     return { allowed: false, reason: `Payment $${amountUsdc} exceeds MAX_PAYMENT_PER_CALL $${maxPerCall}` };
@@ -53,8 +56,8 @@ export function checkSpendingLimit(amountUsdc: number): { allowed: boolean; reas
 export function logPayment(entry: PaymentLogEntry): void {
   resetDailyIfNewDay();
 
-  if (entry.status === "success") {
-    dailySpent += entry.amount_usdc;
+  if (entry.status === "success" && entry.chain !== "casper") {
+    dailySpentByChain.set(entry.chain, (dailySpentByChain.get(entry.chain) ?? 0) + (entry.amount_usdc ?? 0));
   }
 
   try {
@@ -66,7 +69,7 @@ export function logPayment(entry: PaymentLogEntry): void {
   }
 }
 
-export function getDailySpent(): number {
+export function getDailySpent(chain?: string): number {
   resetDailyIfNewDay();
-  return dailySpent;
+  return chain ? dailySpentByChain.get(chain) ?? 0 : [...dailySpentByChain.values()].reduce((sum, amount) => sum + amount, 0);
 }
