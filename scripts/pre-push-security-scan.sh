@@ -10,6 +10,12 @@ BASE="${1:-origin/master}"
 HEAD="${2:-HEAD}"
 cd "$(git rev-parse --show-toplevel)"
 
+# Blocked name patterns live OUTSIDE the repo (gitignored .env) so the
+# published scan never contains the names it blocks. Fail-closed default.
+BLOCKED_NAMES="${BLOCKED_NAME_PATTERNS:-placeholder-must-be-set}"
+[ -f .env ] && . ./.env 2>/dev/null || true
+BLOCKED_NAMES="${BLOCKED_NAME_PATTERNS:-placeholder-must-be-set}"
+
 # Collect the diff to be pushed (added lines + new file names)
 DIFF_NAMES=$(git diff --name-only --diff-filter=A "$BASE" "$HEAD" 2>/dev/null || true)
 DIFF_ADDED=$(git diff "$BASE" "$HEAD" 2>/dev/null | grep -E "^\+" | grep -vE "^\+\+\+" || true)
@@ -35,10 +41,10 @@ fi
 # 3. Real names in file paths (the operator's host user must never appear).
 # The scan script itself contains these patterns — allowlist its own path.
 SCAN_SELF=$(basename "$(git rev-parse --show-toplevel)/scripts/pre-push-security-scan.sh")
-if echo "$DIFF_NAMES" | grep -vE "(^|/)$SCAN_SELF$" | grep -qiE "BLOCKED-PATTERN|/home/[a-z]+/"; then
+if echo "$DIFF_NAMES" | grep -vE "(^|/)$SCAN_SELF$" | grep -qiE "$BLOCKED_NAMES|/home/[a-z]+/"; then
   FAIL=1; reasons+=("personal path or real name in added file paths")
 fi
-if echo "$DIFF_ADDED" | grep -qE "/home/[a-zA-Z]+/|BLOCKED-PATTERN"; then
+if echo "$DIFF_ADDED" | grep -qE "/home/[a-zA-Z]+/|$BLOCKED_NAMES"; then
   # exclude lines that are the scan's own pattern definitions (quoted regex, not a real path)
   if echo "$DIFF_ADDED" | grep "/home/" | grep -vE 'grep|qiE|qE|"[^"]*home[^"]*"|pattern' | grep -q "/home/"; then
     FAIL=1; reasons+=("personal path or real name in added lines")
