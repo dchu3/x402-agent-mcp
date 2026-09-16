@@ -94,6 +94,57 @@ function parseChainFromNetwork(network: string): string {
   return network;
 }
 
+function decodePaymentRequiredHeader(header: string | null): any | null {
+  if (!header) return null;
+  try {
+    // base64url → base64
+    const b64 = header.replace(/-/g, "+").replace(/_/g, "/");
+    const pad = (4 - (b64.length % 4)) % 4;
+    return JSON.parse(Buffer.from(b64 + "=".repeat(pad), "base64").toString("utf-8"));
+  } catch {
+    return null;
+  }
+}
+
+async function fetchRootPaymentChallenge(baseUrl: string, timeoutMs: number = 10000): Promise<any | null> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const resp = await fetch(baseUrl, { signal: controller.signal });
+    clearTimeout(timeout);
+    return decodePaymentRequiredHeader(resp.headers.get("payment-required"));
+  } catch {
+    return null;
+  }
+}
+
+function serviceInfoFromOpenApi(spec: any): any | null {
+  if (!spec?.info || !spec?.paths) return null;
+  const endpoints: Array<{ path: string; method: string; price_usdc: string; description: string }> = [];
+  for (const [path, methods] of Object.entries<any>(spec.paths)) {
+    for (const method of ["get", "post"]) {
+      const op = methods?.[method];
+      if (!op) continue;
+      const raw = String(op.summary || op.description || "");
+      endpoints.push({
+        path,
+        method: method.toUpperCase(),
+        price_usdc: "",
+        description: raw.substring(0, 120),
+      });
+      if (endpoints.length >= 50) break;
+    }
+    if (endpoints.length >= 50) break;
+  }
+  return {
+    name: spec.info.title,
+    description: spec.info.description,
+    category: "other",
+    endpoints: endpoints.length > 0 ? endpoints : undefined,
+    tags: undefined,
+  };
+}
+
 export function registerDiscoverUrlTool(server: McpServer): void {
   server.tool(
     "x402_discover_url",
@@ -106,7 +157,41 @@ export function registerDiscoverUrlTool(server: McpServer): void {
       const errors: string[] = [];
 
       // Step 1: Fetch /.well-known/x402
-      const x402Data = await fetchJson(`${baseUrl}/.well-known/x402`);
+      let x402Data = await fetchJson(`${baseUrl}/.well-known/x402`);
+      const wellKnownPresent = x402Data !== null;
+
+      // Fetch openapi.json early when we may need its paths for the 402 probe
+      // (preference order for service info is still ai-catalog > x402 > openapi)
+      let earlyOpenApi: any = null;
+      const catalog = await fetchJson(`${baseUrl}/.well-known/ai-catalog.json`);
+      if (!catalog) {
+        earlyOpenApi = await fetchJson(`${baseUrl}/openapi.json`);
+      }
+
+      if (!x402Data) {
+        // Fallback: probe the root URL for a 402 PAYMENT-REQUIRED challenge header
+        const challenge = await fetchRootPaymentChallenge(baseUrl);
+        if (challenge) {
+          x402Data = challenge;
+          errors.push("No /.well-known/x402 found, fell back to root 402 PAYMENT-REQUIRED challenge");
+        }
+      }
+      if (!x402Data && earlyOpenApi?.paths) {
+        // Root yielded no challenge (e.g. marketing redirect) — probe OpenAPI GET paths
+        const getPaths: string[] = [];
+        for (const [p, methods] of Object.entries<any>(earlyOpenApi.paths)) {
+          if (methods?.get) getPaths.push(p);
+          if (getPaths.length >= 3) break;
+        }
+        for (const p of getPaths) {
+          const challenge = await fetchRootPaymentChallenge(`${baseUrl}${p}`);
+          if (challenge) {
+            x402Data = challenge;
+            errors.push(`No /.well-known/x402 found, fell back to 402 challenge on ${p}`);
+            break;
+          }
+        }
+      }
       if (!x402Data) {
         return {
           content: [{
@@ -159,13 +244,60 @@ export function registerDiscoverUrlTool(server: McpServer): void {
         }
       }
 
-      // Step 2: Fetch /.well-known/ai-catalog.json
-      const catalog = await fetchJson(`${baseUrl}/.well-known/ai-catalog.json`);
-      if (!catalog) errors.push("No /.well-known/ai-catalog.json found");
+      // Minimal v1 well-known (version + resources, no accepts): payment info is
+      // incomplete even though the service is x402-enabled. Run the same 402
+      // challenge fallback chain (root, then OpenAPI GET paths) to fill it in.
+      const wellKnownFromFetch = wellKnownPresent;
+      if (chains.length === 0 && wellKnownFromFetch) {
+        let challenge = await fetchRootPaymentChallenge(baseUrl);
+        let challengePath = "root";
+        if (!challenge && earlyOpenApi?.paths) {
+          const getPaths: string[] = [];
+          for (const [p, methods] of Object.entries<any>(earlyOpenApi.paths)) {
+            if (methods?.get) getPaths.push(p);
+            if (getPaths.length >= 3) break;
+          }
+          for (const p of getPaths) {
+            challenge = await fetchRootPaymentChallenge(`${baseUrl}${p}`);
+            if (challenge) { challengePath = p; break; }
+          }
+        }
+        if (challenge) {
+          const cAccepts = challenge.accepts || challenge.accept || [];
+          if (Array.isArray(cAccepts) && cAccepts.length > 0) {
+            chains = [...new Set(cAccepts.map((a: any) => parseChainFromNetwork(a.network || "")))];
+            sellerWallet = sellerWallet || cAccepts[0]?.payTo;
+            schemes = [...new Set(cAccepts.map((a: any) => a.scheme))];
+            tokens = [...new Set(cAccepts.map((a: any) => a.extra?.name).filter(Boolean))];
+          } else {
+            const network = challenge.network || challenge.payment_network || "";
+            if (network) chains = [parseChainFromNetwork(network)];
+            sellerWallet = sellerWallet || challenge.seller_wallet || challenge.payTo || challenge.payment_address;
+            if (challenge.payment_scheme) schemes = [challenge.payment_scheme];
+            if (challenge.currency) tokens = [challenge.currency];
+          }
+          errors.push(`Well-known x402 has no accepts, payment info from 402 challenge on ${challengePath}`);
+        }
+      }
 
-      // Step 3: Fetch /llms.txt
+      // Step 2: Fetch /llms.txt
       const llmsTxt = await fetchText(`${baseUrl}/llms.txt`);
       if (!llmsTxt) errors.push("No /llms.txt found");
+
+      // Step 3: OpenAPI fallback for service info (fetched early when ai-catalog absent)
+      let serviceFromOpenApi: any = null;
+      if (!catalog) {
+        if (earlyOpenApi) {
+          serviceFromOpenApi = serviceInfoFromOpenApi(earlyOpenApi);
+          if (serviceFromOpenApi) {
+            errors.push("No /.well-known/ai-catalog.json found, fell back to openapi.json");
+          } else {
+            errors.push("No /.well-known/ai-catalog.json found");
+          }
+        } else {
+          errors.push("No /.well-known/ai-catalog.json found");
+        }
+      }
 
       // Build result — prefer ai-catalog, fall back to x402 well-known endpoints
       let serviceInfo: any = null;
@@ -199,6 +331,8 @@ export function registerDiscoverUrlTool(server: McpServer): void {
         }
       } else if (serviceFromX402) {
         serviceInfo = serviceFromX402;
+      } else if (serviceFromOpenApi) {
+        serviceInfo = serviceFromOpenApi;
       }
 
       const result: DiscoveryResult = {
