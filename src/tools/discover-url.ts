@@ -158,12 +158,37 @@ export function registerDiscoverUrlTool(server: McpServer): void {
 
       // Step 1: Fetch /.well-known/x402
       let x402Data = await fetchJson(`${baseUrl}/.well-known/x402`);
+
+      // Fetch openapi.json early when we may need its paths for the 402 probe
+      // (preference order for service info is still ai-catalog > x402 > openapi)
+      let earlyOpenApi: any = null;
+      const catalog = await fetchJson(`${baseUrl}/.well-known/ai-catalog.json`);
+      if (!catalog) {
+        earlyOpenApi = await fetchJson(`${baseUrl}/openapi.json`);
+      }
+
       if (!x402Data) {
         // Fallback: probe the root URL for a 402 PAYMENT-REQUIRED challenge header
         const challenge = await fetchRootPaymentChallenge(baseUrl);
         if (challenge) {
           x402Data = challenge;
           errors.push("No /.well-known/x402 found, fell back to root 402 PAYMENT-REQUIRED challenge");
+        }
+      }
+      if (!x402Data && earlyOpenApi?.paths) {
+        // Root yielded no challenge (e.g. marketing redirect) — probe OpenAPI GET paths
+        const getPaths: string[] = [];
+        for (const [p, methods] of Object.entries<any>(earlyOpenApi.paths)) {
+          if (methods?.get) getPaths.push(p);
+          if (getPaths.length >= 3) break;
+        }
+        for (const p of getPaths) {
+          const challenge = await fetchRootPaymentChallenge(`${baseUrl}${p}`);
+          if (challenge) {
+            x402Data = challenge;
+            errors.push(`No /.well-known/x402 found, fell back to 402 challenge on ${p}`);
+            break;
+          }
         }
       }
       if (!x402Data) {
@@ -218,19 +243,15 @@ export function registerDiscoverUrlTool(server: McpServer): void {
         }
       }
 
-      // Step 2: Fetch /.well-known/ai-catalog.json
-      const catalog = await fetchJson(`${baseUrl}/.well-known/ai-catalog.json`);
-
-      // Step 3: Fetch /llms.txt
+      // Step 2: Fetch /llms.txt
       const llmsTxt = await fetchText(`${baseUrl}/llms.txt`);
       if (!llmsTxt) errors.push("No /llms.txt found");
 
-      // Step 4: OpenAPI fallback for service info (only when ai-catalog absent)
+      // Step 3: OpenAPI fallback for service info (fetched early when ai-catalog absent)
       let serviceFromOpenApi: any = null;
       if (!catalog) {
-        const openApi = await fetchJson(`${baseUrl}/openapi.json`);
-        if (openApi) {
-          serviceFromOpenApi = serviceInfoFromOpenApi(openApi);
+        if (earlyOpenApi) {
+          serviceFromOpenApi = serviceInfoFromOpenApi(earlyOpenApi);
           if (serviceFromOpenApi) {
             errors.push("No /.well-known/ai-catalog.json found, fell back to openapi.json");
           } else {

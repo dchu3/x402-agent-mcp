@@ -104,6 +104,51 @@ it('all sources present: ai-catalog wins over openapi.json and x402 endpoints', 
   assert.equal(result.errors, undefined);
 });
 
+it('twit.sh real shape: root 301 landing with no challenge, 402 found by probing openapi GET path', async () => {
+  const twitShRealOpenApi = {
+    openapi: '3.0.0',
+    info: { title: 'Twit.sh API', description: 'Post tweets for a fee' },
+    paths: {
+      '/api/tweet': { post: { summary: 'Post a tweet' } },
+      '/api/status': { get: { summary: 'Service status' } },
+    },
+  };
+  globalThis.fetch = (async (input: any) => {
+    const url = String(input instanceof Request ? input.url : input);
+    if (url === 'https://x402.twit.sh/openapi.json') {
+      return new Response(JSON.stringify(twitShRealOpenApi), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url === 'https://x402.twit.sh/api/status') return challengeResponse();
+    if (url === 'https://x402.twit.sh') {
+      // 301 to marketing landing page — no PAYMENT-REQUIRED header
+      return new Response(null, { status: 301, headers: { location: 'https://twit.sh/landing' } });
+    }
+    return new Response('Not Found', { status: 404 });
+  }) as any;
+  const result = JSON.parse((await handler()({ url: 'https://x402.twit.sh' })).content[0].text);
+  assert.equal(result.x402_enabled, true);
+  assert.deepEqual(result.payment.chains, ['base']);
+  assert.equal(result.payment.seller_wallet, '0xSELLERWALLET');
+  assert.deepEqual(result.payment.schemes, ['exact']);
+  assert.ok(result.errors.some((e: string) => /fell back to 402 challenge on \/api\/status/i.test(e)), JSON.stringify(result.errors));
+});
+
+it('openapi GET paths yield no challenge and root has none: x402_enabled false', async () => {
+  globalThis.fetch = (async (input: any) => {
+    const url = String(input instanceof Request ? input.url : input);
+    if (url.endsWith('/openapi.json')) {
+      return new Response(JSON.stringify({
+        openapi: '3.0.0', info: { title: 'Free API' },
+        paths: { '/status': { get: { summary: 's' } } },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response('Not Found', { status: 404 });
+  }) as any;
+  const result = JSON.parse((await handler()({ url: 'https://free.invalid' })).content[0].text);
+  assert.equal(result.x402_enabled, false);
+  assert.match(result.error, /No \/.well-known\/x402 found — this service may not be x402-enabled/);
+});
+
 it('nothing anywhere: x402_enabled false with existing error message', async () => {
   globalThis.fetch = (async () => new Response('Not Found', { status: 404 })) as any;
   const result = JSON.parse((await handler()({ url: 'https://dead.invalid' })).content[0].text);
