@@ -158,6 +158,7 @@ export function registerDiscoverUrlTool(server: McpServer): void {
 
       // Step 1: Fetch /.well-known/x402
       let x402Data = await fetchJson(`${baseUrl}/.well-known/x402`);
+      const wellKnownPresent = x402Data !== null;
 
       // Fetch openapi.json early when we may need its paths for the 402 probe
       // (preference order for service info is still ai-catalog > x402 > openapi)
@@ -240,6 +241,42 @@ export function registerDiscoverUrlTool(server: McpServer): void {
             })),
             tags: x402Data.tags,
           };
+        }
+      }
+
+      // Minimal v1 well-known (version + resources, no accepts): payment info is
+      // incomplete even though the service is x402-enabled. Run the same 402
+      // challenge fallback chain (root, then OpenAPI GET paths) to fill it in.
+      const wellKnownFromFetch = wellKnownPresent;
+      if (chains.length === 0 && wellKnownFromFetch) {
+        let challenge = await fetchRootPaymentChallenge(baseUrl);
+        let challengePath = "root";
+        if (!challenge && earlyOpenApi?.paths) {
+          const getPaths: string[] = [];
+          for (const [p, methods] of Object.entries<any>(earlyOpenApi.paths)) {
+            if (methods?.get) getPaths.push(p);
+            if (getPaths.length >= 3) break;
+          }
+          for (const p of getPaths) {
+            challenge = await fetchRootPaymentChallenge(`${baseUrl}${p}`);
+            if (challenge) { challengePath = p; break; }
+          }
+        }
+        if (challenge) {
+          const cAccepts = challenge.accepts || challenge.accept || [];
+          if (Array.isArray(cAccepts) && cAccepts.length > 0) {
+            chains = [...new Set(cAccepts.map((a: any) => parseChainFromNetwork(a.network || "")))];
+            sellerWallet = sellerWallet || cAccepts[0]?.payTo;
+            schemes = [...new Set(cAccepts.map((a: any) => a.scheme))];
+            tokens = [...new Set(cAccepts.map((a: any) => a.extra?.name).filter(Boolean))];
+          } else {
+            const network = challenge.network || challenge.payment_network || "";
+            if (network) chains = [parseChainFromNetwork(network)];
+            sellerWallet = sellerWallet || challenge.seller_wallet || challenge.payTo || challenge.payment_address;
+            if (challenge.payment_scheme) schemes = [challenge.payment_scheme];
+            if (challenge.currency) tokens = [challenge.currency];
+          }
+          errors.push(`Well-known x402 has no accepts, payment info from 402 challenge on ${challengePath}`);
         }
       }
 
