@@ -56,6 +56,36 @@ Both budgets must be explicitly set and positive. No USD conversion is performed
 x402_fetch({ url: "https://some-casper-endpoint.example/api", chain: "casper" })
 ```
 
+### Enabling the Casper leg
+
+Before live paid Casper calls work, four prerequisites must be in place:
+
+| Prerequisite | How to satisfy it |
+|--------------|-------------------|
+| Funded account key | Create a key with [Casper Wallet](https://www.casperwallet.io/) or [cspr.live](https://cspr.live) and export the hex secret key or PEM. On testnet, request free CSPR from the [Casper testnet faucet](https://testnet.cspr.live/tools/faucet). On mainnet you need real CSPR from an exchange or the staking ecosystem. |
+| wCSPR balance | Endpoints settle in wCSPR (CEP-18), not raw CSPR. On mainnet you may need to wrap CSPR to wCSPR via a supported contract interaction first; on testnet the faucet plus a testnet wCSPR mint may apply. The exact wrap/mint flow varies — confirm it with the endpoint operator. |
+| Target endpoint | This client ships no Casper endpoint list, and the x402 directory currently lists none. You need the endpoint URL from the operator — ask the endpoint operator or the Casper team. |
+| Mote budgets | Both `CASPER_MAX_PAYMENT_PER_CALL` and `CASPER_MAX_DAILY_SPEND` must be set and positive, or **all** paid Casper requests fail closed. This is deliberate safety design, not a bug. |
+
+Worked testnet `.env` (faucet-funded, small budgets — values are decimal wCSPR, converted to integer motes under the hood):
+
+```bash
+CASPER_PRIVATE_KEY=<hex-key-or-pem-path>
+CASPER_NETWORK=casper:casper-test
+CASPER_MAX_PAYMENT_PER_CALL=1
+CASPER_MAX_DAILY_SPEND=5
+```
+
+Smoke test your first call:
+
+```
+x402_fetch({ url: "https://your-casper-endpoint.example/api", chain: "casper" })
+```
+
+Check the payment ledger for an entry with `currency: "wCSPR"` and an exact `amount_motes` string. Before the env vars are set, paid Casper calls return a `NOT_CONFIGURED`-style error; after, they sign and settle. An unset budget means no Casper signing happens at all.
+
+**Why fail-closed:** if the key or either budget is unset, no Casper payment is ever signed — there is no silent fallback. Ambiguous failures retain their budget reservation (authorized, not settled), and spend stays bounded in native motes without any USD-conversion assumptions.
+
 ## Spending Limits & Payment Logging
 
 | Env var | Default | Description |
