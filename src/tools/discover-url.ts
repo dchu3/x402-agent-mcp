@@ -94,6 +94,57 @@ function parseChainFromNetwork(network: string): string {
   return network;
 }
 
+function decodePaymentRequiredHeader(header: string | null): any | null {
+  if (!header) return null;
+  try {
+    // base64url → base64
+    const b64 = header.replace(/-/g, "+").replace(/_/g, "/");
+    const pad = (4 - (b64.length % 4)) % 4;
+    return JSON.parse(Buffer.from(b64 + "=".repeat(pad), "base64").toString("utf-8"));
+  } catch {
+    return null;
+  }
+}
+
+async function fetchRootPaymentChallenge(baseUrl: string, timeoutMs: number = 10000): Promise<any | null> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const resp = await fetch(baseUrl, { signal: controller.signal });
+    clearTimeout(timeout);
+    return decodePaymentRequiredHeader(resp.headers.get("payment-required"));
+  } catch {
+    return null;
+  }
+}
+
+function serviceInfoFromOpenApi(spec: any): any | null {
+  if (!spec?.info || !spec?.paths) return null;
+  const endpoints: Array<{ path: string; method: string; price_usdc: string; description: string }> = [];
+  for (const [path, methods] of Object.entries<any>(spec.paths)) {
+    for (const method of ["get", "post"]) {
+      const op = methods?.[method];
+      if (!op) continue;
+      const raw = String(op.summary || op.description || "");
+      endpoints.push({
+        path,
+        method: method.toUpperCase(),
+        price_usdc: "",
+        description: raw.substring(0, 120),
+      });
+      if (endpoints.length >= 50) break;
+    }
+    if (endpoints.length >= 50) break;
+  }
+  return {
+    name: spec.info.title,
+    description: spec.info.description,
+    category: "other",
+    endpoints: endpoints.length > 0 ? endpoints : undefined,
+    tags: undefined,
+  };
+}
+
 export function registerDiscoverUrlTool(server: McpServer): void {
   server.tool(
     "x402_discover_url",
@@ -106,7 +157,15 @@ export function registerDiscoverUrlTool(server: McpServer): void {
       const errors: string[] = [];
 
       // Step 1: Fetch /.well-known/x402
-      const x402Data = await fetchJson(`${baseUrl}/.well-known/x402`);
+      let x402Data = await fetchJson(`${baseUrl}/.well-known/x402`);
+      if (!x402Data) {
+        // Fallback: probe the root URL for a 402 PAYMENT-REQUIRED challenge header
+        const challenge = await fetchRootPaymentChallenge(baseUrl);
+        if (challenge) {
+          x402Data = challenge;
+          errors.push("No /.well-known/x402 found, fell back to root 402 PAYMENT-REQUIRED challenge");
+        }
+      }
       if (!x402Data) {
         return {
           content: [{
@@ -161,11 +220,26 @@ export function registerDiscoverUrlTool(server: McpServer): void {
 
       // Step 2: Fetch /.well-known/ai-catalog.json
       const catalog = await fetchJson(`${baseUrl}/.well-known/ai-catalog.json`);
-      if (!catalog) errors.push("No /.well-known/ai-catalog.json found");
 
       // Step 3: Fetch /llms.txt
       const llmsTxt = await fetchText(`${baseUrl}/llms.txt`);
       if (!llmsTxt) errors.push("No /llms.txt found");
+
+      // Step 4: OpenAPI fallback for service info (only when ai-catalog absent)
+      let serviceFromOpenApi: any = null;
+      if (!catalog) {
+        const openApi = await fetchJson(`${baseUrl}/openapi.json`);
+        if (openApi) {
+          serviceFromOpenApi = serviceInfoFromOpenApi(openApi);
+          if (serviceFromOpenApi) {
+            errors.push("No /.well-known/ai-catalog.json found, fell back to openapi.json");
+          } else {
+            errors.push("No /.well-known/ai-catalog.json found");
+          }
+        } else {
+          errors.push("No /.well-known/ai-catalog.json found");
+        }
+      }
 
       // Build result — prefer ai-catalog, fall back to x402 well-known endpoints
       let serviceInfo: any = null;
@@ -199,6 +273,8 @@ export function registerDiscoverUrlTool(server: McpServer): void {
         }
       } else if (serviceFromX402) {
         serviceInfo = serviceFromX402;
+      } else if (serviceFromOpenApi) {
+        serviceInfo = serviceFromOpenApi;
       }
 
       const result: DiscoveryResult = {
