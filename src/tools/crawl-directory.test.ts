@@ -1,0 +1,101 @@
+import { strict as assert } from 'node:assert';
+import { afterEach, after, it } from 'node:test';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+// Isolate the directory in a temp file BEFORE loading directory.js — the repo's
+// live endpoints.json is gitignored operator data and must never be written by tests.
+const dir = mkdtempSync(join(tmpdir(), 'x402-crawl-test-'));
+const env = { ...process.env };
+process.env.X402_DIRECTORY_PATH = join(dir, 'endpoints.json');
+writeFileSync(process.env.X402_DIRECTORY_PATH, JSON.stringify({ endpoints: [], categories: [], last_updated: '2026-01-01' }));
+
+const { registerCrawlX402ScanTool } = await import('./crawl-directory.js');
+const { clearDirectoryCache } = await import('../directory.js');
+
+const originalFetch = globalThis.fetch;
+afterEach(() => { globalThis.fetch = originalFetch; });
+after(() => { process.env = env; rmSync(dir, { recursive: true, force: true }); });
+
+function handler() {
+  let callback: any;
+  registerCrawlX402ScanTool({ tool: (_n: unknown, _d: unknown, _s: unknown, fn: unknown) => { callback = fn; } } as any);
+  return callback;
+}
+
+const HTML_CATCH_ALL = '<!doctype html><html><head><title>App</title></head><body><div id="root"></div></body></html>';
+
+function readDirectory() {
+  return JSON.parse(readFileSync(join(dir, 'endpoints.json'), 'utf-8'));
+}
+
+function resourcesPage(hosts: string[]) {
+  return new Response(hosts.map((h) => `<a href="https://${h}/">link</a>`).join(' '), { status: 200 });
+}
+
+function probeMock(map: Record<string, (url: string) => Response>) {
+  return async (input: any, _init?: any) => {
+    const url = String(input instanceof Request ? input.url : input);
+    if (url === 'https://www.x402scan.com/resources') return resourcesPage(Object.keys(map));
+    for (const [host, fn] of Object.entries(map)) {
+      if (url.startsWith(`https://${host}`)) return fn(url);
+    }
+    return new Response('Not Found', { status: 404 });
+  };
+}
+
+it('crawler skips a host whose well-known is an HTML catch-all and never adds it to the directory', async () => {
+  clearDirectoryCache();
+  globalThis.fetch = probeMock({
+    'spa-catchall.example': () => new Response(HTML_CATCH_ALL, { status: 200, headers: { 'content-type': 'text/html' } }),
+  }) as any;
+  const result = JSON.parse((await handler()({ max_results: 5 })).content[0].text);
+  assert.equal(result.new_services_added, 0);
+  assert.equal(readDirectory().endpoints.length, 0);
+});
+
+it('crawler still adds hosts with a valid {version:1,resources:[...]} well-known', async () => {
+  clearDirectoryCache();
+  globalThis.fetch = probeMock({
+    'stableenrich.example': (url) => url.endsWith('/.well-known/x402')
+      ? new Response(JSON.stringify({ version: 1, resources: ['/api/enrich'], description: 'Enrichment API' }), { status: 200, headers: { 'content-type': 'application/json' } })
+      : new Response('Not Found', { status: 404 }),
+  }) as any;
+  const result = JSON.parse((await handler()({ max_results: 5 })).content[0].text);
+  assert.equal(result.new_services_added, 1);
+  const endpoints = readDirectory().endpoints;
+  assert.equal(endpoints.length, 1);
+  assert.equal(endpoints[0].base_url, 'https://stableenrich.example');
+});
+
+it('crawler enables a host via root 402 PAYMENT-REQUIRED challenge with correct chain', async () => {
+  clearDirectoryCache();
+  const challenge = JSON.stringify({
+    x402Version: 2,
+    accepts: [{ scheme: 'exact', network: 'eip155:8453', amount: '10000', payTo: '0xWALLET' }],
+  });
+  const b64 = Buffer.from(challenge).toString('base64');
+  globalThis.fetch = probeMock({
+    'claw402-2.example': (url) => url === 'https://claw402-2.example'
+      ? new Response('Payment Required', { status: 402, headers: { 'payment-required': b64 } })
+      : new Response('Not Found', { status: 404 }),
+  }) as any;
+  const result = JSON.parse((await handler()({ max_results: 5 })).content[0].text);
+  assert.equal(result.new_services_added, 1);
+  assert.equal(result.services[0].chains[0], 'base');
+});
+
+it('crawler prefers a real service name and strips a leading www. from the hostname fallback', async () => {
+  clearDirectoryCache();
+  globalThis.fetch = probeMock({
+    'www.named.example': (url) => url.endsWith('/.well-known/x402')
+      ? new Response(JSON.stringify({ version: 1, resources: ['/x'], name: undefined }), { status: 200 })
+      : url.endsWith('/.well-known/ai-catalog.json')
+        ? new Response(JSON.stringify({ name: 'RealName', description: 'd' }), { status: 200 })
+        : new Response('Not Found', { status: 404 }),
+  }) as any;
+  const result = JSON.parse((await handler()({ max_results: 5 })).content[0].text);
+  assert.equal(result.new_services_added, 1);
+  assert.equal(result.services[0].name, 'RealName');
+});
