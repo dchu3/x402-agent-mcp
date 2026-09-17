@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { fetchJson, findPaymentChallenge, isX402Manifest, chainsFromManifest } from "./probe-utils.js";
 
 interface BatchResult {
   url: string;
@@ -7,6 +8,7 @@ interface BatchResult {
   service_name?: string;
   chains: string[];
   error?: string;
+  notes?: string[];
 }
 
 export function registerBatchDiscoverTool(server: McpServer): void {
@@ -22,69 +24,64 @@ export function registerBatchDiscoverTool(server: McpServer): void {
       // Probe all URLs in parallel
       const promises = args.urls.map(async (url) => {
         const baseUrl = url.replace(/\/$/, "");
+        const notes: string[] = [];
         try {
-          // Fetch well-known x402
-          const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 10000);
-          const x402Resp = await fetch(`${baseUrl}/.well-known/x402`, {
-            signal: controller.signal,
-            headers: { Accept: "application/json" },
-          });
-          clearTimeout(timeout);
+          // Fetch well-known x402 — must be valid JSON with an x402 manifest
+          // shape; an HTML catch-all 200 or junk body does NOT count.
+          const x402Data = await fetchJson(`${baseUrl}/.well-known/x402`);
 
           let chains: string[] = [];
           let x402Enabled = false;
 
-          if (x402Resp.ok) {
+          if (x402Data !== null && isX402Manifest(x402Data)) {
             x402Enabled = true;
-            const x402Data = await x402Resp.json();
-            const accepts = x402Data.accepts || x402Data.accept || [];
-            const acceptList = Array.isArray(accepts) ? accepts : [accepts];
-            chains = [...new Set(acceptList.map((a: any) => {
-              const net = a.network || x402Data.network || "";
-              if (net.includes("solana") || net.includes("5eykt4")) return "solana";
-              if (net.includes("eip155") || net.includes("8453")) return "base";
-              return net;
-            }))];
-            if (chains.length === 0 && x402Data.network) {
-              const net = x402Data.network;
-              if (net.includes("solana") || net.includes("5eykt4")) chains = ["solana"];
-              else if (net.includes("eip155") || net.includes("8453")) chains = ["base"];
-              else chains = [net];
-            }
+            chains = chainsFromManifest(x402Data);
+          } else if (x402Data !== null) {
+            notes.push("Well-known x402 returned JSON but not an x402 manifest shape");
           } else {
-            // Try ai-catalog as fallback
-            const catResp = await fetch(`${baseUrl}/.well-known/ai-catalog.json`, {
-              signal: controller.signal,
-              headers: { Accept: "application/json" },
-            });
-            if (catResp.ok) {
-              x402Enabled = true; // has ai-catalog, likely x402
+            // Fall back to a 402 PAYMENT-REQUIRED challenge (root, then
+            // openapi.json GET paths — many hosts serve a 200 HTML landing
+            // page at / ). Bounded, never pays, never sends credentials.
+            const hit = await findPaymentChallenge(baseUrl);
+            if (hit && isX402Manifest(hit.challenge)) {
+              x402Enabled = true;
+              chains = chainsFromManifest(hit.challenge);
+              notes.push(hit.path === "root"
+                ? "No /.well-known/x402 JSON found, fell back to root 402 PAYMENT-REQUIRED challenge"
+                : `No /.well-known/x402 JSON found, fell back to 402 challenge on ${hit.path}`);
+            } else {
+              // Last resort: a valid ai-catalog.json implies x402 support
+              const catalog = await fetchJson(`${baseUrl}/.well-known/ai-catalog.json`);
+              if (catalog !== null) {
+                x402Enabled = true; // has ai-catalog, likely x402
+                notes.push("No /.well-known/x402 JSON found, enabled via ai-catalog.json");
+              }
             }
           }
 
           // Try to get service name from ai-catalog
           let serviceName: string | undefined;
-          try {
-            const catResp = await fetch(`${baseUrl}/.well-known/ai-catalog.json`, {
-              headers: { Accept: "application/json" },
-            });
-            if (catResp.ok) {
-              const catalog = await catResp.json();
-              if (catalog.entries && catalog.entries[0]) {
-                serviceName = catalog.entries[0].displayName || catalog.host?.displayName;
-              } else if (catalog.name) {
-                serviceName = catalog.name;
-              }
+          const catalog = await fetchJson(`${baseUrl}/.well-known/ai-catalog.json`);
+          if (catalog !== null) {
+            if (catalog.entries && catalog.entries[0]) {
+              serviceName = catalog.entries[0].displayName || catalog.host?.displayName;
+            } else if (catalog.name) {
+              serviceName = catalog.name;
             }
-          } catch {}
+          }
 
-          return {
+          const result: BatchResult = {
             url: baseUrl,
             x402_enabled: x402Enabled,
             service_name: serviceName,
             chains,
-          } as BatchResult;
+          };
+          if (!x402Enabled) {
+            result.notes = [...notes, "No valid x402 manifest found (well-known was missing, HTML, or non-manifest JSON)"];
+          } else if (notes.length > 0) {
+            result.notes = notes;
+          }
+          return result;
         } catch (err: any) {
           return {
             url: baseUrl,

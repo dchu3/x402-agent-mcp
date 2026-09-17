@@ -29,21 +29,35 @@ export interface EndpointDirectory {
 
 let cachedDirectory: EndpointDirectory | null = null;
 
+// Directory path resolution order (X402_DIRECTORY_PATH env override first —
+// set this in tests/sandboxes so the operator's live endpoints.json is never touched):
+//   1. X402_DIRECTORY_PATH env override
+//   2. <repo>/endpoints.json (from dist/ → project root)
+//   3. process.cwd()/endpoints.json
+function livePaths(): string[] {
+  return [
+    ...(process.env.X402_DIRECTORY_PATH ? [process.env.X402_DIRECTORY_PATH] : []),
+    join(__dirname, "..", "endpoints.json"),       // from dist/ → project root
+    join(process.cwd(), "endpoints.json"),          // from project root
+  ];
+}
+
+/** Clear the in-memory directory cache (used by tests between cases). */
+export function clearDirectoryCache(): void {
+  cachedDirectory = null;
+}
+
 export function loadDirectory(): EndpointDirectory {
   if (cachedDirectory) return cachedDirectory;
   // Try live file first, then template
-  const livePaths = [
-    join(__dirname, "..", "endpoints.json"),
-    join(process.cwd(), "endpoints.json"),
-    "/home/redacted-operator/projects/x402-agent-mcp/endpoints.json",
-  ];
+  const searchPaths = livePaths();
   const templatePaths = [
     join(__dirname, "..", "endpoints.example.json"),
     join(process.cwd(), "endpoints.example.json"),
   ];
 
   // Try live file first
-  for (const p of livePaths) {
+  for (const p of searchPaths) {
     try {
       const raw = readFileSync(p, "utf-8");
       cachedDirectory = JSON.parse(raw) as EndpointDirectory;
@@ -59,7 +73,7 @@ export function loadDirectory(): EndpointDirectory {
       const raw = readFileSync(p, "utf-8");
       cachedDirectory = JSON.parse(raw) as EndpointDirectory;
       // Create live file from template so future writes go to the right place
-      for (const lp of livePaths) {
+      for (const lp of searchPaths) {
         try {
           writeFileSync(lp, raw, "utf-8");
           break;
@@ -91,12 +105,8 @@ export function addToDirectory(entry: EndpointEntry): boolean {
     dir.categories.push(entry.category);
   }
 
-  // Write back to file
-  const possiblePaths = [
-    join(__dirname, "..", "endpoints.json"),       // from dist/ → project root
-    join(process.cwd(), "endpoints.json"),          // from project root
-    "/home/redacted-operator/projects/x402-agent-mcp/endpoints.json",
-  ];
+  // Write back to file (X402_DIRECTORY_PATH override consulted first)
+  const possiblePaths = livePaths();
   for (const p of possiblePaths) {
     try {
       writeFileSync(p, JSON.stringify(dir, null, 2) + "\n", "utf-8");
