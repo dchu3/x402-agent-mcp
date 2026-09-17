@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { addToDirectory } from "../directory.js";
-import { CASPER_CHAIN, isCasperNetwork } from "../casper/networks.js";
+import { fetchJson, fetchRootPaymentChallenge, parseChainFromNetwork } from "./probe-utils.js";
 
 interface WellKnownX402 {
   x402Version?: number;
@@ -56,22 +56,6 @@ interface DiscoveryResult {
   errors?: string[];
 }
 
-async function fetchJson(url: string, timeoutMs: number = 10000): Promise<any | null> {
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
-    const resp = await fetch(url, {
-      signal: controller.signal,
-      headers: { Accept: "application/json" },
-    });
-    clearTimeout(timeout);
-    if (!resp.ok) return null;
-    return await resp.json();
-  } catch {
-    return null;
-  }
-}
-
 async function fetchText(url: string, timeoutMs: number = 10000): Promise<string | null> {
   try {
     const controller = new AbortController();
@@ -82,37 +66,6 @@ async function fetchText(url: string, timeoutMs: number = 10000): Promise<string
     clearTimeout(timeout);
     if (!resp.ok) return null;
     return await resp.text();
-  } catch {
-    return null;
-  }
-}
-
-function parseChainFromNetwork(network: string): string {
-  if (network.includes("solana") || network.includes("5eykt4")) return "solana";
-  if (network.includes("eip155") || network.includes("8453")) return "base";
-  if (isCasperNetwork(network)) return CASPER_CHAIN;
-  return network;
-}
-
-function decodePaymentRequiredHeader(header: string | null): any | null {
-  if (!header) return null;
-  try {
-    // base64url → base64
-    const b64 = header.replace(/-/g, "+").replace(/_/g, "/");
-    const pad = (4 - (b64.length % 4)) % 4;
-    return JSON.parse(Buffer.from(b64 + "=".repeat(pad), "base64").toString("utf-8"));
-  } catch {
-    return null;
-  }
-}
-
-async function fetchRootPaymentChallenge(baseUrl: string, timeoutMs: number = 10000): Promise<any | null> {
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
-    const resp = await fetch(baseUrl, { signal: controller.signal });
-    clearTimeout(timeout);
-    return decodePaymentRequiredHeader(resp.headers.get("payment-required"));
   } catch {
     return null;
   }

@@ -29,22 +29,27 @@ export interface EndpointDirectory {
 
 let cachedDirectory: EndpointDirectory | null = null;
 
-// Directory path resolution order:
-//   1. X402_DIRECTORY_PATH env override (pattern: PAYMENT_LOG_PATH in payment-utils.ts)
-//      — set this in tests/sandboxes so the operator's live endpoints.json is never touched.
+// Directory path resolution order (X402_DIRECTORY_PATH env override first —
+// set this in tests/sandboxes so the operator's live endpoints.json is never touched):
+//   1. X402_DIRECTORY_PATH env override
 //   2. <repo>/endpoints.json (from dist/ → project root)
 //   3. process.cwd()/endpoints.json
-//   4. the shipped template endpoints.example.json (copied to the live path)
 function livePaths(): string[] {
   return [
     ...(process.env.X402_DIRECTORY_PATH ? [process.env.X402_DIRECTORY_PATH] : []),
-    join(__dirname, "..", "endpoints.json"),
-    join(process.cwd(), "endpoints.json"),
+    join(__dirname, "..", "endpoints.json"),       // from dist/ → project root
+    join(process.cwd(), "endpoints.json"),          // from project root
   ];
+}
+
+/** Clear the in-memory directory cache (used by tests between cases). */
+export function clearDirectoryCache(): void {
+  cachedDirectory = null;
 }
 
 export function loadDirectory(): EndpointDirectory {
   if (cachedDirectory) return cachedDirectory;
+  // Try live file first, then template
   const searchPaths = livePaths();
   const templatePaths = [
     join(__dirname, "..", "endpoints.example.json"),
@@ -82,11 +87,6 @@ export function loadDirectory(): EndpointDirectory {
     }
   }
   throw new Error("endpoints.json not found in any expected location");
-}
-
-/** Clear the in-memory directory cache (used by tests between cases). */
-export function clearDirectoryCache(): void {
-  cachedDirectory = null;
 }
 
 export function addToDirectory(entry: EndpointEntry): boolean {
