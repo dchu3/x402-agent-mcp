@@ -1,9 +1,46 @@
 import { strict as assert } from 'node:assert';
-import { afterEach, it } from 'node:test';
-import { registerDiscoverUrlTool } from './discover-url.js';
+import { after, afterEach, it } from 'node:test';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+// Isolate the endpoint directory BEFORE importing the tool, so discovery
+// can never mutate the repo-root endpoints.json (PAYMENT_LOG_PATH pattern).
+const dir = mkdtempSync(join(tmpdir(), 'x402-discover-test-'));
+const overridePath = join(dir, 'endpoints.json');
+writeFileSync(overridePath, readFileSync(join(import.meta.dirname, '..', '..', 'endpoints.example.json'), 'utf-8'));
+const env = { ...process.env };
+process.env.X402_DIRECTORY_PATH = overridePath;
+
+const { registerDiscoverUrlTool } = await import('./discover-url.js');
+const { clearDirectoryCache } = await import('../directory.js');
+
+const repoRootEndpoints = join(import.meta.dirname, '..', '..', 'endpoints.json');
+// endpoints.json at the repo root is gitignored operator data; its absence
+// (clean checkout) is the normal case. Snapshot it once at module load if it
+// exists so tests can assert — unconditionally — that the discover flow never
+// creates, deletes, or modifies it.
+const repoRootSnapshot = existsSync(repoRootEndpoints)
+  ? createHash('md5').update(readFileSync(repoRootEndpoints)).digest('hex')
+  : null;
+
+function assertRepoRootUntouched(): void {
+  if (!existsSync(repoRootEndpoints)) {
+    assert.equal(repoRootSnapshot, null, 'repo-root endpoints.json must not be created or deleted by the flow');
+    return;
+  }
+  assert.ok(repoRootSnapshot !== null, 'repo-root endpoints.json must not be created by the flow');
+  assert.equal(
+    createHash('md5').update(readFileSync(repoRootEndpoints)).digest('hex'),
+    repoRootSnapshot,
+    'repo-root endpoints.json hash must be unchanged'
+  );
+}
 
 const originalFetch = globalThis.fetch;
-afterEach(() => { globalThis.fetch = originalFetch; });
+afterEach(() => { globalThis.fetch = originalFetch; clearDirectoryCache(); process.env = { ...env, X402_DIRECTORY_PATH: overridePath }; });
+after(() => { process.env = env; rmSync(dir, { recursive: true, force: true }); });
 
 function handler() {
   let callback: any;
@@ -196,4 +233,27 @@ it('nothing anywhere: x402_enabled false with existing error message', async () 
   const result = JSON.parse((await handler()({ url: 'https://dead.invalid' })).content[0].text);
   assert.equal(result.x402_enabled, false);
   assert.match(result.error, /No \/.well-known\/x402 found — this service may not be x402-enabled/);
+});
+
+it('discover flow adds to the override path only and never touches repo-root endpoints.json', async () => {
+  globalThis.fetch = (async (input: any) => {
+    const url = String(input instanceof Request ? input.url : input);
+    if (url.endsWith('/.well-known/x402')) {
+      return new Response(JSON.stringify({
+        x402Version: 2,
+        accepts: [{ scheme: 'exact', network: 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp', amount: '5000', payTo: 'SoLWallet', extra: { name: 'USDC' } }],
+        endpoints: [{ path: '/from-x402', method: 'GET' }],
+      }), { status: 200 });
+    }
+    if (url.endsWith('/.well-known/ai-catalog.json')) {
+      return new Response(JSON.stringify({ name: 'CatalogSvc', description: 'from catalog', category: 'ai', endpoints: [{ path: '/c', method: 'GET', price_usdc: '0.01' }] }), { status: 200 });
+    }
+    return new Response('Not Found', { status: 404 });
+  }) as any;
+  const result = JSON.parse((await handler()({ url: 'https://example.invalid' })).content[0].text);
+  assert.equal(result.x402_enabled, true);
+  assert.equal(result.service.name, 'CatalogSvc');
+  const written = JSON.parse(readFileSync(overridePath, 'utf-8'));
+  assert.ok(written.endpoints.some((e: any) => e.base_url === 'https://example.invalid'), 'fixture entry must be written to the override path');
+  assertRepoRootUntouched();
 });

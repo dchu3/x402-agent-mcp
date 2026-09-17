@@ -93,6 +93,7 @@ Check the payment ledger for an entry with `currency: "wCSPR"` and an exact `amo
 | `MAX_PAYMENT_PER_CALL` | 0.50 | Reject any single call above this amount (USDC) |
 | `MAX_DAILY_SPEND` | 10.00 | Reject after cumulative daily spend exceeded (USDC) |
 | `PAYMENT_LOG_PATH` | ./x402-payments.jsonl | Path to payment log file (gitignored) |
+| `X402_DIRECTORY_PATH` | ./endpoints.json | Path to the endpoint directory file (gitignored); set to isolate tests/sandboxes from the live directory |
 
 Payments share one `x402-payments.jsonl` ledger with timestamp, URL, chain, amount, tx hash, and status. USDC entries use `amount_usdc`; Casper entries use `currency: "wCSPR"` and an exact `amount_motes` string. Base/Solana counters are tracked by chain and summed for the existing USD daily limit. Casper has an independent mote counter.
 
@@ -230,6 +231,7 @@ The `endpoints.json` file contains known x402 endpoints. It is **gitignored** â€
 - `x402_discover_url` auto-adds new services when discovered
 - `x402_crawl_directory` scrapes x402scan.com for new services
 - Only true x402 endpoints (no API keys) are included
+- Set `X402_DIRECTORY_PATH` to point the directory elsewhere (consulted first by all reads/writes) â€” useful for tests and sandboxed installs so the live `endpoints.json` is never modified
 
 To bootstrap a fresh install:
 ```bash
