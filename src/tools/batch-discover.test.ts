@@ -84,6 +84,25 @@ it('non-JSON scalar/array well-known bodies are not x402-enabled', async () => {
   }
 });
 
+it('token4u.ai shape: 500 JSON well-known + 200 text/html ai-catalog -> not enabled, no throw', async () => {
+  globalThis.fetch = (async (input: any) => {
+    const url = String(input instanceof Request ? input.url : input);
+    if (url.endsWith('/.well-known/x402')) {
+      return new Response('{"error":"Internal Server Error"}', { status: 500, headers: { 'content-type': 'application/json' } });
+    }
+    if (url.endsWith('/.well-known/ai-catalog.json')) {
+      return new Response(HTML_CATCH_ALL, { status: 200, headers: { 'content-type': 'text/html' } });
+    }
+    return new Response('Not Found', { status: 404 });
+  }) as any;
+  const result = JSON.parse((await handler()({ urls: ['https://token4u.ai'] })).content[0].text);
+  const entry = result.results[0];
+  assert.equal(entry.x402_enabled, false);
+  assert.equal(entry.error, undefined);
+  assert.deepEqual(entry.chains, []);
+  assert.ok(entry.notes?.some((n: string) => /no valid x402 manifest/i.test(n)));
+});
+
 it('404 well-known but root 402 PAYMENT-REQUIRED challenge -> enabled with correct chain', async () => {
   const challenge = JSON.stringify({
     x402Version: 2,
