@@ -1,6 +1,15 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { addToDirectory } from "../directory.js";
+import { fetchJson, fetchRootPaymentChallenge, isX402Manifest, parseChainFromNetwork } from "./probe-utils.js";
+
+function chainsFromManifest(data: any): string[] {
+  const accepts = data.accepts || data.accept || [];
+  const acceptList = Array.isArray(accepts) ? accepts : [accepts];
+  const chains = [...new Set(acceptList.map((a: any) => parseChainFromNetwork(a.network || data.network || "")).filter(Boolean))] as string[];
+  if (chains.length === 0 && data.network) chains.push(parseChainFromNetwork(data.network));
+  return chains;
+}
 
 interface CrawledService {
   url: string;
@@ -60,69 +69,44 @@ function guessCategory(url: string, name: string): string {
 
 async function probeUrl(baseUrl: string): Promise<CrawledService | null> {
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8000);
-
-    // Try /.well-known/x402 first
-    const x402Resp = await fetch(`${baseUrl}/.well-known/x402`, {
-      signal: controller.signal,
-      headers: { Accept: "application/json" },
-    });
-
-    clearTimeout(timeout);
-
-    let x402Enabled = false;
-    let chains: string[] = [];
-    let name = baseUrl.replace(/^https?:\/\//, "").split(".")[0];
+    // Hostname-derived fallback name — strip a leading www.
+    let name = baseUrl.replace(/^https?:\/\//, "").split("/")[0].replace(/^www\./, "").split(".")[0];
     let description = "";
+    let chains: string[] = [];
 
-    if (x402Resp.ok) {
+    // 1. /.well-known/x402 — must parse as JSON AND look like an x402 manifest.
+    //    An HTML catch-all 200 (SPA host) or junk body is not x402 support.
+    const x402Data = await fetchJson(`${baseUrl}/.well-known/x402`, 8000);
+    let x402Enabled = x402Data !== null && isX402Manifest(x402Data);
+    if (x402Enabled) {
+      chains = chainsFromManifest(x402Data);
+      name = x402Data.service || x402Data.name || name;
+      description = x402Data.description || "";
+    }
+
+    // 2. Root 402 PAYMENT-REQUIRED challenge fallback (bounded, never pays)
+    const challenge = !x402Enabled ? await fetchRootPaymentChallenge(baseUrl, 8000) : null;
+    if (challenge && isX402Manifest(challenge)) {
       x402Enabled = true;
-      try {
-        const x402Data = await x402Resp.json();
-        const accepts = x402Data.accepts || x402Data.accept || [];
-        const acceptList = Array.isArray(accepts) ? accepts : [accepts];
-        chains = [...new Set(acceptList.map((a: any) => {
-          const net = a.network || x402Data.network || "";
-          if (net.includes("solana") || net.includes("5eykt4")) return "solana";
-          if (net.includes("eip155") || net.includes("8453")) return "base";
-          return net;
-        }))];
-        if (chains.length === 0 && x402Data.network) {
-          const net = x402Data.network;
-          if (net.includes("solana") || net.includes("5eykt4")) chains = ["solana"];
-          else if (net.includes("eip155") || net.includes("8453")) chains = ["base"];
-          else chains = [net];
-        }
-        name = x402Data.service || x402Data.name || name;
-        description = x402Data.description || "";
-      } catch {}
-    } else {
-      // Try ai-catalog as fallback
-      const controller2 = new AbortController();
-      const timeout2 = setTimeout(() => controller2.abort(), 8000);
-      const catResp = await fetch(`${baseUrl}/.well-known/ai-catalog.json`, {
-        signal: controller2.signal,
-        headers: { Accept: "application/json" },
-      });
-      clearTimeout(timeout2);
+      if (chains.length === 0) chains = chainsFromManifest(challenge);
+    }
 
-      if (catResp.ok) {
-        x402Enabled = true;
-        try {
-          const catalog = await catResp.json();
-          if (catalog.entries && catalog.entries[0]) {
-            name = catalog.entries[0].displayName || catalog.host?.displayName || name;
-            description = catalog.entries[0].description || "";
-          } else if (catalog.name) {
-            name = catalog.name;
-            description = catalog.description || "";
-          }
-        } catch {}
-      } else {
-        return null; // not x402
+    // 3. ai-catalog: real service name/description source; x402 signal on its own
+    const catalog = await fetchJson(`${baseUrl}/.well-known/ai-catalog.json`, 8000);
+    if (catalog !== null) {
+      if (catalog.entries && catalog.entries[0]) {
+        name = catalog.entries[0].displayName || catalog.host?.displayName || name;
+        description = description || catalog.entries[0].description || "";
+      } else if (catalog.name) {
+        name = catalog.name;
+        description = description || catalog.description || "";
+      }
+      if (!x402Enabled) {
+        x402Enabled = true; // has ai-catalog, likely x402
       }
     }
+
+    if (!x402Enabled) return null; // not x402
 
     return {
       url: baseUrl,
