@@ -1,7 +1,7 @@
 import { strict as assert } from 'node:assert';
 import { after, afterEach, it } from 'node:test';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -17,7 +17,26 @@ const { registerDiscoverUrlTool } = await import('./discover-url.js');
 const { clearDirectoryCache } = await import('../directory.js');
 
 const repoRootEndpoints = join(import.meta.dirname, '..', '..', 'endpoints.json');
-const rootMd5 = () => createHash('md5').update(readFileSync(repoRootEndpoints)).digest('hex');
+// endpoints.json at the repo root is gitignored operator data; its absence
+// (clean checkout) is the normal case. Snapshot it once at module load if it
+// exists so tests can assert — unconditionally — that the discover flow never
+// creates, deletes, or modifies it.
+const repoRootSnapshot = existsSync(repoRootEndpoints)
+  ? createHash('md5').update(readFileSync(repoRootEndpoints)).digest('hex')
+  : null;
+
+function assertRepoRootUntouched(): void {
+  if (!existsSync(repoRootEndpoints)) {
+    assert.equal(repoRootSnapshot, null, 'repo-root endpoints.json must not be created or deleted by the flow');
+    return;
+  }
+  assert.ok(repoRootSnapshot !== null, 'repo-root endpoints.json must not be created by the flow');
+  assert.equal(
+    createHash('md5').update(readFileSync(repoRootEndpoints)).digest('hex'),
+    repoRootSnapshot,
+    'repo-root endpoints.json hash must be unchanged'
+  );
+}
 
 const originalFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = originalFetch; clearDirectoryCache(); process.env = { ...env, X402_DIRECTORY_PATH: overridePath }; });
@@ -217,7 +236,6 @@ it('nothing anywhere: x402_enabled false with existing error message', async () 
 });
 
 it('discover flow adds to the override path only and never touches repo-root endpoints.json', async () => {
-  const before = rootMd5();
   globalThis.fetch = (async (input: any) => {
     const url = String(input instanceof Request ? input.url : input);
     if (url.endsWith('/.well-known/x402')) {
@@ -237,5 +255,5 @@ it('discover flow adds to the override path only and never touches repo-root end
   assert.equal(result.service.name, 'CatalogSvc');
   const written = JSON.parse(readFileSync(overridePath, 'utf-8'));
   assert.ok(written.endpoints.some((e: any) => e.base_url === 'https://example.invalid'), 'fixture entry must be written to the override path');
-  assert.equal(rootMd5(), before, 'repo-root endpoints.json hash must be unchanged');
+  assertRepoRootUntouched();
 });
