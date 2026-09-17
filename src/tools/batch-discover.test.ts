@@ -103,6 +103,34 @@ it('token4u.ai shape: 500 JSON well-known + 200 text/html ai-catalog -> not enab
   assert.ok(entry.notes?.some((n: string) => /no valid x402 manifest/i.test(n)));
 });
 
+it('socialx402.com/stabletravel.dev shape: 404 well-known + root 402 challenge -> enabled (regression: was false negative)', async () => {
+  const mk = (network: string, payTo: string) => {
+    const challenge = JSON.stringify({ x402Version: 2, accepts: [{ scheme: 'exact', network, amount: '10000', payTo }] });
+    return Buffer.from(challenge).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  };
+  const challenges: Record<string, string> = {
+    'https://socialx402.com': mk('eip155:8453', '0xSOCIAL'),
+    'https://stabletravel.dev': mk('solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp', 'SoLTravel'),
+  };
+  globalThis.fetch = (async (input: any) => {
+    const url = String(input instanceof Request ? input.url : input);
+    if (challenges[url]) {
+      return new Response('Payment Required', { status: 402, headers: { 'payment-required': challenges[url] } });
+    }
+    return new Response('Not Found', { status: 404 });
+  }) as any;
+  const result = JSON.parse((await handler()({ urls: ['https://socialx402.com', 'https://stabletravel.dev'] })).content[0].text);
+  assert.equal(result.x402_enabled, 2);
+  const [social, travel] = result.results;
+  assert.equal(social.x402_enabled, true);
+  assert.deepEqual(social.chains, ['base']);
+  assert.equal(travel.x402_enabled, true);
+  assert.deepEqual(travel.chains, ['solana']);
+  for (const entry of result.results) {
+    assert.ok(entry.notes?.some((n: string) => /fell back to root 402/i.test(n)));
+  }
+});
+
 it('404 well-known but root 402 PAYMENT-REQUIRED challenge -> enabled with correct chain', async () => {
   const challenge = JSON.stringify({
     x402Version: 2,
