@@ -49,11 +49,22 @@ it('addToDirectory with override writes to override path only, not repo root', (
   assert.equal(md5(REPO_ROOT_ENDPOINTS), rootBefore, 'repo-root endpoints.json must not be modified');
 });
 
-it('loadDirectory with override seeds the override path from the shipped template', () => {
+it('loadDirectory with override reads the override file first', () => {
+  writeFileSync(overridePath, JSON.stringify(template, null, 2) + '\n');
+  const rootBefore = md5(REPO_ROOT_ENDPOINTS);
   const loaded = loadDirectory();
   assert.deepEqual(loaded.categories, template.categories);
-  assert.ok(existsSync(overridePath), 'template should be copied to the override path');
-  assert.equal(existsSync(join(dir, '..', '..', 'endpoints.json')) || true, true);
+  assert.deepEqual(loaded.endpoints, template.endpoints);
+  assert.equal(md5(REPO_ROOT_ENDPOINTS), rootBefore, 'repo-root endpoints.json must not be modified');
+});
+
+it('loadDirectory with override set but absent falls back read-only to the repo file', () => {
+  assert.equal(existsSync(overridePath), false);
+  const rootBefore = md5(REPO_ROOT_ENDPOINTS);
+  const loaded = loadDirectory();
+  assert.ok(Array.isArray(loaded.endpoints));
+  assert.equal(existsSync(overridePath), false, 'fallback must not write when the override file is absent');
+  assert.equal(md5(REPO_ROOT_ENDPOINTS), rootBefore, 'repo-root endpoints.json must not be modified');
 });
 
 it('repo-root endpoints.json content hash is unchanged after the full addToDirectory flow', () => {
