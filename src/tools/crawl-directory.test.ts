@@ -86,6 +86,48 @@ it('crawler enables a host via root 402 PAYMENT-REQUIRED challenge with correct 
   assert.equal(result.services[0].chains[0], 'base');
 });
 
+it('crawler finds the 402 challenge via openapi.json GET paths when the root is an HTML landing page', async () => {
+  clearDirectoryCache();
+  const challenge = JSON.stringify({
+    x402Version: 2,
+    accepts: [{ scheme: 'exact', network: 'eip155:8453', amount: '10000', payTo: '0xWALLET' }],
+  });
+  const b64 = Buffer.from(challenge).toString('base64');
+  globalThis.fetch = probeMock({
+    'landing.example': (url) => {
+      if (url === 'https://landing.example') return new Response(HTML_CATCH_ALL, { status: 200, headers: { 'content-type': 'text/html' } });
+      if (url === 'https://landing.example/openapi.json') {
+        return new Response(JSON.stringify({ openapi: '3.0.0', info: { title: 'X' }, paths: { '/api/data': { get: {} } } }), { status: 200 });
+      }
+      if (url === 'https://landing.example/api/data') {
+        return new Response('Payment Required', { status: 402, headers: { 'payment-required': b64 } });
+      }
+      return new Response('Not Found', { status: 404 });
+    },
+  }) as any;
+  const result = JSON.parse((await handler()({ max_results: 5 })).content[0].text);
+  assert.equal(result.new_services_added, 1);
+  assert.equal(result.services[0].chains[0], 'base');
+});
+
+it('crawler derives chains from SIWX supportedChains when accepts is empty', async () => {
+  clearDirectoryCache();
+  const challenge = JSON.stringify({
+    x402Version: 2,
+    accepts: [],
+    extensions: { 'sign-in-with-x': { supportedChains: [{ chainId: 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp' }] } },
+  });
+  const b64 = Buffer.from(challenge).toString('base64');
+  globalThis.fetch = probeMock({
+    'siwx.example': (url) => url === 'https://siwx.example'
+      ? new Response('Payment Required', { status: 402, headers: { 'payment-required': b64 } })
+      : new Response('Not Found', { status: 404 }),
+  }) as any;
+  const result = JSON.parse((await handler()({ max_results: 5 })).content[0].text);
+  assert.equal(result.new_services_added, 1);
+  assert.deepEqual(result.services[0].chains, ['solana']);
+});
+
 it('crawler prefers a real service name and strips a leading www. from the hostname fallback', async () => {
   clearDirectoryCache();
   globalThis.fetch = probeMock({

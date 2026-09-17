@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { fetchJson, fetchRootPaymentChallenge, isX402Manifest, parseChainFromNetwork } from "./probe-utils.js";
+import { fetchJson, findPaymentChallenge, isX402Manifest, chainsFromManifest } from "./probe-utils.js";
 
 interface BatchResult {
   url: string;
@@ -9,14 +9,6 @@ interface BatchResult {
   chains: string[];
   error?: string;
   notes?: string[];
-}
-
-function chainsFromManifest(data: any): string[] {
-  const accepts = data.accepts || data.accept || [];
-  const acceptList = Array.isArray(accepts) ? accepts : [accepts];
-  const chains = [...new Set(acceptList.map((a: any) => parseChainFromNetwork(a.network || data.network || "")).filter(Boolean))] as string[];
-  if (chains.length === 0 && data.network) chains.push(parseChainFromNetwork(data.network));
-  return chains;
 }
 
 export function registerBatchDiscoverTool(server: McpServer): void {
@@ -47,12 +39,16 @@ export function registerBatchDiscoverTool(server: McpServer): void {
           } else if (x402Data !== null) {
             notes.push("Well-known x402 returned JSON but not an x402 manifest shape");
           } else {
-            // Fall back to root 402 PAYMENT-REQUIRED challenge (bounded, never pays)
-            const challenge = await fetchRootPaymentChallenge(baseUrl);
-            if (challenge && isX402Manifest(challenge)) {
+            // Fall back to a 402 PAYMENT-REQUIRED challenge (root, then
+            // openapi.json GET paths — many hosts serve a 200 HTML landing
+            // page at / ). Bounded, never pays, never sends credentials.
+            const hit = await findPaymentChallenge(baseUrl);
+            if (hit && isX402Manifest(hit.challenge)) {
               x402Enabled = true;
-              chains = chainsFromManifest(challenge);
-              notes.push("No /.well-known/x402 JSON found, fell back to root 402 PAYMENT-REQUIRED challenge");
+              chains = chainsFromManifest(hit.challenge);
+              notes.push(hit.path === "root"
+                ? "No /.well-known/x402 JSON found, fell back to root 402 PAYMENT-REQUIRED challenge"
+                : `No /.well-known/x402 JSON found, fell back to 402 challenge on ${hit.path}`);
             } else {
               // Last resort: a valid ai-catalog.json implies x402 support
               const catalog = await fetchJson(`${baseUrl}/.well-known/ai-catalog.json`);

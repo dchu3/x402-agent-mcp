@@ -103,6 +103,77 @@ it('token4u.ai shape: 500 JSON well-known + 200 text/html ai-catalog -> not enab
   assert.ok(entry.notes?.some((n: string) => /no valid x402 manifest/i.test(n)));
 });
 
+it('claw402.ai live shape: 200 HTML landing at root, 402 challenge found via openapi.json GET path', async () => {
+  const challenge = JSON.stringify({
+    x402Version: 2,
+    accepts: [{ scheme: 'exact', network: 'eip155:8453', amount: '10000', payTo: '0xCLAW' }],
+  });
+  const b64 = Buffer.from(challenge).toString('base64');
+  globalThis.fetch = (async (input: any) => {
+    const url = String(input instanceof Request ? input.url : input);
+    if (url === 'https://claw402.ai' || url === 'https://claw402.ai/') {
+      return new Response(HTML_CATCH_ALL, { status: 200, headers: { 'content-type': 'text/html' } });
+    }
+    if (url === 'https://claw402.ai/openapi.json') {
+      return new Response(JSON.stringify({
+        openapi: '3.0.0',
+        info: { title: 'Claw402' },
+        paths: { '/api/v1/foo': { post: {} }, '/api/v1/models': { get: {} } },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (url === 'https://claw402.ai/api/v1/models') {
+      return new Response('Payment Required', { status: 402, headers: { 'payment-required': b64 } });
+    }
+    if (url.endsWith('/.well-known/x402')) {
+      return new Response(HTML_CATCH_ALL, { status: 200, headers: { 'content-type': 'text/html' } });
+    }
+    return new Response('Not Found', { status: 404 });
+  }) as any;
+  const result = JSON.parse((await handler()({ urls: ['https://claw402.ai'] })).content[0].text);
+  const entry = result.results[0];
+  assert.equal(entry.x402_enabled, true);
+  assert.deepEqual(entry.chains, ['base']);
+  assert.ok(entry.notes?.some((n: string) => /402 challenge on \/api\/v1\/models/i.test(n)));
+});
+
+it('socialx402.com live shape: challenge with empty accepts + SIWX supportedChains -> chains from SIWX', async () => {
+  const challenge = JSON.stringify({
+    x402Version: 2,
+    error: 'SIWX authentication required',
+    accepts: [],
+    extensions: {
+      'sign-in-with-x': {
+        supportedChains: [
+          { chainId: 'eip155:8453', type: 'eip191' },
+          { chainId: 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp', type: 'ed25519' },
+        ],
+      },
+    },
+  });
+  const b64 = Buffer.from(challenge).toString('base64');
+  globalThis.fetch = (async (input: any) => {
+    const url = String(input instanceof Request ? input.url : input);
+    if (url === 'https://socialx402.com') {
+      return new Response(HTML_CATCH_ALL, { status: 200, headers: { 'content-type': 'text/html' } });
+    }
+    if (url === 'https://socialx402.com/openapi.json') {
+      return new Response(JSON.stringify({
+        openapi: '3.0.0',
+        info: { title: 'SocialX402' },
+        paths: { '/api/jobs': { get: {} } },
+      }), { status: 200 });
+    }
+    if (url === 'https://socialx402.com/api/jobs') {
+      return new Response('Payment Required', { status: 402, headers: { 'payment-required': b64 } });
+    }
+    return new Response('Not Found', { status: 404 });
+  }) as any;
+  const result = JSON.parse((await handler()({ urls: ['https://socialx402.com'] })).content[0].text);
+  const entry = result.results[0];
+  assert.equal(entry.x402_enabled, true);
+  assert.deepEqual(entry.chains, ['base', 'solana']);
+});
+
 it('socialx402.com/stabletravel.dev shape: 404 well-known + root 402 challenge -> enabled (regression: was false negative)', async () => {
   const mk = (network: string, payTo: string) => {
     const challenge = JSON.stringify({ x402Version: 2, accepts: [{ scheme: 'exact', network, amount: '10000', payTo }] });

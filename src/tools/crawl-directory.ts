@@ -1,15 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { addToDirectory } from "../directory.js";
-import { fetchJson, fetchRootPaymentChallenge, isX402Manifest, parseChainFromNetwork } from "./probe-utils.js";
-
-function chainsFromManifest(data: any): string[] {
-  const accepts = data.accepts || data.accept || [];
-  const acceptList = Array.isArray(accepts) ? accepts : [accepts];
-  const chains = [...new Set(acceptList.map((a: any) => parseChainFromNetwork(a.network || data.network || "")).filter(Boolean))] as string[];
-  if (chains.length === 0 && data.network) chains.push(parseChainFromNetwork(data.network));
-  return chains;
-}
+import { fetchJson, findPaymentChallenge, isX402Manifest, chainsFromManifest } from "./probe-utils.js";
 
 interface CrawledService {
   url: string;
@@ -84,11 +76,13 @@ async function probeUrl(baseUrl: string): Promise<CrawledService | null> {
       description = x402Data.description || "";
     }
 
-    // 2. Root 402 PAYMENT-REQUIRED challenge fallback (bounded, never pays)
-    const challenge = !x402Enabled ? await fetchRootPaymentChallenge(baseUrl, 8000) : null;
-    if (challenge && isX402Manifest(challenge)) {
+    // 2. 402 PAYMENT-REQUIRED challenge fallback (root, then openapi.json GET
+    //    paths — many x402 hosts serve a 200 HTML landing page at / ).
+    //    Bounded, never pays, never sends credentials.
+    const hit = !x402Enabled ? await findPaymentChallenge(baseUrl, 8000) : null;
+    if (hit && isX402Manifest(hit.challenge)) {
       x402Enabled = true;
-      if (chains.length === 0) chains = chainsFromManifest(challenge);
+      if (chains.length === 0) chains = chainsFromManifest(hit.challenge);
     }
 
     // 3. ai-catalog: real service name/description source; x402 signal on its own
