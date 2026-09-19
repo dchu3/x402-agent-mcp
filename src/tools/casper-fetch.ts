@@ -28,6 +28,14 @@ export async function fetchCasper(url: string, method: string, body: string | un
   let error: string | undefined;
   try {
     const client = new x402Client();
+    // @x402/core >= 2.25 enforces default-asset spendControls BEFORE payment
+    // creation; wCSPR is not an SDK default asset, so Casper offers would be
+    // rejected upstream of our own guard. Disable the SDK controls here: the
+    // repo guard below (guardCasperPayments) is the authoritative gate for
+    // Casper — network pin, wCSPR asset allowlist, mote-exact per-call/daily
+    // budgets, one authorization per call. USD-denominated SDK caps cannot
+    // price motes anyway.
+    client.setSpendControls(false);
     registerCasperScheme(client, key, network);
     authorized = guardCasperPayments(client, network);
     const transport: typeof fetch = async (input, init) => {

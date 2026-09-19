@@ -14,6 +14,10 @@ const offer = { scheme: 'exact', network: 'casper:casper' as const, asset: WCSPR
 function clientFor(budget: CasperBudget) {
   let signed = 0;
   const client = new x402Client();
+  // @x402/core >= 2.25 spendControls default to SDK-recognized assets only and
+  // run before payment-creation hooks; these tests exercise THIS repo's guard
+  // (the production casper-fetch path disables SDK controls the same way).
+  client.setSpendControls(false);
   client.register('casper:casper', { scheme: 'exact', createPaymentPayload: async () => { signed++; return { x402Version: 2, payload: {} }; } });
   guardCasperPayments(client, 'casper:casper', budget);
   return { client, signed: () => signed };
