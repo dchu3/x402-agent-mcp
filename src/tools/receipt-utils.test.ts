@@ -39,8 +39,10 @@ it('success:false receipt -> receipt string returned, txHash undefined', () => {
 });
 
 it('no receipt headers at all -> receipt null, txHash undefined', () => {
-  assert.deepEqual(extractSettlementReceipt(new Headers()), { receipt: null, txHash: undefined });
-  assert.deepEqual(extractSettlementReceipt(() => null), { receipt: null, txHash: undefined });
+  for (const result of [extractSettlementReceipt(new Headers()), extractSettlementReceipt(() => null)]) {
+    assert.equal(result.receipt, null);
+    assert.equal(result.txHash, undefined);
+  }
 });
 
 it('PAYMENT-RESPONSE takes precedence when both spellings are present', () => {

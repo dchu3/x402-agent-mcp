@@ -11,6 +11,7 @@ import { casperBudget } from "../casper/budget.js";
 import { selectCasperAccept, assertPayableCasperAccept, casperAmountMotes } from "../casper/accepts.js";
 import { CASPER_CHAIN, isCasperNetwork, toCasperCaip2 } from "../casper/networks.js";
 import { checkSpendingLimit, logPayment, getDailySpent, getMaxPerCall, getMaxDailySpend } from "../payment-utils.js";
+import { extractSettlementReceipt } from "./receipt-utils.js";
 
 export function registerFetchTool(server: McpServer): void {
   server.tool(
@@ -209,16 +210,7 @@ export function registerFetchTool(server: McpServer): void {
           bodyResult = text.substring(0, 5000);
         }
 
-        const paymentResponse = resp.headers.get("x-payment-response");
-
-        // Log the payment
-        let txHash: string | undefined;
-        if (paymentResponse) {
-          try {
-            const receipt = JSON.parse(Buffer.from(paymentResponse, "base64").toString());
-            txHash = receipt.settlement?.txHash || receipt.transactionHash || receipt.txHash;
-          } catch {}
-        }
+        const { receipt: paymentReceipt, txHash } = extractSettlementReceipt(resp.headers);
 
         // Extract actual cost from response body if available
         let actualCost = amountUsdc;
@@ -247,7 +239,7 @@ export function registerFetchTool(server: McpServer): void {
               paid: resp.status === 200,
               cost_usdc: actualCost,
               daily_spent_usdc: parseFloat(getDailySpent().toFixed(4)),
-              payment_receipt: paymentResponse || null,
+              payment_receipt: paymentReceipt,
               body: bodyResult,
             }),
           }],
