@@ -19,6 +19,7 @@ function cfg(overrides: Partial<PolicyConfig> = {}): PolicyConfig {
     },
     networks: { allowed: ['base', 'solana', 'casper'] },
     tokens: { allowed: ['USDC', 'wCSPR'] },
+    recipients: { mode: 'change-detect', allowed: [], perService: {}, known: {} },
     ...overrides,
   };
 }

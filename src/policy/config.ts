@@ -85,9 +85,13 @@ export function defaultPolicyConfig(errors: string[] = []): PolicyConfig {
     },
     networks: { allowed: ["base", "solana", "casper"] },
     tokens: { allowed: ["USDC", "wCSPR"] },
+    // Issue #26 compat default: change-detect with NO baselines — the rule is
+    // active only for a host with a recorded baseline, so with an empty `known`
+    // map the recipient gate never fires and today's decisions are unchanged
+    // (the unchanged test suite is the proof, README "compat default").
+    recipients: { mode: "change-detect", allowed: [], perService: {}, known: {} },
   };
 }
-
 /** Frozen snapshot of the compat default, exported for documentation/tests.
  * loadPolicyConfig() never mutates it (it builds fresh states). */
 export const DEFAULT_POLICY_CONFIG: PolicyConfig = defaultPolicyConfig();
@@ -108,6 +112,10 @@ function failClosedConfig(errors: string[]): PolicyConfig {
     },
     networks: { allowed: [] },
     tokens: { allowed: [] },
+    // Fail-closed state: allowlist mode with an empty effective list denies
+    // every recipient — consistent with this state's "nothing is payable"
+    // content (the engine additionally short-circuits on configErrors).
+    recipients: { mode: "allowlist", allowed: [], perService: {}, known: {} },
   };
 }
 
@@ -164,17 +172,52 @@ function servicePolicy(v: unknown, path: string, errors: string[]): ServicePolic
   return policy;
 }
 
+function recipientsPolicy(v: unknown, path: string, errors: string[]): void {
+  if (!isPlainObject(v)) {
+    errors.push(`${path} must be an object with a "mode" of allowlist|change-detect`);
+    return;
+  }
+  const known = new Set(["mode", "allowed", "perService", "known"]);
+  for (const key of Object.keys(v)) {
+    if (!known.has(key)) errors.push(`${path}.${key} is not a recognised policy key (typo protection)`);
+  }
+  if (v.mode !== "allowlist" && v.mode !== "change-detect") {
+    errors.push(`${path}.mode must be "allowlist" or "change-detect"`);
+  }
+  if (v.allowed !== undefined) stringArray(v.allowed, `${path}.allowed`, errors);
+  if (v.perService !== undefined) {
+    if (!isPlainObject(v.perService)) {
+      errors.push(`${path}.perService must be an object keyed by hostname`);
+    } else {
+      for (const [host, list] of Object.entries(v.perService)) {
+        stringArray(list, `${path}.perService.${host}`, errors);
+      }
+    }
+  }
+  if (v.known !== undefined) {
+    if (!isPlainObject(v.known)) {
+      errors.push(`${path}.known must be an object keyed by hostname`);
+    } else {
+      for (const [host, baseline] of Object.entries(v.known)) {
+        if (typeof baseline !== "string" || baseline.trim() === "") {
+          errors.push(`${path}.known.${host} must be a non-empty string`);
+        }
+      }
+    }
+  }
+}
+
 /** Strict validation of a parsed config document against the schema. Only
  * `payments` is required (safety-critical — the issue's fail-closed rule);
- * services/networks/tokens are optional and merge over the defaults. Unknown
- * keys are errors everywhere (typo protection: a misspelled cap must never be
- * silently ignored). */
+ * services/networks/tokens/recipients are optional and merge over the
+ * defaults. Unknown keys are errors everywhere (typo protection: a misspelled
+ * cap must never be silently ignored). */
 function validateDocument(doc: unknown, errors: string[]): void {
   if (!isPlainObject(doc)) {
     errors.push("policy config must be a JSON object");
     return;
   }
-  const knownTop = new Set(["payments", "services", "networks", "tokens"]);
+  const knownTop = new Set(["payments", "services", "networks", "tokens", "recipients"]);
   for (const key of Object.keys(doc)) {
     if (!knownTop.has(key)) errors.push(`policy config key "${key}" is not recognised (typo protection)`);
   }
@@ -223,6 +266,14 @@ function validateDocument(doc: unknown, errors: string[]): void {
       for (const key of Object.keys(doc.tokens)) if (key !== "allowed") errors.push(`tokens.${key} is not a recognised policy key`);
       stringArray(doc.tokens.allowed, "tokens.allowed", errors);
     }
+  }
+
+  // recipients — optional; strict shape (issue #26). No mode-conditional
+  // requirements: a partial block merges over the defaults field-by-field in
+  // applyFileConfig, and whatever shape results is what the engine evaluates
+  // (an allowlist mode with an empty effective list denies — fail-closed).
+  if (doc.recipients !== undefined) {
+    recipientsPolicy(doc.recipients, "recipients", errors);
   }
 }
 
@@ -275,6 +326,12 @@ function applyFileConfig(config: PolicyConfig, errors: string[]): void {
     services?: Partial<Record<ServiceLevelKey, ServicePolicy>>;
     networks?: { allowed?: string[] };
     tokens?: { allowed?: string[] };
+    recipients?: {
+      mode?: "allowlist" | "change-detect";
+      allowed?: string[];
+      perService?: Record<string, string[]>;
+      known?: Record<string, string>;
+    };
   };
 
   // payments is fully specified (required) — replace wholesale.
@@ -290,6 +347,22 @@ function applyFileConfig(config: PolicyConfig, errors: string[]): void {
   }
   if (d.networks?.allowed) config.networks = { allowed: [...d.networks.allowed] };
   if (d.tokens?.allowed) config.tokens = { allowed: [...d.tokens.allowed] };
+
+  // Issue #26: merge recipients over the default ONLY when the section is
+  // present, field-by-field, copying fresh arrays/objects — never aliasing
+  // DEFAULT_POLICY_CONFIG (the default template must stay pristine). Shapes
+  // are guaranteed by validateDocument (unknown keys / wrong types error out
+  // before anything is applied).
+  if (d.recipients) {
+    config.recipients = {
+      mode: d.recipients.mode ?? config.recipients.mode,
+      allowed: d.recipients.allowed !== undefined ? [...d.recipients.allowed] : config.recipients.allowed,
+      perService: d.recipients.perService !== undefined
+        ? Object.fromEntries(Object.entries(d.recipients.perService).map(([host, list]) => [host, [...list]]))
+        : config.recipients.perService,
+      known: d.recipients.known !== undefined ? { ...d.recipients.known } : config.recipients.known,
+    };
+  }
 }
 
 function parseNumberOverride(value: string, name: string, errors: string[]): number | undefined {

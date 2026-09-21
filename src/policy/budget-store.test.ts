@@ -95,6 +95,7 @@ it('cap enforcement per service while global cap intact (engine + store together
       },
       networks: { allowed: ['base', 'solana', 'casper'] },
       tokens: { allowed: ['USDC', 'wCSPR'] },
+      recipients: { mode: 'change-detect', allowed: [], perService: {}, known: {} },
     },
     configErrors: [],
   });

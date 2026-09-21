@@ -22,10 +22,32 @@ export interface ServicePolicy {
   maxDaily?: number;
 }
 
+/** Recipient gate policy (issue #26). Two modes, both fail-closed:
+ * - "allowlist": ACTIVE always — a payment may only be made to a recipient on
+ *   the effective allowlist for the host (perService[host] REPLACES the global
+ *   `allowed` list for that host when present). An EMPTY effective list denies
+ *   every recipient; a missing/unusable probed recipient denies too (membership
+ *   can never be proven).
+ * - "change-detect": ACTIVE only for a host with a recorded baseline in `known`
+ *   — denies only when the probed recipient differs from the baseline (no
+ *   baseline ⇒ nothing to compare ⇒ no reason emitted; that is what keeps the
+ *   compat default inactive). */
+export interface RecipientPolicy {
+  mode: "allowlist" | "change-detect";
+  /** Global allowlist (allowlist mode). */
+  allowed: string[];
+  /** host (lowercase) -> allowed recipients, REPLACING `allowed` for that host. */
+  perService: Record<string, string[]>;
+  /** host (lowercase) -> baseline recipient (change-detect mode). */
+  known: Record<string, string>;
+}
+
 /** Policy configuration model (issue Phase 2, JSON per the ratified decision —
  * loaded/validated in src/policy/config.ts; this is the shape the engine uses).
  * Service keys mirror the issue's config example (lowercase trust levels); the
- * engine maps TrustLevel → key case-insensitively. */
+ * engine maps TrustLevel → key case-insensitively. `recipients` is REQUIRED so
+ * every construction site (including test fixtures) must state a recipient
+ * policy — fail-closed at compile time (issue #26). */
 export interface PolicyConfig {
   payments: { enabled: boolean; maxPerRequest: number; maxDaily: number };
   services: {
@@ -37,6 +59,7 @@ export interface PolicyConfig {
   };
   networks: { allowed: string[] };
   tokens: { allowed: string[] };
+  recipients: RecipientPolicy;
 }
 
 /** The request a payment decision is made about. `trustLevel` is supplied by

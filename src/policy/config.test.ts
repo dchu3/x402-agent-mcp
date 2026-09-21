@@ -280,6 +280,106 @@ it('resolveTrustLevel: BLOCKED env outranks TRUSTED env outranks directory, else
   assert.equal(resolveTrustLevel(''), 'UNKNOWN', 'unparseable host → UNKNOWN (fail-closed derivation)');
 });
 
+// ---------------------------------------------------------------------------
+// Issue #26 — the top-level `recipients` block (recipient allowlisting +
+// change detection). Strict validation in the same style as networks/tokens;
+// unknown keys inside the block are errors (typo protection). The COMPAT
+// DEFAULT (no recipients key, or the block absent in the file) is
+// change-detect with no baselines — inactive by construction, so today's
+// decisions are unchanged (rule 4.5 lives in engine.ts).
+// ---------------------------------------------------------------------------
+
+const VALID_RECIPIENTS = {
+  mode: 'allowlist',
+  allowed: ['0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'],
+  perService: { 'svc.example': ['0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'] },
+  known: { 'svc.example': '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' },
+};
+
+it('a file with a valid recipients block loads clean and replaces the default block', () => {
+  process.env.POLICY_CONFIG_PATH = configFile('recipients-valid.json', validFileJson({ recipients: VALID_RECIPIENTS }));
+  const state = loadPolicyConfig();
+  assert.deepEqual(state.configErrors, []);
+  assert.deepEqual(state.config.recipients, {
+    mode: 'allowlist',
+    allowed: ['0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'],
+    perService: { 'svc.example': ['0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'] },
+    known: { 'svc.example': '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' },
+  });
+});
+
+it('a partial recipients block merges over the defaults field-by-field (fresh copies, never aliased)', () => {
+  process.env.POLICY_CONFIG_PATH = configFile('recipients-partial.json', validFileJson({
+    recipients: { mode: 'allowlist', allowed: ['0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'] },
+  }));
+  const state = loadPolicyConfig();
+  assert.deepEqual(state.configErrors, []);
+  assert.equal(state.config.recipients.mode, 'allowlist');
+  assert.deepEqual(state.config.recipients.allowed, ['0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa']);
+  // Fields not present in the file keep their defaults.
+  assert.deepEqual(state.config.recipients.perService, {});
+  assert.deepEqual(state.config.recipients.known, {});
+});
+
+it('an invalid recipients mode fails closed (CONFIG_INVALID)', () => {
+  process.env.POLICY_CONFIG_PATH = configFile('recipients-mode.json', validFileJson({ recipients: { ...VALID_RECIPIENTS, mode: 'deny' } }));
+  const result = getPolicyEngine().evaluate(discoveredCtx);
+  assert.equal(result.decision, 'DENY');
+  assert.ok(result.reasons.some((r) => r.code === 'CONFIG_INVALID'));
+});
+
+it('a malformed recipients allowed list fails closed (CONFIG_INVALID)', () => {
+  for (const bad of [
+    { ...VALID_RECIPIENTS, allowed: '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }, // non-array
+    { ...VALID_RECIPIENTS, allowed: ['0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', ''] }, // empty-string entry
+    { ...VALID_RECIPIENTS, allowed: [42] }, // non-string entry
+  ]) {
+    process.env.POLICY_CONFIG_PATH = configFile('recipients-allowed.json', validFileJson({ recipients: bad }));
+    const result = getPolicyEngine().evaluate(discoveredCtx);
+    assert.equal(result.decision, 'DENY', `recipients block ${JSON.stringify(bad)} must fail closed`);
+    assert.ok(result.reasons.some((r) => r.code === 'CONFIG_INVALID'));
+  }
+});
+
+it('malformed perService / known maps fail closed (CONFIG_INVALID)', () => {
+  for (const bad of [
+    { ...VALID_RECIPIENTS, perService: 'svc.example' }, // not an object
+    { ...VALID_RECIPIENTS, perService: { 'svc.example': '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' } }, // value not an array
+    { ...VALID_RECIPIENTS, perService: { 'svc.example': [''] } }, // empty-string entry
+    { ...VALID_RECIPIENTS, known: ['svc.example'] }, // not an object
+    { ...VALID_RECIPIENTS, known: { 'svc.example': 42 } }, // value not a non-empty string
+    { ...VALID_RECIPIENTS, known: { 'svc.example': '' } }, // empty-string baseline
+  ]) {
+    process.env.POLICY_CONFIG_PATH = configFile('recipients-maps.json', validFileJson({ recipients: bad }));
+    const result = getPolicyEngine().evaluate(discoveredCtx);
+    assert.equal(result.decision, 'DENY', `recipients block ${JSON.stringify(bad)} must fail closed`);
+    assert.ok(result.reasons.some((r) => r.code === 'CONFIG_INVALID'));
+  }
+});
+
+it('an unknown key inside the recipients block fails closed (typo protection)', () => {
+  process.env.POLICY_CONFIG_PATH = configFile('recipients-typo.json', validFileJson({
+    recipients: { ...VALID_RECIPIENTS, allow: ['0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'] },
+  }));
+  const result = getPolicyEngine().evaluate(discoveredCtx);
+  assert.equal(result.decision, 'DENY');
+  assert.ok(result.reasons.some((r) => r.code === 'CONFIG_INVALID' && r.message.includes('allow')));
+});
+
+it('a file WITHOUT a recipients block keeps the behavior-compat default (change-detect, empty maps — inactive)', () => {
+  process.env.POLICY_CONFIG_PATH = configFile('no-recipients.json', validFileJson());
+  const state = loadPolicyConfig();
+  assert.deepEqual(state.configErrors, []);
+  assert.deepEqual(state.config.recipients, { mode: 'change-detect', allowed: [], perService: {}, known: {} });
+});
+
+it('loading a recipients-bearing file never mutates DEFAULT_POLICY_CONFIG', () => {
+  const snapshot = JSON.stringify(DEFAULT_POLICY_CONFIG);
+  process.env.POLICY_CONFIG_PATH = configFile('recipients-snapshot.json', validFileJson({ recipients: VALID_RECIPIENTS }));
+  loadPolicyConfig();
+  assert.equal(JSON.stringify(DEFAULT_POLICY_CONFIG), snapshot, 'loadPolicyConfig must never mutate the default template (recipients included)');
+});
+
 it('DEFAULT_POLICY_CONFIG is the documented compat default and is not mutated by loading', () => {
   const snapshot = JSON.stringify(DEFAULT_POLICY_CONFIG);
   process.env.POLICY_CONFIG_PATH = configFile('policy.json', validFileJson({ payments: { enabled: true, maxPerRequest: 0.1, maxDaily: 1 } }));
