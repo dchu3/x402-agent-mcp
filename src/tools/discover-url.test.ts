@@ -13,7 +13,7 @@ writeFileSync(overridePath, readFileSync(join(import.meta.dirname, '..', '..', '
 const env = { ...process.env };
 process.env.X402_DIRECTORY_PATH = overridePath;
 
-const { registerDiscoverUrlTool } = await import('./discover-url.js');
+const { registerDiscoverUrlTool, boundedTruncatedText, isPrivateAddress } = await import('./discover-url.js');
 const { clearDirectoryCache } = await import('../directory.js');
 
 const repoRootEndpoints = join(import.meta.dirname, '..', '..', 'endpoints.json');
@@ -256,4 +256,108 @@ it('discover flow adds to the override path only and never touches repo-root end
   const written = JSON.parse(readFileSync(overridePath, 'utf-8'));
   assert.ok(written.endpoints.some((e: any) => e.base_url === 'https://example.invalid'), 'fixture entry must be written to the override path');
   assertRepoRootUntouched();
+});
+
+// --- #18.6: SSRF guard + bounded responses ---
+
+it('refuses literal private addresses of every class before any fetch', async () => {
+  const classes = [
+    'http://127.0.0.1:8080/',      // loopback 127/8
+    'http://10.1.2.3/',            // private 10/8
+    'http://172.16.5.4/',          // 172.16/12
+    'http://192.168.0.2/',         // 192.168/16
+    'http://169.254.169.254/',     // link-local 169.254/16 (cloud metadata)
+    'http://0.0.0.0/',             // unspecified (localhost-equivalent)
+    'http://[::1]/',               // IPv6 loopback
+    'http://[fc00::1]/',           // ULA fc00::/7
+    'http://[fe80::1]/',           // IPv6 link-local fe80::/10
+    'http://[::ffff:127.0.0.1]/',  // IPv4-mapped loopback
+  ];
+  let calls = 0;
+  globalThis.fetch = (async () => { calls++; return new Response('nope', { status: 404 }); }) as any;
+  for (const url of classes) {
+    const result = JSON.parse((await handler()({ url })).content[0].text);
+    assert.equal(result.error, 'refused_private_address', url);
+    assert.equal(result.x402_enabled, false, url);
+  }
+  assert.equal(calls, 0, 'refusal must happen before any fetch');
+});
+
+it('public literal IP is not refused (guard must not over-refuse)', async () => {
+  let calls = 0;
+  globalThis.fetch = (async (input: any) => {
+    calls++;
+    const url = String(input instanceof Request ? input.url : input);
+    if (url === 'https://93.184.216.34/.well-known/x402') {
+      return new Response(JSON.stringify({
+        x402Version: 2,
+        accepts: [{ scheme: 'exact', network: 'eip155:8453', amount: '10000', payTo: '0xSELLERWALLET', extra: { name: 'USD Coin' } }],
+      }), { status: 200 });
+    }
+    return new Response('Not Found', { status: 404 });
+  }) as any;
+  const result = JSON.parse((await handler()({ url: 'https://93.184.216.34' })).content[0].text);
+  assert.equal(result.x402_enabled, true);
+  assert.notEqual(result.error, 'refused_private_address');
+  assert.ok(calls > 0, 'public host must actually be fetched');
+});
+
+it('isPrivateAddress classifier covers every class incl. hex-mapped and boundaries', () => {
+  const privateOnes = [
+    '127.0.0.1', '10.0.0.1', '172.16.0.1', '172.31.255.255', '192.168.1.1',
+    '169.254.169.254', '0.0.0.0',
+    '::1', '::', '::ffff:127.0.0.1', '::ffff:7f00:1', 'fc00::1', 'fdff::1',
+    'fe80::1', 'febf::1',
+  ];
+  for (const ip of privateOnes) assert.equal(isPrivateAddress(ip), true, ip);
+  const publicOnes = [
+    '93.184.216.34', '172.32.0.1', '172.15.0.1', '192.169.0.1', '169.255.0.1',
+    '::2', '2606:4700::6810:85e5', '::ffff:8.8.8.8', 'feC0::1',
+  ];
+  for (const ip of publicOnes) assert.equal(isPrivateAddress(ip), false, ip);
+});
+
+it('oversized llms.txt is truncated, not crashed', async () => {
+  const big = 'a'.repeat(80_000);
+  globalThis.fetch = (async (input: any) => {
+    const url = String(input instanceof Request ? input.url : input);
+    if (url.endsWith('/.well-known/x402')) {
+      return new Response(JSON.stringify({
+        x402Version: 2,
+        accepts: [{ scheme: 'exact', network: 'eip155:8453', amount: '10000', payTo: '0xSELLERWALLET', extra: { name: 'USD Coin' } }],
+      }), { status: 200 });
+    }
+    if (url.endsWith('/llms.txt')) return new Response(big, { status: 200 });
+    return new Response('Not Found', { status: 404 });
+  }) as any;
+  const result = JSON.parse((await handler()({ url: 'https://bounded.invalid' })).content[0].text);
+  assert.equal(result.llms_txt, big.slice(0, 2000), 'bounded read caps the body; existing 2000-char cap applies downstream');
+  assert.ok(!(result.errors ?? []).some((e: string) => /No \/llms\.txt found/.test(e)));
+});
+
+it('boundedTruncatedText truncates at the byte limit instead of throwing', async () => {
+  const big = 'b'.repeat(100_000);
+  assert.equal((await boundedTruncatedText(new Response(big))).length, 65536, 'default 64KB bound');
+  assert.equal(await boundedTruncatedText(new Response(big), 1000), 'b'.repeat(1000));
+  assert.equal(await boundedTruncatedText(new Response('small')), 'small');
+});
+
+it('redirect on llms.txt is refused, not followed (redirect: error)', async () => {
+  globalThis.fetch = (async (input: any, init?: any) => {
+    const url = String(input instanceof Request ? input.url : input);
+    if (url.endsWith('/.well-known/x402')) {
+      return new Response(JSON.stringify({
+        x402Version: 2,
+        accepts: [{ scheme: 'exact', network: 'eip155:8453', amount: '10000', payTo: '0xSELLERWALLET', extra: { name: 'USD Coin' } }],
+      }), { status: 200 });
+    }
+    if (url.endsWith('/llms.txt')) {
+      assert.equal(init?.redirect, 'error', 'fetchText must pass redirect: error so redirects are never followed');
+      throw new TypeError('redirect: error'); // mimic undici refusing to follow
+    }
+    return new Response('Not Found', { status: 404 });
+  }) as any;
+  const result = JSON.parse((await handler()({ url: 'https://redirector.invalid' })).content[0].text);
+  assert.equal(result.x402_enabled, true);
+  assert.ok((result.errors ?? []).some((e: string) => /No \/llms\.txt found/.test(e)), 'redirected llms.txt must degrade to not-found, not fetch the redirect target');
 });

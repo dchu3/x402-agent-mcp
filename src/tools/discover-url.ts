@@ -1,5 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { isIP } from "net";
+import { lookup } from "dns/promises";
 import { addToDirectory } from "../directory.js";
 import { fetchJson, fetchRootPaymentChallenge, parseChainFromNetwork } from "./probe-utils.js";
 
@@ -56,16 +58,173 @@ interface DiscoveryResult {
   errors?: string[];
 }
 
+// --- SSRF guard (#18.6) ----------------------------------------------------
+// Discovery fetches attacker-influenced URLs, so the tool handler refuses any
+// host that resolves to a private, loopback or link-local address BEFORE the
+// first request (structured error: refused_private_address). Refuse-at-resolve
+// covers the practical attack; full DNS-rebinding prevention needs socket-level
+// pinning and remains a documented known limitation, as does redirect-following
+// in the shared probe helpers (fetchJson/fetchRootPaymentChallenge).
+
+/** True if ip is a private/loopback/link-local/unspecified IPv4 address:
+ * 127/8, 10/8, 172.16/12, 192.168/16, 169.254/16, 0/8. Fail closed on junk. */
+export function isPrivateIPv4(ip: string): boolean {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(ip);
+  if (!m) return true; // unparseable — fail closed
+  const a = Number(m[1]);
+  const b = Number(m[2]);
+  if (a === 0 || a === 10 || a === 127) return true;   // unspecified / 10/8 / loopback
+  if (a === 172 && b >= 16 && b <= 31) return true;    // 172.16/12
+  if (a === 192 && b === 168) return true;             // 192.168/16
+  if (a === 169 && b === 254) return true;             // 169.254/16 link-local
+  return false;
+}
+
+/** Expand an IPv6 literal into 8 numeric hextets, or null if unparseable.
+ * Handles '::' compression and a trailing dotted quad (converted to two hextets). */
+function expandIPv6(ip: string): number[] | null {
+  if (!/^[0-9a-f:.]+$/.test(ip)) return null;
+  const hasCompression = ip.includes("::");
+  let head: string[];
+  let tail: string[];
+  if (hasCompression) {
+    const parts = ip.split("::");
+    if (parts.length !== 2) return null;
+    head = parts[0] === "" ? [] : parts[0].split(":");
+    tail = parts[1] === "" ? [] : parts[1].split(":");
+  } else {
+    head = ip.split(":");
+    tail = [];
+  }
+  const lastHead = head[head.length - 1];
+  const lastTail = tail[tail.length - 1];
+  const dotted = lastTail?.includes(".") ? lastTail : lastHead?.includes(".") ? lastHead : null;
+  if (dotted) {
+    const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(dotted);
+    if (!m) return null;
+    const hi = ((Number(m[1]) << 8) | Number(m[2])).toString(16);
+    const lo = ((Number(m[3]) << 8) | Number(m[4])).toString(16);
+    if (lastTail?.includes(".")) tail = [...tail.slice(0, -1), hi, lo];
+    else head = [...head.slice(0, -1), hi, lo];
+  }
+  if (head.length + tail.length > 8) return null;
+  const missing = 8 - head.length - tail.length;
+  if (!hasCompression && missing !== 0) return null;
+  const groups = [...head, ...Array<string>(missing).fill("0"), ...tail].map((g) => parseInt(g, 16));
+  if (groups.some((g) => Number.isNaN(g) || g < 0 || g > 0xffff)) return null;
+  return groups;
+}
+
+/** True if ip is a private/loopback/link-local/unspecified IPv6 address:
+ * ::1, :: (unspecified), IPv4-mapped ::ffff:0:0/96 (judged by embedded IPv4),
+ * fc00::/7 (ULA), fe80::/10 (link-local). Fail closed on junk. */
+export function isPrivateIPv6(ip: string): boolean {
+  const s = ip.toLowerCase();
+  // A dotted-quad tail (IPv4-mapped ::ffff:a.b.c.d, deprecated IPv4-compatible
+  // ::a.b.c.d, or NAT64-style literals) is judged by its embedded IPv4 address.
+  const colonParts = s.split(":");
+  const tail = colonParts[colonParts.length - 1];
+  if (tail.includes(".") && isPrivateIPv4(tail)) return true;
+  const groups = expandIPv6(s);
+  if (!groups) return true; // unparseable — fail closed
+  const [g0, g1, g2, g3, g4, g5, g6, g7] = groups;
+  if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0xffff) {
+    return isPrivateIPv4(`${(g6 >> 8) & 0xff}.${g6 & 0xff}.${(g7 >> 8) & 0xff}.${g7 & 0xff}`);
+  }
+  if (groups.every((g) => g === 0)) return true;                       // :: unspecified
+  if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0 && g6 === 0 && g7 === 1) return true; // ::1
+  if (g0 >= 0xfc00 && g0 <= 0xfdff) return true;                      // fc00::/7
+  if (g0 >= 0xfe80 && g0 <= 0xfebf) return true;                      // fe80::/10
+  return false;
+}
+
+/** Classifier used by the SSRF guard and its tests. */
+export function isPrivateAddress(ip: string): boolean {
+  const kind = isIP(ip);
+  if (kind === 4) return isPrivateIPv4(ip);
+  if (kind === 6) return isPrivateIPv6(ip);
+  return false;
+}
+
+function refusalFor(url: string): object {
+  return {
+    url,
+    x402_enabled: false,
+    error: "refused_private_address",
+    detail: "Host resolves to a private, loopback or link-local address; discovery refused before any request (SSRF guard, #18.6). DNS-rebinding prevention via socket pinning is a documented known limitation.",
+    discovered_at: new Date().toISOString(),
+  };
+}
+
+/** Resolve the target host and return a structured refusal object if it maps
+ * to a private/loopback/link-local address, else null. Literal IPs are judged
+ * directly; hostnames are resolved (all families). Unresolvable hosts are NOT
+ * refused here — the fetch itself fails and yields the normal not-found path. */
+async function privateAddressRefusal(rawUrl: string): Promise<object | null> {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return null; // unparseable URL: let the fetch fail through the normal path
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+  const host = parsed.hostname.replace(/^\[/, "").replace(/\]$/, "").toLowerCase();
+  const kind = isIP(host);
+  if (kind === 4) return isPrivateIPv4(host) ? refusalFor(rawUrl) : null;
+  if (kind === 6) return isPrivateIPv6(host) ? refusalFor(rawUrl) : null;
+  let resolved: Array<{ address: string; family: number }>;
+  try {
+    resolved = await lookup(host, { all: true, verbatim: true });
+  } catch {
+    return null;
+  }
+  const unsafe = resolved.some((r) => (r.family === 6 ? isPrivateIPv6(r.address) : isPrivateIPv4(r.address)));
+  return unsafe ? refusalFor(rawUrl) : null;
+}
+
+// --- bounded response reading ----------------------------------------------
+
+/** Read a response body up to limit bytes and TRUNCATE (cancel the stream,
+ * return what was read) when it exceeds the limit. Adapted from casper-fetch.ts
+ * boundedText(), which instead throws: on the payment path an oversized body is
+ * an attack signal, while discovery content is advisory and degrades gracefully. */
+export async function boundedTruncatedText(response: Response, limit = 65536): Promise<string> {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const remaining = limit - size;
+      if (value.byteLength > remaining) {
+        chunks.push(value.subarray(0, remaining));
+        await reader.cancel();
+        break;
+      }
+      size += value.byteLength;
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 async function fetchText(url: string, timeoutMs: number = 10000): Promise<string | null> {
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    // redirect: "error" — a redirect target is never resolved by the SSRF guard,
+    // so redirects must never be followed (same rule as the payment fetch paths).
     const resp = await fetch(url, {
       signal: controller.signal,
+      redirect: "error",
     });
     clearTimeout(timeout);
     if (!resp.ok) return null;
-    return await resp.text();
+    return await boundedTruncatedText(resp);
   } catch {
     return null;
   }
@@ -108,6 +267,17 @@ export function registerDiscoverUrlTool(server: McpServer): void {
     async (args) => {
       const baseUrl = args.url.replace(/\/$/, "");
       const errors: string[] = [];
+
+      // SSRF guard (#18.6): resolve and judge the target BEFORE any request.
+      const refusal = await privateAddressRefusal(baseUrl);
+      if (refusal) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify(refusal, null, 2),
+          }],
+        };
+      }
 
       // Step 1: Fetch /.well-known/x402
       let x402Data = await fetchJson(`${baseUrl}/.well-known/x402`);
