@@ -688,3 +688,106 @@ it('forced chain solana: an endpoint that does not charge (probe answers 200) pa
   const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
   assert.equal(entries.find((e: any) => e.url === url)?.status, 'success');
 });
+
+// ---------------------------------------------------------------------------
+// Issue #26 — the probe recipient enters the policy gate (rule 4.5).
+// Base/Solana: the Step 3.5 gate evaluates the probed payTo. Casper: the pure
+// selectCasperAccept is hoisted above the gate so the Casper leg can evaluate
+// its recipient too — the throw/budget/intent order below the gate is
+// untouched. Compat default (change-detect, no baselines) fires nothing.
+// ---------------------------------------------------------------------------
+
+function policyConfigFile(content: Record<string, unknown>): string {
+  const d = mkdtempSync(join(tmpdir(), 'x402-fetch-rcpt-'));
+  extraDirs.push(d);
+  const p = join(d, 'policy.json');
+  writeFileSync(p, JSON.stringify(content), 'utf8');
+  return p;
+}
+
+it('recipient allowlist DENY: the wrong probed recipient is refused by policy before the payment layer', async () => {
+  const strangerWallet = bs58.encode(Buffer.alloc(32, 0x0b));
+  process.env.POLICY_CONFIG_PATH = policyConfigFile({
+    payments: { enabled: true, maxPerRequest: 0.5, maxDaily: 10 },
+    recipients: { mode: 'allowlist', allowed: [strangerWallet], perService: {}, known: {} },
+  });
+  const url = 'https://rcpt-deny-test.invalid/api';
+  const before = ledgerLines();
+  let calls = 0;
+  globalThis.fetch = (async () => { calls++; return chargeableSolanaChallenge(url); }) as any;
+  const result = await handler()({ url });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(calls, 1, 'only the 402 probe may hit the network — the paid fetch must never run');
+  assert.equal(parsed.policy_decision, 'DENY');
+  assert.ok(parsed.reasons.some((r: any) => r.code === 'RECIPIENT_NOT_ALLOWED'), 'the recipient code must reach the caller');
+  assert.match(
+    parsed.reasons.find((r: any) => r.code === 'RECIPIENT_NOT_ALLOWED').message,
+    /CHARGE_PAYTO_B58|not in the allowlist/,
+    'the refusal must name the compared recipient (the probed payTo), not a vague generic message',
+  );
+  assert.deepEqual(ledgerLines(), before, 'DENY must not write to the payment ledger');
+});
+
+it('recipient allowlist: the matching probed recipient pays exactly as before (no false positives)', async () => {
+  process.env.POLICY_CONFIG_PATH = policyConfigFile({
+    payments: { enabled: true, maxPerRequest: 0.5, maxDaily: 10 },
+    recipients: { mode: 'allowlist', allowed: [CHARGE_PAYTO_B58], perService: {}, known: {} },
+  });
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  process.env.SOLANA_RPC_URL = RPC_SIM_URL;
+  const url = 'https://rcpt-allow-test.invalid/api';
+  let probes = 0, paidAttempts = 0, rpcCalls = 0, signedRetries = 0;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    const urlStr = input instanceof Request ? input.url : String(input);
+    if (urlStr.startsWith(RPC_SIM_URL)) {
+      rpcCalls++;
+      return rpcSimResponse(await requestBodyText(input, init));
+    }
+    assert.equal(urlStr, url, 'no other endpoint call may happen');
+    if (noSignatureHeader(input, init)) {
+      signedRetries++;
+      return new Response('{"result":"ok"}', { status: 200, headers: { 'PAYMENT-RESPONSE': receiptB64 } });
+    }
+    if (probes === 0) { probes++; return chargeableSolanaChallenge(url); }
+    paidAttempts++;
+    return chargeableSolanaChallenge(url);
+  }) as any;
+  const before = ledgerLines();
+  const result = await handler()({ url, chain: 'solana' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(probes, 1);
+  assert.equal(paidAttempts, 1);
+  assert.equal(rpcCalls, 1);
+  assert.equal(signedRetries, 1, 'the listed recipient must still be signed and paid');
+  assert.equal(parsed.status, 200);
+  assert.equal(parsed.paid, true);
+  assert.equal(parsed.cost_usdc, 0.01);
+  assert.equal(parsed.policy_decision, undefined, 'ALLOW adds no policy keys to the success output');
+  const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
+  assert.equal(entries.find((e: any) => e.url === url)?.status, 'success');
+});
+
+it('recipient change-detect: a Casper payTo differing from the recorded baseline is refused at the gate before casperBudget/reserve', async () => {
+  const url = 'https://casper-rcpt-mismatch-test.invalid/api';
+  const roguePayTo = '00' + 'cd'.repeat(32); // NOT the payTo the probe advertises ('00' + 'ab'.repeat(32))
+  process.env.POLICY_CONFIG_PATH = policyConfigFile({
+    payments: { enabled: true, maxPerRequest: 0.5, maxDaily: 10 },
+    recipients: { mode: 'change-detect', allowed: [], perService: {}, known: { 'casper-rcpt-mismatch-test.invalid': roguePayTo } },
+  });
+  let calls = 0;
+  globalThis.fetch = (async () => { calls++; return casperChallengeFixed(); }) as any;
+  const { casperBudget } = await import('../casper/budget.js');
+  const budgetBefore = casperBudget.getDailySpent();
+  const result = await handler()({ url, chain: 'casper' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(calls, 1, 'only the probe may run — no Casper payment machinery');
+  assert.equal(parsed.policy_decision, 'DENY');
+  assert.ok(parsed.reasons.some((r: any) => r.code === 'RECIPIENT_NOT_ALLOWED'));
+  assert.match(
+    parsed.reasons.find((r: any) => r.code === 'RECIPIENT_NOT_ALLOWED').message,
+    /differs from the recorded baseline/,
+    'the Casper gate must have compared the PROBED payTo against the baseline — not a missing-recipient fallback',
+  );
+  assert.equal(casperBudget.getDailySpent(), budgetBefore, 'the refusal must precede any casperBudget reserve');
+});

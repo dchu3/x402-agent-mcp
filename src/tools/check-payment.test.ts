@@ -119,3 +119,80 @@ it('APPROVAL_REQUIRED surfaces as its own decision (engine-level; fetch refuses 
   assert.equal(parsed.decision, 'APPROVAL_REQUIRED');
   assert.ok(parsed.reasons.some((r: any) => r.code === 'APPROVAL_REQUIRED'));
 });
+// ---------------------------------------------------------------------------
+// Issue #26 — x402_check_payment parity: the inspection tool accepts an
+// optional `recipient` argument so an agent can check the recipient gate
+// BEFORE x402_fetch. The tool never pays (tripwire asserted per test).
+// ---------------------------------------------------------------------------
+
+const RCPT_POLICY_DIR = mkdtempSync(join(tmpdir(), 'x402-check-payment-rcpt-'));
+process.env.X402_POLICY_RECIPIENTS_FIXTURE = RCPT_POLICY_DIR; // keep a handle; individual tests set POLICY_CONFIG_PATH
+
+function recipientsConfigFile(content: Record<string, unknown>): string {
+  const p = join(RCPT_POLICY_DIR, `policy-${Object.keys(content).length}-${Math.random().toString(36).slice(2)}.json`);
+  writeFileSync(p, JSON.stringify(content), 'utf8');
+  return p;
+}
+
+it('recipient argument: the matching recipient (different formatting, same canonical form) is ALLOWed and echoed', async () => {
+  const payment = payingFetchMock();
+  process.env.POLICY_CONFIG_PATH = recipientsConfigFile({
+    payments: { enabled: true, maxPerRequest: 0.5, maxDaily: 10 },
+    recipients: { mode: 'allowlist', allowed: ['0x833589fcd6edb6e08f4c7c32d4f71b54bda02913'], perService: {}, known: {} },
+  });
+  const result = await handler()({ url: 'https://analyzer.example/score', amount: 0.05, chain: 'base', token: 'USDC', recipient: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.decision, 'ALLOW');
+  assert.equal(parsed.recipient, '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', 'the probed recipient is echoed verbatim');
+  assert.equal(parsed.recipient_normalized, '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913', 'the normalized form is echoed');
+  assert.equal(payment.calls, 0);
+});
+
+it('recipient argument: a recipient outside the allowlist is refused with RECIPIENT_NOT_ALLOWED', async () => {
+  const payment = payingFetchMock();
+  process.env.POLICY_CONFIG_PATH = recipientsConfigFile({
+    payments: { enabled: true, maxPerRequest: 0.5, maxDaily: 10 },
+    recipients: { mode: 'allowlist', allowed: ['0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'], perService: {}, known: {} },
+  });
+  const result = await handler()({ url: 'https://analyzer.example/score', amount: 0.05, chain: 'base', token: 'USDC', recipient: '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.decision, 'DENY');
+  assert.ok(parsed.reasons.some((r: any) => r.code === 'RECIPIENT_NOT_ALLOWED'));
+  assert.equal(payment.calls, 0);
+});
+
+it('recipient argument: omitting the recipient in allowlist mode is refused (the tool states the requirement)', async () => {
+  const payment = payingFetchMock();
+  process.env.POLICY_CONFIG_PATH = recipientsConfigFile({
+    payments: { enabled: true, maxPerRequest: 0.5, maxDaily: 10 },
+    recipients: { mode: 'allowlist', allowed: ['0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'], perService: {}, known: {} },
+  });
+  const result = await handler()({ url: 'https://analyzer.example/score', amount: 0.05, chain: 'base', token: 'USDC' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.decision, 'DENY');
+  assert.ok(parsed.reasons.some((r: any) => r.code === 'RECIPIENT_NOT_ALLOWED'));
+  assert.equal(payment.calls, 0);
+});
+
+it('recipient argument: change-detect parity — a probed recipient differing from the baseline is refused', async () => {
+  const payment = payingFetchMock();
+  process.env.POLICY_CONFIG_PATH = recipientsConfigFile({
+    payments: { enabled: true, maxPerRequest: 0.5, maxDaily: 10 },
+    recipients: { mode: 'change-detect', allowed: [], perService: {}, known: { 'analyzer.example': '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' } },
+  });
+  const result = await handler()({ url: 'https://analyzer.example/score', amount: 0.05, chain: 'base', token: 'USDC', recipient: '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.decision, 'DENY');
+  assert.ok(parsed.reasons.some((r: any) => r.code === 'RECIPIENT_NOT_ALLOWED'));
+  assert.equal(payment.calls, 0);
+});
+
+it('recipient argument: the compat default (change-detect, no baselines) ignores the recipient entirely', async () => {
+  const payment = payingFetchMock();
+  const result = await handler()({ url: 'https://analyzer.example/score', amount: 0.05, chain: 'base', token: 'USDC', recipient: '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.decision, 'ALLOW', 'no baseline for the host ⇒ the recipient gate is inactive');
+  assert.equal(parsed.recipient, '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+  assert.equal(parsed.recipient_normalized, '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
+  assert.equal(payment.calls, 0);
+});

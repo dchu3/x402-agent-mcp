@@ -215,19 +215,26 @@ export function registerFetchTool(server: McpServer): void {
 
             // Casper settles in wCSPR motes (9 decimals), not 6-decimal USDC.
             if (useChain === CASPER_CHAIN) {
+              // Issue #26: the Casper recipient is only knowable after accept
+              // selection, and selectCasperAccept is pure and non-throwing —
+              // so it is evaluated ABOVE the gate (same call, same arguments,
+              // semantics unchanged) and its payTo feeds the gate. The throw
+              // below keeps its exact position: refusal order for a 402
+              // without a Casper accept stays gate-refusal (if any) first, then
+              // the throw.
+              const casperAccept = selectCasperAccept(paymentInfo, casperNetwork);
               // POLICY GATE (issue #19): evaluate() BEFORE the internal Casper
               // budget check; casper/budget.ts stays untouched inside the
               // payment layer. Casper amounts have no USD price at this layer,
               // so amount 0 — mote budgets remain the spend control, and the
-              // engine enforces chain/token/service rules + global kill switch.
+              // engine enforces chain/token/service/recipient rules + global kill switch.
               const casperPolicy = getPolicyEngine().evaluate(
-                buildPolicyContext(url, CASPER_CHAIN, "wCSPR", 0),
+                buildPolicyContext(url, CASPER_CHAIN, "wCSPR", 0, { recipient: casperAccept?.payTo }),
                 { dailySpentUsd: getDailySpent(), perServiceSpentUsd: getPerServiceSpent(serviceHost) },
               );
               if (casperPolicy.decision !== "ALLOW") {
                 return policyRefusal(casperPolicy, url, CASPER_CHAIN, 0);
               }
-              const casperAccept = selectCasperAccept(paymentInfo, casperNetwork);
               if (!casperAccept) throw new Error("No matching exact Casper payment offer");
               if (casperAccept) {
                 casperNetwork = toCasperCaip2(casperAccept.network);
@@ -337,9 +344,11 @@ export function registerFetchTool(server: McpServer): void {
         // must pass before payment code runs. APPROVAL_REQUIRED is refused
         // here too (stdio MCP has no human-approval channel in Phase 1 — the
         // issue's fail-closed principle; the APPROVAL_REQUIRED reason code is
-        // preserved so callers see why).
+        // preserved so callers see why). Issue #26: the probed payTo enters
+        // the gate as the recipient (rule 4.5) — the same single probe value
+        // the intent binds below, so policy validates exactly what is signed.
         const policyResult = getPolicyEngine().evaluate(
-          buildPolicyContext(url, useChain, "USDC", amountUsdc),
+          buildPolicyContext(url, useChain, "USDC", amountUsdc, { recipient: probedOffer?.payTo }),
           { dailySpentUsd: getDailySpent(), perServiceSpentUsd: getPerServiceSpent(serviceHost) },
         );
         if (policyResult.decision !== "ALLOW") {

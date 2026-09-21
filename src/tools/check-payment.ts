@@ -16,6 +16,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { loadDirectory } from "../directory.js";
 import { getPolicyEngine, buildPolicyContext } from "../policy/config.js";
+import { normalizeRecipient } from "../policy/recipient.js";
 import { getDailySpent } from "../payment-utils.js";
 import { getPerServiceSpent } from "../policy/budget-store.js";
 
@@ -39,12 +40,13 @@ function findDirectoryEntry(host: string) {
 export function registerCheckPaymentTool(server: McpServer): void {
   server.tool(
     "x402_check_payment",
-    "Evaluate a prospective x402 payment against the payment policy WITHOUT paying. Returns ALLOW / DENY / APPROVAL_REQUIRED with stable machine-readable reason codes. Use it before x402_fetch to understand the policy boundary. This tool never performs a payment.",
+    "Evaluate a prospective x402 payment against the payment policy WITHOUT paying. Returns ALLOW / DENY / APPROVAL_REQUIRED with stable machine-readable reason codes. Use it before x402_fetch to understand the policy boundary. In recipient allowlist mode the recipient argument is REQUIRED (pass the payTo address from the 402 challenge); in change-detect mode it is compared against the recorded baseline. This tool never performs a payment.",
     {
       url: z.string().describe("Full URL of the x402 endpoint you intend to pay (e.g. https://example.com/api)"),
       amount: z.number().optional().describe("Prospective payment amount in USD (e.g. from the 402 challenge). Omit to check chain/token/service rules with the directory price when known."),
       chain: z.string().optional().describe("Payment chain: 'base', 'solana' or 'casper'. Defaults to the directory entry's chain, else 'base'."),
       token: z.string().optional().describe("Payment token, e.g. 'USDC' or 'wCSPR'. Defaults to 'USDC'."),
+      recipient: z.string().optional().describe("The recipient address that would be paid (payTo from the 402 challenge). Required to evaluate recipient allowlist mode; compared against the recorded baseline in change-detect mode."),
     },
     async (args) => {
       let host = "";
@@ -82,11 +84,18 @@ export function registerCheckPaymentTool(server: McpServer): void {
       }
       const amountUsd = amount ?? 0;
 
-      const ctx = buildPolicyContext(args.url, chain, token, amountUsd);
+      const ctx = buildPolicyContext(args.url, chain, token, amountUsd, { recipient: args.recipient });
       const result = getPolicyEngine().evaluate(ctx, {
         dailySpentUsd: getDailySpent(),
         perServiceSpentUsd: getPerServiceSpent(host),
       });
+
+      // Issue #26: echo the probed recipient verbatim plus its normalized
+      // (canonical) form — the exact value rule 4.5 compared. null when no
+      // recipient was supplied or it is not a valid address for the chain.
+      const recipientEcho = args.recipient !== undefined
+        ? { recipient: args.recipient, recipient_normalized: normalizeRecipient(chain, args.recipient) ?? null }
+        : {};
 
       const output = {
         decision: result.decision,
@@ -94,6 +103,7 @@ export function registerCheckPaymentTool(server: McpServer): void {
         amount: amountUsd.toFixed(2),
         currency: token,
         chain,
+        ...recipientEcho,
         trust_level: result.limits.trustLevel,
         reasons: result.reasons.map((r) => ({ code: r.code, message: r.message })),
         limits: result.limits,
