@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { afterEach, after, it } from 'node:test';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, chmodSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadPolicyConfig, getPolicyEngine, resolveTrustLevel, DEFAULT_POLICY_CONFIG } from './config.js';
@@ -154,6 +154,47 @@ it('a missing config file at POLICY_CONFIG_PATH loads the default policy (ratifi
   assert.deepEqual(state.configErrors, []);
   assert.equal(state.config.payments.enabled, true);
   assert.equal(state.config.payments.maxPerRequest, 0.5);
+});
+
+// ---------------------------------------------------------------------------
+// Post-#23 follow-up: the loader used to swallow EVERY read error as if the
+// file were merely missing — a file that EXISTS but is UNREADABLE (revoked
+// permissions, a directory path, …) then silently ran the DEFAULT policy,
+// discarding the operator's tightened rules and failing open. Missing file
+// (ENOENT) stays ratified default-policy behavior; every OTHER read error
+// fails closed with CONFIG_INVALID + PAYMENTS_DISABLED.
+// ---------------------------------------------------------------------------
+
+it('a config file that exists but is unreadable (EACCES) fails closed — never silently permissive', (t) => {
+  const p = configFile('unreadable.json', validFileJson());
+  chmodSync(p, 0o000);
+  try {
+    readFileSync(p); // root (or CAP_DAC_OVERRIDE) can still read chmod-000 files
+    t.skip('chmod-000 is still readable to this process (e.g. running as root) — cannot simulate EACCES here');
+  } catch {
+    // unreadable exactly as intended — proceed
+  }
+  process.env.POLICY_CONFIG_PATH = p;
+  const engine = getPolicyEngine();
+  const result = engine.evaluate(discoveredCtx);
+  assert.equal(result.decision, 'DENY', 'an unreadable config must never fall back to the (permissive) default policy');
+  assert.deepEqual(result.reasons.map((r) => r.code), ['CONFIG_INVALID', 'PAYMENTS_DISABLED']);
+  assert.ok(
+    result.reasons.some((r) => r.code === 'CONFIG_INVALID' && r.message.includes('EACCES')),
+    'the CONFIG_INVALID reason must carry the underlying read error',
+  );
+});
+
+it('a config path pointing at a directory (EISDIR) fails closed like any other non-missing read error', () => {
+  process.env.POLICY_CONFIG_PATH = tempDir(); // a directory — readFileSync throws EISDIR, not ENOENT
+  const engine = getPolicyEngine();
+  const result = engine.evaluate(discoveredCtx);
+  assert.equal(result.decision, 'DENY');
+  assert.deepEqual(result.reasons.map((r) => r.code), ['CONFIG_INVALID', 'PAYMENTS_DISABLED']);
+  assert.ok(
+    result.reasons.some((r) => r.code === 'CONFIG_INVALID' && r.message.includes('EISDIR')),
+    'the CONFIG_INVALID reason must carry the underlying read error',
+  );
 });
 
 it('X402_POLICY_* env overrides take precedence over the config file', () => {

@@ -274,6 +274,10 @@ export function registerFetchTool(server: McpServer): void {
 
         const { receipt: paymentReceipt, txHash } = extractSettlementReceipt(resp.headers);
 
+        // The exact accounting rule payment-utils.logPayment counts by (and
+        // ledger rehydration filters by): only a 200 counts as spend.
+        const isSuccessfulPayment = resp.status === 200;
+
         // Extract actual cost from response body if available
         let actualCost = amountUsdc;
         if (bodyResult && typeof bodyResult === "object") {
@@ -288,13 +292,21 @@ export function registerFetchTool(server: McpServer): void {
           chain: useChain,
           amount_usdc: actualCost,
           tx_hash: txHash,
-          status: resp.status === 200 ? "success" : "failed",
+          status: isSuccessfulPayment ? "success" : "failed",
         });
 
         // Issue #19: per-service budget accounting — recorded right next to
         // logPayment for USD-settled successes (same rules as the global
         // tracker; rehydration rebuilds identical values after a restart).
-        recordServicePayment(url, actualCost);
+        // Post-#23 parity fix: the guard MUST be the same one logPayment
+        // counts by (resp.status === 200). Rehydration filters ledger entries
+        // by status === "success", so recording a non-200 settled response
+        // here (e.g. 500-after-settlement) would count it in-process while
+        // the ledger drops it — per-service caps would silently loosen after
+        // a restart (in-process vs post-restart spend divergence).
+        if (isSuccessfulPayment) {
+          recordServicePayment(url, actualCost);
+        }
 
         return {
           content: [{
