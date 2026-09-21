@@ -1,7 +1,7 @@
 import { strict as assert } from 'node:assert';
 import { after, afterEach, it } from 'node:test';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -12,7 +12,7 @@ const overridePath = join(dir, 'endpoints.json');
 const env = { ...process.env };
 process.env.X402_DIRECTORY_PATH = overridePath;
 
-const { addToDirectory, loadDirectory, clearDirectoryCache } = await import('./directory.js');
+const { addToDirectory, loadDirectory, clearDirectoryCache, atomicWriteFileSync } = await import('./directory.js');
 
 // endpoints.json at the repo root is gitignored operator data; its absence
 // (clean checkout) is the normal case. Snapshot it once at module load if it
@@ -95,4 +95,71 @@ it('repo-root endpoints.json is unchanged after the full addToDirectory flow', (
   const written = JSON.parse(readFileSync(overridePath, 'utf-8'));
   assert.equal(written.endpoints.length, 2);
   assertRepoRootUntouched();
+});
+
+// --- #18.3: corrupt-file recovery + atomic writes ---
+
+function cleanCorruptEvidence(): void {
+  for (const f of readdirSync(dir).filter((f) => f.startsWith('endpoints.json.corrupt-'))) {
+    rmSync(join(dir, f));
+  }
+}
+
+function quarantinedFiles(): string[] {
+  return readdirSync(dir).filter((f) => f.startsWith('endpoints.json.corrupt-'));
+}
+
+it('corrupt endpoints.json is quarantined and the directory recovers to empty', () => {
+  cleanCorruptEvidence();
+  const garbage = '{"endpoints": [ broken';
+  writeFileSync(overridePath, garbage);
+  const loaded = loadDirectory();
+  assert.deepEqual(loaded.endpoints, [], 'corrupt file must recover to an empty directory, not crash');
+  assert.deepEqual(loaded.categories, []);
+  const evidence = quarantinedFiles();
+  assert.equal(evidence.length, 1, 'exactly one corrupt-evidence file');
+  assert.match(evidence[0], /endpoints\.json\.corrupt-/);
+  assert.equal(readFileSync(join(dir, evidence[0]), 'utf-8'), garbage, 'corrupt evidence preserved verbatim');
+  assertRepoRootUntouched();
+});
+
+it('valid JSON with a non-directory shape is quarantined too (never crashes the MCP)', () => {
+  cleanCorruptEvidence();
+  writeFileSync(overridePath, '{"not": "a directory"}');
+  const loaded = loadDirectory();
+  assert.deepEqual(loaded.endpoints, []);
+  assert.equal(quarantinedFiles().length, 1, 'shape-invalid file quarantined as evidence');
+  assertRepoRootUntouched();
+});
+
+it('after corrupt recovery, addToDirectory rebuilds a valid directory', () => {
+  cleanCorruptEvidence();
+  writeFileSync(overridePath, 'CORRUPT');
+  const loaded = loadDirectory(); // quarantines + caches empty
+  assert.equal(loaded.endpoints.length, 0);
+  assert.equal(addToDirectory(entry), true, 'write after recovery must succeed');
+  clearDirectoryCache();
+  const reloaded = loadDirectory();
+  assert.equal(reloaded.endpoints.length, 1);
+  assert.equal(reloaded.endpoints[0].base_url, entry.base_url);
+  assertRepoRootUntouched();
+});
+
+it('atomic write leaves no temp files behind on success', () => {
+  const target = join(dir, 'atomic-target.json');
+  atomicWriteFileSync(target, '{"ok":true}');
+  assert.equal(readFileSync(target, 'utf-8'), '{"ok":true}');
+  assert.deepEqual(readdirSync(dir).filter((f) => f.includes('.tmp-')), [], 'no temp file leftovers');
+});
+
+it('atomic write cleans up its temp file on failure (read-only directory)', () => {
+  const roDir = join(dir, 'readonly');
+  mkdirSync(roDir);
+  chmodSync(roDir, 0o555);
+  try {
+    assert.throws(() => atomicWriteFileSync(join(roDir, 'target.json'), 'data'));
+  } finally {
+    chmodSync(roDir, 0o755); // restore so cleanup can remove the dir
+  }
+  assert.deepEqual(readdirSync(roDir).filter((f) => f.includes('.tmp-')), [], 'temp file removed after failed write');
 });
