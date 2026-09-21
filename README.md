@@ -101,6 +101,21 @@ Casper reserves budget synchronously before signing to prevent concurrent oversp
 
 Counters are process-local and reset at UTC midnight or process restart. They are not a durable, multi-instance wallet limit.
 
+### Limitations — read before relying on these budgets
+
+- **Per-process counters.** Daily spend lives in the memory of one MCP process (rehydrated once from the ledger on the first budget check). It is never a wallet-level limit.
+- **Multiple instances = separate budgets.** Running two MCP processes gives each its own counter, so the real daily spend can reach N × `MAX_DAILY_SPEND`. Durable multi-instance enforcement requires an external store and is on the roadmap; until then, run one instance per budget scope.
+- **The USDC daily cap can be overshot by in-flight concurrency.** The guard checks `MAX_DAILY_SPEND` before paying and records spend only after settlement; the await points between the check and the log inside a paid fetch mean several in-flight requests can pass the same check. The synchronous check-then-log span itself is exact (locked by the concurrent-consumption test in `src/payment-utils.rehydrate.test.ts`), but cross-await atomicity must not be assumed.
+- **Casper is the fail-closed equivalent class.** Casper reserves budget synchronously *before* signing, so concurrent Casper calls cannot overspend, and an unset or invalid budget disables Casper payments entirely. Verified by `src/casper/budget.test.ts`: "daily reservations prevent concurrent callers overspending", "checks changed requirements at signing and blocks retries", "unset either Casper budget disables signing", "invalid, zero and negative budgets disable payment", and "rolls only the Casper counter at UTC day change".
+
+## Trust Model
+
+**Settlement receipts are server-attested, not independently verified.** When a paid fetch settles, the seller's `PAYMENT-RESPONSE` header is decoded and surfaced as `payment_receipt` in the tool output. That receipt comes from the endpoint operator's server: it is an attestation, not proof. Every paid-fetch output therefore also carries `receipt_verified: false` and `receipt_note: "server-provided, not independently verified on-chain"` so the agent never mistakes an attestation for an on-chain fact. A malformed or hostile receipt is surfaced as-is (or absent) rather than treated as payment confirmation.
+
+Independent on-chain verification is roadmap work — it requires a chain client per network (Base, Solana, Casper) to confirm the settlement transaction. Until then, treat `receipt_verified: false` as the ground truth: if a payment's settlement matters to you, verify the `tx_hash` / receipt yourself on the relevant chain explorer.
+
+The other trust boundaries are explicit: the discovery fetcher refuses private/loopback/link-local addresses before any request and never follows redirects (see `x402_discover_url`), payment paths refuse redirects and size-bound all response bodies and payment headers, and the directory is written atomically with corrupt-file quarantine rather than silent overwrite.
+
 ## Quick Start
 
 ### 1. Install
@@ -239,6 +254,8 @@ cp endpoints.example.json endpoints.json
 # Then run x402_crawl_directory to populate
 ```
 
+Directory entries carry a `source` field for provenance: `"seed"` marks the operator-curated baseline, `"discovery"` marks entries added by `x402_crawl_directory`. This is the baseline for the trust-level classification planned in issue #19.
+
 ## Automated Directory Refresh
 
 The endpoint directory stays fresh by running `x402_crawl_directory` on a schedule. Here's how to set it up in popular agent frameworks:
@@ -287,6 +304,15 @@ The crawler can also be called programmatically:
 import { registerCrawlX402ScanTool } from "./tools/crawl-directory.js";
 // Or call the MCP via stdio — see usage examples above
 ```
+
+## Roadmap
+
+Explicitly deferred — tracked here so the boundary is visible, not forgotten:
+
+- **Discovery freshness & trust levels (issue #18.2 detail)** — the directory records provenance (`source: "seed"` / `source: "discovery"`) but does not track freshness or verification state. Enforcement of freshness, trust levels and per-service policy belongs to the **#19 policy engine** (its trust-level model consumes exactly this metadata) and is deliberately not implemented ad hoc here.
+- **Self-describing service manifests (issue #18.7)** — machine-readable service metadata is an ecosystem-wide direction: services must publish manifests before clients can consume them. Deferred to the ecosystem roadmap; `x402_discover_url` already consumes `/.well-known/ai-catalog.json` and `/.well-known/x402` where present.
+- **Multi-instance budget durability** — enforcing one budget across several MCP processes needs an external spend store (see Limitations under Spending Limits).
+- **On-chain settlement-receipt verification** — independently verifying receipts needs a chain client per network (see Trust Model).
 
 ## Disclaimer
 

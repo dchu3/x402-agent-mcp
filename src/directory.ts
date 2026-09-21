@@ -1,6 +1,20 @@
-import { readFileSync, writeFileSync } from "fs";
+import { readFileSync, writeFileSync, renameSync, rmSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
+
+// Persistence model (#18.3):
+// - Single-process ownership: the directory file is written by this process
+//   only. There is no file lock and no cross-process coordination — two MCP
+//   instances sharing one endpoints.json operate last-writer-wins and will
+//   silently overwrite each other's additions. Multi-instance deployments
+//   should give each instance its own X402_DIRECTORY_PATH.
+// - Atomic writes: every write goes to a temp file in the destination
+//   directory followed by renameSync — atomic on POSIX — so a crash mid-write
+//   can never leave a truncated or half-written endpoints.json.
+// - Corrupt recovery: if the live file exists but cannot be parsed into a
+//   directory shape, it is quarantined as endpoints.json.corrupt-<timestamp>
+//   (evidence preserved verbatim) and the MCP continues with an empty
+//   directory instead of crashing. Corrupt data is never silently overwritten.
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -19,6 +33,11 @@ export interface EndpointEntry {
     description: string;
   }>;
   well_known?: Record<string, string>;
+  /** Provenance metadata (#18.2/#18.7 — baseline for #19's trust levels):
+   * "seed" = operator-curated baseline entries; "discovery" = entries added
+   * by x402_crawl_directory. Entries added through other paths may omit it
+   * and are treated as unclassified by the #19 policy engine. */
+  source?: string;
 }
 
 export interface EndpointDirectory {
@@ -47,6 +66,61 @@ export function clearDirectoryCache(): void {
   cachedDirectory = null;
 }
 
+let tmpSeq = 0;
+
+/** Write data to p atomically: temp file in the same directory (same
+ * filesystem — required for atomic rename), then renameSync over the target.
+ * On failure the temp file is removed so no partial artifacts remain.
+ * Exported for the atomicity smoke tests. */
+export function atomicWriteFileSync(p: string, data: string): void {
+  const tmp = `${p}.tmp-${process.pid}-${Date.now()}-${++tmpSeq}`;
+  try {
+    writeFileSync(tmp, data, "utf-8");
+    renameSync(tmp, p);
+  } catch (err) {
+    try { rmSync(tmp, { force: true }); } catch { /* best-effort cleanup */ }
+    throw err;
+  }
+}
+
+function emptyDirectory(): EndpointDirectory {
+  return { endpoints: [], categories: [], last_updated: new Date().toISOString().slice(0, 10) };
+}
+
+/** Parse a directory file, tolerating absent categories/last_updated but
+ * refusing anything without an endpoints array (that would crash addToDirectory). */
+function parseDirectory(raw: string, source: string): EndpointDirectory | null {
+  try {
+    const parsed = JSON.parse(raw) as Partial<EndpointDirectory> | null;
+    if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.endpoints)) {
+      console.error(`[x402] ${source} is not a valid endpoints directory (missing endpoints array)`);
+      return null;
+    }
+    return {
+      endpoints: parsed.endpoints,
+      categories: Array.isArray(parsed.categories) ? parsed.categories : [],
+      last_updated: typeof parsed.last_updated === "string" ? parsed.last_updated : new Date().toISOString().slice(0, 10),
+    };
+  } catch (err) {
+    console.error(`[x402] ${source} is not valid JSON: ${err}`);
+    return null;
+  }
+}
+
+let quarantineSeq = 0;
+
+/** Move a corrupt directory file aside, preserving the evidence. Best-effort:
+ * never throws — recovering to an empty directory matters more than the rename. */
+function quarantineCorruptFile(p: string): void {
+  try {
+    const quarantined = `${p}.corrupt-${Date.now()}-${++quarantineSeq}`;
+    renameSync(p, quarantined);
+    console.error(`[x402] ${p} was corrupt; quarantined as ${quarantined}; continuing with an empty directory`);
+  } catch (err) {
+    console.error(`[x402] ${p} was corrupt and could not be quarantined: ${err}`);
+  }
+}
+
 export function loadDirectory(): EndpointDirectory {
   if (cachedDirectory) return cachedDirectory;
   // Try live file first, then template
@@ -58,24 +132,34 @@ export function loadDirectory(): EndpointDirectory {
 
   // Try live file first
   for (const p of searchPaths) {
+    let raw: string;
     try {
-      const raw = readFileSync(p, "utf-8");
-      cachedDirectory = JSON.parse(raw) as EndpointDirectory;
-      return cachedDirectory;
+      raw = readFileSync(p, "utf-8");
     } catch {
-      continue;
+      continue; // missing or unreadable — try the next candidate location
     }
+    const parsed = parseDirectory(raw, p);
+    if (parsed) {
+      cachedDirectory = parsed;
+      return cachedDirectory;
+    }
+    // File exists but is unreadable/corrupt: preserve the evidence and keep
+    // the MCP alive (#18.3). Deliberately do NOT fall through to the template
+    // — that would silently discard operator data.
+    quarantineCorruptFile(p);
+    cachedDirectory = emptyDirectory();
+    return cachedDirectory;
   }
 
   // Fall back to template, then copy it to live file
   for (const p of templatePaths) {
     try {
       const raw = readFileSync(p, "utf-8");
-      cachedDirectory = JSON.parse(raw) as EndpointDirectory;
+      cachedDirectory = parseDirectory(raw, p) ?? emptyDirectory();
       // Create live file from template so future writes go to the right place
       for (const lp of searchPaths) {
         try {
-          writeFileSync(lp, raw, "utf-8");
+          atomicWriteFileSync(lp, raw);
           break;
         } catch {
           continue;
@@ -109,7 +193,7 @@ export function addToDirectory(entry: EndpointEntry): boolean {
   const possiblePaths = livePaths();
   for (const p of possiblePaths) {
     try {
-      writeFileSync(p, JSON.stringify(dir, null, 2) + "\n", "utf-8");
+      atomicWriteFileSync(p, JSON.stringify(dir, null, 2) + "\n");
       return true;
     } catch {
       continue;

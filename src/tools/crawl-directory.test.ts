@@ -69,6 +69,19 @@ it('crawler still adds hosts with a valid {version:1,resources:[...]} well-known
   assert.equal(endpoints[0].base_url, 'https://stableenrich.example');
 });
 
+it('crawled entries are stamped source: "discovery" (#19 trust-level baseline)', async () => {
+  clearDirectoryCache();
+  globalThis.fetch = probeMock({
+    'stamped.example': (url) => url.endsWith('/.well-known/x402')
+      ? new Response(JSON.stringify({ version: 1, resources: ['/x'], description: 'd' }), { status: 200 })
+      : new Response('Not Found', { status: 404 }),
+  }) as any;
+  const result = JSON.parse((await handler()({ max_results: 5 })).content[0].text);
+  assert.equal(result.new_services_added, 1);
+  const [entry] = readDirectory().endpoints;
+  assert.equal(entry.source, 'discovery', '#18.2/#18.7: crawled additions carry discovery provenance');
+});
+
 it('crawler enables a host via root 402 PAYMENT-REQUIRED challenge with correct chain', async () => {
   clearDirectoryCache();
   const challenge = JSON.stringify({
