@@ -404,3 +404,24 @@ it('intent boundary: Casper payTo swapped between probe and payment ⇒ aborted 
   assert.match(parsed.error, /failed/, 'a swapped offer must fail, never pay the stranger');
   assert.equal(casperBudget.getDailySpent(), before, 'the intent hook runs BEFORE guardCasperPayments: no budget reserve happened');
 });
+
+it('intent boundary integration: an intent that expires before payload creation is refused at signing (INTENT_EXPIRED)', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  process.env.X402_INTENT_TTL_MS = '1'; // 1 ms TTL — deterministic expiry once the paid leg arrives later
+  const url = 'https://intent-expiry-test.invalid/api';
+  let calls = 0;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    calls++;
+    assert.equal(noSignatureHeader(input, init), false, 'an expired intent must never produce a signature');
+    if (calls > 1) await new Promise((r) => setTimeout(r, 10)); // let the TTL elapse before the paid challenge arrives
+    return bindableSolanaChallenge('10000', url);
+  }) as any;
+  const before = ledgerLines();
+  const result = await handler()({ url });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(calls, 2, 'probe + one paid attempt — expiry aborts inside the SDK hook');
+  assert.deepEqual(parsed.reasons.map((r: any) => r.code), ['INTENT_UNAUTHORISED', 'EXPIRED']);
+  const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
+  assert.ok(!entries.some((e: any) => e.url === url && e.status === 'success'), 'no ledger success for an expired intent');
+});
