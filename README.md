@@ -101,6 +101,13 @@ Casper reserves budget synchronously before signing to prevent concurrent oversp
 
 Counters are process-local and reset at UTC midnight or process restart. They are not a durable, multi-instance wallet limit.
 
+### Limitations — read before relying on these budgets
+
+- **Per-process counters.** Daily spend lives in the memory of one MCP process (rehydrated once from the ledger on the first budget check). It is never a wallet-level limit.
+- **Multiple instances = separate budgets.** Running two MCP processes gives each its own counter, so the real daily spend can reach N × `MAX_DAILY_SPEND`. Durable multi-instance enforcement requires an external store and is on the roadmap; until then, run one instance per budget scope.
+- **The USDC daily cap can be overshot by in-flight concurrency.** The guard checks `MAX_DAILY_SPEND` before paying and records spend only after settlement; the await points between the check and the log inside a paid fetch mean several in-flight requests can pass the same check. The synchronous check-then-log span itself is exact (locked by the concurrent-consumption test in `src/payment-utils.rehydrate.test.ts`), but cross-await atomicity must not be assumed.
+- **Casper is the fail-closed equivalent class.** Casper reserves budget synchronously *before* signing, so concurrent Casper calls cannot overspend, and an unset or invalid budget disables Casper payments entirely. Verified by `src/casper/budget.test.ts`: "daily reservations prevent concurrent callers overspending", "checks changed requirements at signing and blocks retries", "unset either Casper budget disables signing", "invalid, zero and negative budgets disable payment", and "rolls only the Casper counter at UTC day change".
+
 ## Quick Start
 
 ### 1. Install

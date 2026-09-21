@@ -75,3 +75,26 @@ it('casper entries are excluded from rehydrated spend (same rule as logPayment)'
   assert.equal(getDailySpent(), 0.25);
   assert.equal(getDailySpent('casper'), 0);
 });
+
+it('concurrent consumption: 5 parallel per-call requests against budget for exactly 2 → exactly 2 allowed', async () => {
+  // #18.4: budget for exactly two per-call requests (2 × MAX_PAYMENT_PER_CALL);
+  // five requests fire via Promise.all. JS is single-threaded, so the guard's
+  // synchronous span — checkSpendingLimit followed immediately by the settlement
+  // logPayment, the exact span fetch.ts uses around a paid call — runs atomically
+  // per request and the daily cap admits exactly two. (Interleaving between the
+  // check and the log — the await points inside wrapFetchWithPayment — is the
+  // documented overshoot limitation; see README Limitations.)
+  process.env.MAX_DAILY_SPEND = '0.40';
+  process.env.MAX_PAYMENT_PER_CALL = '0.20';
+  const { checkSpendingLimit, logPayment, getDailySpent } = await freshModule();
+  const allowed = await Promise.all(
+    Array.from({ length: 5 }, async () => {
+      const check = checkSpendingLimit(0.20);
+      if (check.allowed) logPayment(entry({ chain: 'base', amount_usdc: 0.20 }));
+      return check.allowed;
+    }),
+  );
+  assert.equal(allowed.filter(Boolean).length, 2, 'exactly 2 of 5 may consume the 0.40 budget');
+  assert.equal(allowed.filter((a) => !a).length, 3, 'the rest must be denied');
+  assert.equal(getDailySpent(), 0.40);
+});
