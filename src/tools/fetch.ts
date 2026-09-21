@@ -11,7 +11,7 @@ import { casperBudget } from "../casper/budget.js";
 import { selectCasperAccept, assertPayableCasperAccept, casperAmountMotes } from "../casper/accepts.js";
 import { CASPER_CHAIN, isCasperNetwork, toCasperCaip2 } from "../casper/networks.js";
 import { checkSpendingLimit, logPayment, getDailySpent, getMaxPerCall, getMaxDailySpend } from "../payment-utils.js";
-import { extractSettlementReceipt } from "./receipt-utils.js";
+import { extractSettlementReceipt, RECEIPT_VERIFIED, RECEIPT_NOTE } from "./receipt-utils.js";
 
 export function registerFetchTool(server: McpServer): void {
   server.tool(
@@ -240,6 +240,8 @@ export function registerFetchTool(server: McpServer): void {
               cost_usdc: actualCost,
               daily_spent_usdc: parseFloat(getDailySpent().toFixed(4)),
               payment_receipt: paymentReceipt,
+              receipt_verified: RECEIPT_VERIFIED,
+              receipt_note: RECEIPT_NOTE,
               body: bodyResult,
             }),
           }],
