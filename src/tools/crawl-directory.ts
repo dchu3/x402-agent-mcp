@@ -170,6 +170,7 @@ export function registerCrawlX402ScanTool(server: McpServer): void {
               category: result.category,
               tags: [result.category, "x402", ...result.chains],
               endpoints: [],
+              source: "discovery", // #18.2/#18.7 provenance baseline for #19 trust levels
             });
 
             if (wasAdded) {

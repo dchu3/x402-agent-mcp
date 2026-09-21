@@ -254,6 +254,8 @@ cp endpoints.example.json endpoints.json
 # Then run x402_crawl_directory to populate
 ```
 
+Directory entries carry a `source` field for provenance: `"seed"` marks the operator-curated baseline, `"discovery"` marks entries added by `x402_crawl_directory`. This is the baseline for the trust-level classification planned in issue #19.
+
 ## Automated Directory Refresh
 
 The endpoint directory stays fresh by running `x402_crawl_directory` on a schedule. Here's how to set it up in popular agent frameworks:
@@ -302,6 +304,15 @@ The crawler can also be called programmatically:
 import { registerCrawlX402ScanTool } from "./tools/crawl-directory.js";
 // Or call the MCP via stdio — see usage examples above
 ```
+
+## Roadmap
+
+Explicitly deferred — tracked here so the boundary is visible, not forgotten:
+
+- **Discovery freshness & trust levels (issue #18.2 detail)** — the directory records provenance (`source: "seed"` / `source: "discovery"`) but does not track freshness or verification state. Enforcement of freshness, trust levels and per-service policy belongs to the **#19 policy engine** (its trust-level model consumes exactly this metadata) and is deliberately not implemented ad hoc here.
+- **Self-describing service manifests (issue #18.7)** — machine-readable service metadata is an ecosystem-wide direction: services must publish manifests before clients can consume them. Deferred to the ecosystem roadmap; `x402_discover_url` already consumes `/.well-known/ai-catalog.json` and `/.well-known/x402` where present.
+- **Multi-instance budget durability** — enforcing one budget across several MCP processes needs an external spend store (see Limitations under Spending Limits).
+- **On-chain settlement-receipt verification** — independently verifying receipts needs a chain client per network (see Trust Model).
 
 ## Disclaimer
 

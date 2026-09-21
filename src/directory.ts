@@ -33,6 +33,11 @@ export interface EndpointEntry {
     description: string;
   }>;
   well_known?: Record<string, string>;
+  /** Provenance metadata (#18.2/#18.7 — baseline for #19's trust levels):
+   * "seed" = operator-curated baseline entries; "discovery" = entries added
+   * by x402_crawl_directory. Entries added through other paths may omit it
+   * and are treated as unclassified by the #19 policy engine. */
+  source?: string;
 }
 
 export interface EndpointDirectory {
