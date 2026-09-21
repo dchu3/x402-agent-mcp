@@ -20,6 +20,37 @@ const LOG_PATH = process.env.PAYMENT_LOG_PATH || "./x402-payments.jsonl";
 const dailySpentByChain = new Map<string, number>();
 let dailyDate = new Date().toISOString().slice(0, 10);
 
+// The MCP runs over stdio with per-session process lifetime, so the in-memory
+// counter starts at $0 on every restart and MAX_DAILY_SPEND would never be
+// cumulative. Rebuild today's spend from the ledger once, lazily, on first
+// budget check.
+let rehydrated = false;
+
+function rehydrateFromLedger(): void {
+  if (rehydrated) return;
+  rehydrated = true; // set before any I/O — never double-read, even if read throws
+  if (!existsSync(LOG_PATH)) return;
+  try {
+    for (const line of readFileSync(LOG_PATH, "utf-8").split("\n")) {
+      try {
+        const entry = JSON.parse(line) as PaymentLogEntry;
+        if (
+          entry.status === "success" &&
+          entry.chain !== "casper" &&
+          typeof entry.chain === "string" &&
+          entry.timestamp.slice(0, 10) === dailyDate
+        ) {
+          dailySpentByChain.set(entry.chain, (dailySpentByChain.get(entry.chain) ?? 0) + (entry.amount_usdc ?? 0));
+        }
+      } catch {
+        // Corrupted ledger lines are skipped — logging is best-effort, so is reading it back
+      }
+    }
+  } catch (err) {
+    console.error(`[x402] Failed to rehydrate daily spend from ledger: ${err}`);
+  }
+}
+
 function resetDailyIfNewDay(): void {
   const today = new Date().toISOString().slice(0, 10);
   if (today !== dailyDate) {
@@ -37,6 +68,7 @@ export function getMaxDailySpend(): number {
 }
 
 export function checkSpendingLimit(amountUsdc: number): { allowed: boolean; reason?: string } {
+  rehydrateFromLedger();
   resetDailyIfNewDay();
 
   const dailySpent = getDailySpent();
@@ -70,6 +102,7 @@ export function logPayment(entry: PaymentLogEntry): void {
 }
 
 export function getDailySpent(chain?: string): number {
+  rehydrateFromLedger();
   resetDailyIfNewDay();
   return chain ? dailySpentByChain.get(chain) ?? 0 : [...dailySpentByChain.values()].reduce((sum, amount) => sum + amount, 0);
 }
