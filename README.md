@@ -152,7 +152,7 @@ Decisions are exactly `ALLOW`, `DENY`, `APPROVAL_REQUIRED`. Every non-ALLOW resu
 | `UNKNOWN_SERVICE` | Host is not in the directory while `services.unknown` is configured to deny |
 | `APPROVAL_REQUIRED` | The trust level is configured to `approval` (Phase 1: treated as a refusal — see below) |
 | `CONFIG_INVALID` | Policy configuration failed validation — the engine fails closed |
-| `RECIPIENT_NOT_ALLOWED` | Reserved for recipient allowlisting (a deliberately deferred future extension — no Phase 1 rule emits it) |
+| `RECIPIENT_NOT_ALLOWED` | Rule 4.5 recipient gate (issue #26): the probed recipient is not on the effective allowlist (allowlist mode — fail-closed on an empty effective list or a missing/unusable probed recipient), or differs from the recorded baseline (change-detect mode) |
 
 Rules are evaluated in a fixed, documented order and reasons **accumulate** (all triggered codes are returned, not just the first). `DENY` outranks `APPROVAL_REQUIRED` outranks `ALLOW`. Cap boundaries match the inner payment guards exactly: `> cap` denies, reaching the cap exactly is allowed.
 
@@ -188,11 +188,12 @@ JSON via `POLICY_CONFIG_PATH` (no new dependencies), with `X402_POLICY_*` env ov
     "blocked":    { "action": "deny" }
   },
   "networks": { "allowed": ["base", "solana", "casper"] },
-  "tokens":   { "allowed": ["USDC", "wCSPR"] }
+  "tokens":   { "allowed": ["USDC", "wCSPR"] },
+  "recipients": { "mode": "change-detect", "allowed": [], "perService": {}, "known": {} }
 }
 ```
 
-The example above **is** the behavior-compat default: non-directory hosts are payable at the global caps (`services.unknown: allow` — before the policy engine, directory membership played no role in the limit checks). Tightening is opt-in and never the default — for example, the following refuses every non-directory host and tightens directory-service caps (a copy-paste of the block above does NOT apply any of this):
+The example above **is** the behavior-compat default: non-directory hosts are payable at the global caps (`services.unknown: allow` — before the policy engine, directory membership played no role in the limit checks), and the recipient gate is inactive by construction (`recipients` defaults to `change-detect` with **no** recorded baselines — nothing to compare, so rule 4.5 never fires). Tightening is opt-in and never the default — for example, the following refuses every non-directory host and tightens directory-service caps (a copy-paste of the block above does NOT apply any of this):
 
 ```json
 {
@@ -203,6 +204,41 @@ The example above **is** the behavior-compat default: non-directory hosts are pa
   }
 }
 ```
+
+**Recipients (issue #26).** The `recipients` block gates *who* may be paid — rule 4.5 emits `RECIPIENT_NOT_ALLOWED`. Comparison happens on the **normalized (canonical)** recipient, chain-aware: EVM `0x…` addresses are compared case-insensitively against their EIP-55-valid spelling (a wrong-checksum spelling is not repaired — it is unusable), Solana wallets as the canonical 32-byte base58 re-encoding, Casper payTo as `00` + 64 hex with an optional `account-hash-` prefix stripped. Formatting can therefore never bypass or break the gate. Two modes:
+
+- **`allowlist` — active always, fail-closed.** A payment is refused unless the probed recipient normalizes to an entry on the *effective* allowlist for the host: `recipients.perService[host]` **replaces** the global `recipients.allowed` list when present (keys are lowercase hostnames). An **empty effective list denies every recipient**, and a missing or unusable probed recipient is denied too — membership can never be proven.
+- **`change-detect` — active only for a host with a recorded baseline.** `recipients.known` maps a lowercase hostname to its expected recipient (e.g. `"known": { "merchant.example": "00ab…" }`); the payment is refused when the probed recipient differs from the baseline. With no baseline for the host nothing fires — nothing to compare. This is the compat default (empty `known` ⇒ inactive).
+
+Compat default block:
+
+```json
+{
+  "recipients": {
+    "mode": "change-detect",
+    "allowed": [],
+    "perService": {},
+    "known": {}
+  }
+}
+```
+
+Tightening example — only ever pay one global recipient, except one host which pays only its own:
+
+```json
+{
+  "recipients": {
+    "mode": "allowlist",
+    "allowed": ["0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"],
+    "perService": {
+      "trusted-merchant.example": ["0x2222222222222222222222222222222222222222"]
+    },
+    "known": {}
+  }
+}
+```
+
+**The `recipients` block is file-only.** A per-host map cannot be expressed cleanly as a flat env var, so unlike the sections above there is deliberately **no** `X402_POLICY_*` override for it (the other sections keep their knobs, below). Unknown keys inside `recipients` are errors (typo protection), like everywhere else. In `allowlist` mode, `x402_fetch` passes the `payTo` address from the 402 challenge into the gate for both the USD legs (Base/Solana) and the Casper leg, so the recipient is validated **before** any payment machinery runs; the payment intent then binds exactly the validated value.
 
 Env overrides (each fails closed on a malformed value — never silently ignored):
 
@@ -223,7 +259,7 @@ Env overrides (each fails closed on a malformed value — never silently ignored
 
 1. **`APPROVAL_REQUIRED` is a refusal in Phase 1.** This MCP runs over stdio and has no human-approval channel; returning a decision the agent could treat as "pending" would be worse than refusing. The engine returns `APPROVAL_REQUIRED` with that reason code preserved, and `x402_fetch` refuses to pay — the issue's fail-closed principle applied to the approval gap.
 
-2. **The default policy reproduces pre-policy behavior exactly** (the explicit backwards-compatibility decision the issue demands — made explicit here rather than silently weakening the safety model): payments enabled, caps from `MAX_PAYMENT_PER_CALL` (default $0.50) / `MAX_DAILY_SPEND` (default $10.00), networks `[base, solana, casper]`, tokens `[USDC, wCSPR]`, every directory service payable at the global caps, and `services.unknown: allow` — because today **any** host is payable at the global caps (directory membership plays no role in the pre-policy gate), and the unchanged test suite is the proof of that compatibility. Tightening — e.g. `services.unknown: "deny"` so non-directory hosts are refused — is opt-in via config. The zero-behavior-change claim is test-locked: the full pre-existing suite passes unchanged under the default policy, and the fetch integration tests assert both the refusal path and the untouched default path.
+2. **The default policy reproduces pre-policy behavior exactly** (the explicit backwards-compatibility decision the issue demands — made explicit here rather than silently weakening the safety model): payments enabled, caps from `MAX_PAYMENT_PER_CALL` (default $0.50) / `MAX_DAILY_SPEND` (default $10.00), networks `[base, solana, casper]`, tokens `[USDC, wCSPR]`, every directory service payable at the global caps, `services.unknown: allow` — because today **any** host is payable at the global caps (directory membership plays no role in the pre-policy gate) — and the recipient gate inactive (`recipients` defaults to `change-detect` with no baselines). The unchanged test suite is the proof of that compatibility. Tightening — e.g. `services.unknown: "deny"` so non-directory hosts are refused, or a recipient `allowlist` — is opt-in via config. The zero-behavior-change claim is test-locked: the full pre-existing suite passes unchanged under the default policy, and the fetch integration tests assert both the refusal path and the untouched default path.
 
 ### Inspecting a payment without paying
 
@@ -247,7 +283,9 @@ Env overrides (each fails closed on a malformed value — never silently ignored
 
 Per-service daily spend is tracked in the same payment ledger (grouped by URL hostname, rehydrated like the global counter — no parallel state). Per-service caps are enforced for USD-settled chains (Base/Solana); Casper remains governed by its mote budgets (`CASPER_MAX_PAYMENT_PER_CALL` / `CASPER_MAX_DAILY_SPEND`) inside the payment layer.
 
-Deliberately **not** in Phase 1 (future extensions, tracked separately in issue #19): approval workflows, recipient allowlists, price-change/anomaly detection, payment velocity limits, circuit breakers, transaction simulation, response size limits, untrusted-data labelling, prompt-injection-aware response handling, and a persistent audit ledger.
+`x402_check_payment` also accepts an optional **`recipient`** argument (issue #26) — the `payTo` address from the 402 challenge — so the recipient gate can be checked before fetching. In `allowlist` mode the argument is **required** (without it the gate denies); in `change-detect` mode it is compared against the recorded baseline. The response echoes `recipient` verbatim plus `recipient_normalized`, the canonical form rule 4.5 compares (`null` when no recipient was supplied or it is not a valid address for the chain).
+
+Deliberately **not** in Phase 1 (future extensions, tracked separately in issue #19): approval workflows, price-change/anomaly detection, payment velocity limits, circuit breakers, transaction simulation, response size limits, untrusted-data labelling, prompt-injection-aware response handling, and a persistent audit ledger. (Recipient allowlisting — formerly on this list — shipped as rule 4.5, issue #26.)
 
 ## Payment Intent Boundary (issue #25)
 
