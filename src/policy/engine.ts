@@ -11,6 +11,11 @@
 //   2. PAYMENTS_DISABLED        — global payments kill switch
 //   3. CHAIN_NOT_ALLOWED        — network allowlist
 //   4. TOKEN_NOT_ALLOWED        — token allowlist
+//   4.5 RECIPIENT_NOT_ALLOWED   — recipient gate (issue #26): allowlist mode is
+//      ACTIVE always (fail-closed on an empty effective list and on a
+//      missing/unusable probed recipient); change-detect mode is ACTIVE only
+//      for a host with a recorded baseline (denies only when the probed
+//      recipient differs from it). Comparison is on normalized recipients.
 //   5. UNKNOWN_SERVICE          — services.unknown = deny and level UNKNOWN
 //   6. REQUEST_LIMIT_EXCEEDED   — per-request cap (level override ?? global)
 //   7. DAILY_LIMIT_EXCEEDED     — global daily cap
@@ -23,6 +28,7 @@
 // per-request denies when amount > cap; daily denies when spent + amount > cap
 // (reaching the cap exactly is allowed).
 
+import { normalizeRecipient } from "./recipient.js";
 import type {
   PolicyBudgetState,
   PolicyConfig,
@@ -45,7 +51,7 @@ const DENY_CODES: ReadonlySet<ReasonCode> = new Set([
   "DAILY_LIMIT_EXCEEDED",
   "SERVICE_LIMIT_EXCEEDED",
   "CONFIG_INVALID",
-  "RECIPIENT_NOT_ALLOWED", // reserved (no Phase 1 emitter) — kept fail-closed by design
+  "RECIPIENT_NOT_ALLOWED", // rule 4.5 (issue #26): the recipient gate — emitted by the engine since #26
 ]);
 
 export class PolicyEngine {
@@ -109,6 +115,47 @@ export class PolicyEngine {
     // Rule 4: token allowlist.
     if (!cfg.tokens.allowed.includes(ctx.token)) {
       reasons.push({ code: "TOKEN_NOT_ALLOWED", message: `Token '${ctx.token}' is not in the allowed tokens [${cfg.tokens.allowed.join(", ")}]` });
+    }
+
+    // Rule 4.5: recipient gate (issue #26). Fail-closed in both modes. The
+    // rule stays inside the pure core: normalization is a pure helper
+    // (src/policy/recipient.ts), host keys are matched lowercase (the context
+    // service is already lowercased by buildPolicyContext), and the compared
+    // recipient never appears beyond its canonical form in messages.
+    const rcpt = cfg.recipients;
+    const rcptHost = ctx.service.toLowerCase();
+    if (rcpt.mode === "allowlist") {
+      // Allowlist mode is ACTIVE always — that is the fail-closed intent of
+      // the mode. The per-service list REPLACES the global list for the host.
+      const effective = rcpt.perService[rcptHost] ?? rcpt.allowed;
+      if (effective.length === 0) {
+        reasons.push({ code: "RECIPIENT_NOT_ALLOWED", message: `Recipient allowlist for ${rcptHost} is empty — no recipient is payable (fail-closed allowlist mode)` });
+      } else if (!ctx.recipient || ctx.recipient.trim() === "") {
+        reasons.push({ code: "RECIPIENT_NOT_ALLOWED", message: `No recipient was probed for ${rcptHost} — allowlist mode cannot prove membership and fails closed` });
+      } else {
+        const canonical = normalizeRecipient(ctx.chain, ctx.recipient);
+        if (canonical === undefined) {
+          reasons.push({ code: "RECIPIENT_NOT_ALLOWED", message: `Probed recipient for ${rcptHost} is not a valid address for chain '${ctx.chain}' — allowlist mode fails closed` });
+        } else if (!effective.some((entry) => normalizeRecipient(ctx.chain, entry) === canonical)) {
+          reasons.push({ code: "RECIPIENT_NOT_ALLOWED", message: `Recipient ${canonical} is not in the allowlist for ${rcptHost} (allowlist mode)` });
+        }
+      }
+    } else {
+      // Change-detect mode is ACTIVE only for a host with a recorded baseline:
+      // no baseline ⇒ nothing to compare ⇒ no reason emitted (this is what
+      // keeps the behavior-compat default inert).
+      const baseline = rcpt.known[rcptHost];
+      if (baseline !== undefined) {
+        if (!ctx.recipient || ctx.recipient.trim() === "") {
+          reasons.push({ code: "RECIPIENT_NOT_ALLOWED", message: `No recipient was probed for ${rcptHost} — change-detect cannot compare it against the recorded baseline and fails closed` });
+        } else {
+          const probed = normalizeRecipient(ctx.chain, ctx.recipient);
+          const base = normalizeRecipient(ctx.chain, baseline);
+          if (probed === undefined || base === undefined || probed !== base) {
+            reasons.push({ code: "RECIPIENT_NOT_ALLOWED", message: `Probed recipient ${probed ?? `(not a valid address for chain '${ctx.chain}')`} differs from the recorded baseline for ${rcptHost} (change-detect mode)` });
+          }
+        }
+      }
     }
 
     // Rule 5: unknown service (services.unknown = deny refuses non-directory

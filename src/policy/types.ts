@@ -91,10 +91,10 @@ export interface PolicyBudgetState {
 
 /** Machine-readable reason codes (issue Phase 6). Stable contract for coding
  * agents and future UIs — never rely on the human-readable message alone.
- * RECIPIENT_NOT_ALLOWED is reserved: recipient allowlisting is an explicitly
- * deferred future extension (issue "Future extensions"); no Phase 1 rule
- * emits it. CONFIG_INVALID is the fail-closed marker for unusable policy
- * configuration (operator-ratified addition to the issue's list). */
+ * RECIPIENT_NOT_ALLOWED is emitted by rule 4.5 (issue #26): the recipient gate
+ * (allowlist / change-detect modes, see RecipientPolicy). CONFIG_INVALID is the
+ * fail-closed marker for unusable policy configuration (operator-ratified
+ * addition to the issue's list). */
 export type ReasonCode =
   | "PAYMENTS_DISABLED"
   | "REQUEST_LIMIT_EXCEEDED"
