@@ -8,6 +8,7 @@ import { registerDiscoverUrlTool } from "./tools/discover-url.js";
 import { registerHealthCheckTool } from "./tools/health.js";
 import { registerBatchDiscoverTool } from "./tools/batch-discover.js";
 import { registerCrawlX402ScanTool } from "./tools/crawl-directory.js";
+import { registerCheckPaymentTool } from "./tools/check-payment.js";
 import { VERSION } from "./version.js";
 
 const server = new McpServer({
@@ -23,6 +24,7 @@ registerDiscoverUrlTool(server);
 registerHealthCheckTool(server);
 registerBatchDiscoverTool(server);
 registerCrawlX402ScanTool(server);
+registerCheckPaymentTool(server);
 registerFetchTool(server);
 
 // Start server
