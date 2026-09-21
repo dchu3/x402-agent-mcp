@@ -25,18 +25,17 @@ console.log("trusted-host request:   ", ok.decision, (ok.reasons ?? []).map(r =>
 const deny = evalUrl("https://some-random-host.example/api", "solana", "USDC", 0.10);
 console.log("unknown-host request:  ", deny.decision, (deny.reasons ?? []).map(r => r.code).join(","));
 
-// 3) casper chain not in the example allowlist → DENY CHAIN_NOT_ALLOWED
+// 3) casper + wCSPR now in the example allowlist → ALLOW (multi-chain example)
 const chain = evalUrl("https://directory-host.example/api", "casper", "wCSPR", 0.10);
-console.log("casper request:        ", chain.decision, (chain.reasons ?? []).map(r => r.code).join(","));
+console.log("casper request:        ", chain.decision, (chain.reasons ?? []).map(r => r.code).join(",") || "(no reasons)");
 
 // 4) over the trusted per-request cap ($1.00) → DENY REQUEST_LIMIT_EXCEEDED
 const cap = evalUrl("https://directory-host.example/api", "solana", "USDC", 1.50);
 console.log("over-cap request:      ", cap.decision, (cap.reasons ?? []).map(r => r.code).join(","));
 
 rmSync(dir, { recursive: true, force: true });
-const pass = ok.decision === "ALLOW" && deny.decision === "DENY" && chain.decision === "DENY" && cap.decision === "DENY"
+const pass = ok.decision === "ALLOW" && deny.decision === "DENY" && chain.decision === "ALLOW" && cap.decision === "DENY"
   && (deny.reasons ?? []).some(r => r.code === "UNKNOWN_SERVICE")
-  && (chain.reasons ?? []).some(r => r.code === "CHAIN_NOT_ALLOWED")
   && (cap.reasons ?? []).some(r => r.code === "REQUEST_LIMIT_EXCEEDED");
 console.log(pass ? "\nEXAMPLE VALIDATES CLEAN + behaves as documented" : "\nMISMATCH vs documentation");
 process.exit(pass ? 0 : 1);

@@ -25,12 +25,14 @@
   "networks": {
     "allowed": [
       "solana",
-      "base"
+      "base",
+      "casper"
     ]
   },
   "tokens": {
     "allowed": [
-      "USDC"
+      "USDC",
+      "wCSPR"
     ]
   }
 }
