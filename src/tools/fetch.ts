@@ -123,12 +123,26 @@ export function registerFetchTool(server: McpServer): void {
       let casperNetwork = process.env.CASPER_NETWORK || "";
       // Issue #25: the concrete probe offer, retained so the payment intent
       // can bind exactly what policy evaluated (the USD estimate alone is not
-      // an authorisation). Undefined when the probe is skipped (forced chain).
+      // an authorisation). Undefined only when the probe cannot yield an
+      // offer: an unrecognised forced chain still skips the probe, and a
+      // forced-chain probe may legitimately yield none (amendment 1).
       let probedOffer: { scheme?: string; network?: string; asset?: string; amount?: string; payTo?: string } | undefined;
       let casperIntent: PaymentIntent | null = null;
       let casperBlockedCode: IntentRejectCode | undefined;
 
-      if (!useChain || useChain === CASPER_CHAIN) {
+      // Forced-chain fix (#25): a forced base/solana chain must still OBSERVE
+      // the offer so the payment intent can bind it — via the same single
+      // free 402 probe the auto-detect path performs (a 402 response, no
+      // payment; no second network call is added). For forced base/solana the
+      // probe only observes: it never replaces the caller's chain and never
+      // refuses the HTTP request — a probe that yields no offer leaves
+      // probedOffer undefined and the guarded paid fetch below decides at
+      // signing time (blocking hook), preserving the pre-#25 pass-through for
+      // endpoints that do not actually charge. Forced Casper semantics and
+      // auto-detect behaviour are unchanged.
+      const forcedChain = useChain === "solana" || useChain === "base";
+
+      if (!useChain || useChain === CASPER_CHAIN || forcedChain) {
         try {
           const probeResp = await fetch(url, {
             method,
@@ -138,7 +152,7 @@ export function registerFetchTool(server: McpServer): void {
             body: args.body || undefined,
           });
 
-          if (probeResp.status !== 402) {
+          if (probeResp.status !== 402 && !forcedChain) {
             const text = await boundedText(probeResp);
             return {
               content: [{
@@ -153,106 +167,116 @@ export function registerFetchTool(server: McpServer): void {
             };
           }
 
-          const encoded = probeResp.headers.get("payment-required");
-          if (encoded && encoded.length > 65536) throw new Error("Payment header exceeds size limit");
-          const paymentInfo = JSON.parse(encoded ? Buffer.from(encoded, "base64").toString("utf8") : await boundedText(probeResp));
-          const accepts = paymentInfo.accepts || paymentInfo.accept || [];
-          const firstAccept = Array.isArray(accepts) ? accepts[0] : accepts;
-          const network = firstAccept?.network || "";
+          if (probeResp.status === 402) {
+            const encoded = probeResp.headers.get("payment-required");
+            if (encoded && encoded.length > 65536) throw new Error("Payment header exceeds size limit");
+            const paymentInfo = JSON.parse(encoded ? Buffer.from(encoded, "base64").toString("utf8") : await boundedText(probeResp));
+            const accepts = paymentInfo.accepts || paymentInfo.accept || [];
+            const firstAccept = Array.isArray(accepts) ? accepts[0] : accepts;
+            const network = firstAccept?.network || "";
 
-          // Issue #25: retain the concrete offer (chain detection + USD
-          // estimate are derived from the same single probe — no new calls).
-          probedOffer = {
-            scheme: firstAccept?.scheme,
-            network: firstAccept?.network,
-            asset: firstAccept?.asset,
-            amount: firstAccept?.amount,
-            payTo: firstAccept?.payTo,
-          };
-
-          // Capture amount for spending limit check
-          if (firstAccept?.amount) {
-            probedAmountUsdc = Number(firstAccept.amount) / 1e6;
-          }
-
-          if (useChain === CASPER_CHAIN) {
-            // Forced Casper still probes and validates a real offer below.
-          } else if (network.includes("solana") || network.includes("5eykt4")) {
-            useChain = "solana";
-          } else if (network.includes("eip155") || network.includes("8453")) {
-            useChain = "base";
-          } else if (isCasperNetwork(network)) {
-            useChain = CASPER_CHAIN;
-          } else {
-            return {
-              content: [{
-                type: "text" as const,
-                text: JSON.stringify({
-                  error: "Could not auto-detect chain from 402 response",
-                  payment_info: JSON.stringify(paymentInfo).slice(0, 1000),
-                  hint: "Specify chain parameter: 'solana', 'base' or 'casper'",
-                }),
-              }],
+            // Issue #25: retain the concrete offer (chain detection + USD
+            // estimate are derived from the same single probe — no new calls).
+            probedOffer = {
+              scheme: firstAccept?.scheme,
+              network: firstAccept?.network,
+              asset: firstAccept?.asset,
+              amount: firstAccept?.amount,
+              payTo: firstAccept?.payTo,
             };
-          }
 
-          // Casper settles in wCSPR motes (9 decimals), not 6-decimal USDC.
-          if (useChain === CASPER_CHAIN) {
-            // POLICY GATE (issue #19): evaluate() BEFORE the internal Casper
-            // budget check; casper/budget.ts stays untouched inside the
-            // payment layer. Casper amounts have no USD price at this layer,
-            // so amount 0 — mote budgets remain the spend control, and the
-            // engine enforces chain/token/service rules + global kill switch.
-            const casperPolicy = getPolicyEngine().evaluate(
-              buildPolicyContext(url, CASPER_CHAIN, "wCSPR", 0),
-              { dailySpentUsd: getDailySpent(), perServiceSpentUsd: getPerServiceSpent(serviceHost) },
-            );
-            if (casperPolicy.decision !== "ALLOW") {
-              return policyRefusal(casperPolicy, url, CASPER_CHAIN, 0);
+            // Capture amount for spending limit check
+            if (firstAccept?.amount) {
+              probedAmountUsdc = Number(firstAccept.amount) / 1e6;
             }
-            const casperAccept = selectCasperAccept(paymentInfo, casperNetwork);
-            if (!casperAccept) throw new Error("No matching exact Casper payment offer");
-            if (casperAccept) {
-              casperNetwork = toCasperCaip2(casperAccept.network);
-              try {
-                assertPayableCasperAccept(casperAccept);
-                // Issue #25: bind the validated offer to a payment intent now
-                // (gate order unchanged: evaluate → intent → budget check).
-                // If it cannot be bound, the flow still continues — with a
-                // blocking hook instead of an executable intent.
-                const casperIntentResult = createFromOffer({
-                  decision: casperPolicy,
-                  url,
-                  chain: CASPER_CHAIN,
-                  token: "wCSPR",
-                  asset: casperAccept.asset,
-                  amountAtomic: casperAmountMotes(casperAccept).toString(),
-                  decimals: 9,
-                  recipient: casperAccept.payTo,
-                  network: casperNetwork,
-                  scheme: casperAccept.scheme,
-                  amountUsdEstimate: 0,
-                });
-                if (casperIntentResult.ok === true) casperIntent = casperIntentResult.intent;
-                else casperBlockedCode = casperIntentResult.code;
-                casperBudget.check(casperAmountMotes(casperAccept));
-              } catch (err: any) {
-                return {
-                  content: [{
-                    type: "text" as const,
-                    text: JSON.stringify({ error: err.message, url, chain: CASPER_CHAIN, payment_info: JSON.stringify(paymentInfo).slice(0, 1000) }),
-                  }],
-                };
+
+            if (useChain === CASPER_CHAIN || forcedChain) {
+              // Forced Casper still probes and validates a real offer below;
+              // forced base/solana keep the caller's chain — the probe only
+              // observed the offer above (never re-detects, never refutes it).
+            } else if (network.includes("solana") || network.includes("5eykt4")) {
+              useChain = "solana";
+            } else if (network.includes("eip155") || network.includes("8453")) {
+              useChain = "base";
+            } else if (isCasperNetwork(network)) {
+              useChain = CASPER_CHAIN;
+            } else {
+              return {
+                content: [{
+                  type: "text" as const,
+                  text: JSON.stringify({
+                    error: "Could not auto-detect chain from 402 response",
+                    payment_info: JSON.stringify(paymentInfo).slice(0, 1000),
+                    hint: "Specify chain parameter: 'solana', 'base' or 'casper'",
+                  }),
+                }],
+              };
+            }
+
+            // Casper settles in wCSPR motes (9 decimals), not 6-decimal USDC.
+            if (useChain === CASPER_CHAIN) {
+              // POLICY GATE (issue #19): evaluate() BEFORE the internal Casper
+              // budget check; casper/budget.ts stays untouched inside the
+              // payment layer. Casper amounts have no USD price at this layer,
+              // so amount 0 — mote budgets remain the spend control, and the
+              // engine enforces chain/token/service rules + global kill switch.
+              const casperPolicy = getPolicyEngine().evaluate(
+                buildPolicyContext(url, CASPER_CHAIN, "wCSPR", 0),
+                { dailySpentUsd: getDailySpent(), perServiceSpentUsd: getPerServiceSpent(serviceHost) },
+              );
+              if (casperPolicy.decision !== "ALLOW") {
+                return policyRefusal(casperPolicy, url, CASPER_CHAIN, 0);
+              }
+              const casperAccept = selectCasperAccept(paymentInfo, casperNetwork);
+              if (!casperAccept) throw new Error("No matching exact Casper payment offer");
+              if (casperAccept) {
+                casperNetwork = toCasperCaip2(casperAccept.network);
+                try {
+                  assertPayableCasperAccept(casperAccept);
+                  // Issue #25: bind the validated offer to a payment intent now
+                  // (gate order unchanged: evaluate → intent → budget check).
+                  // If it cannot be bound, the flow still continues — with a
+                  // blocking hook instead of an executable intent.
+                  const casperIntentResult = createFromOffer({
+                    decision: casperPolicy,
+                    url,
+                    chain: CASPER_CHAIN,
+                    token: "wCSPR",
+                    asset: casperAccept.asset,
+                    amountAtomic: casperAmountMotes(casperAccept).toString(),
+                    decimals: 9,
+                    recipient: casperAccept.payTo,
+                    network: casperNetwork,
+                    scheme: casperAccept.scheme,
+                    amountUsdEstimate: 0,
+                  });
+                  if (casperIntentResult.ok === true) casperIntent = casperIntentResult.intent;
+                  else casperBlockedCode = casperIntentResult.code;
+                  casperBudget.check(casperAmountMotes(casperAccept));
+                } catch (err: any) {
+                  return {
+                    content: [{
+                      type: "text" as const,
+                      text: JSON.stringify({ error: err.message, url, chain: CASPER_CHAIN, payment_info: JSON.stringify(paymentInfo).slice(0, 1000) }),
+                    }],
+                  };
+                }
               }
             }
           }
         } catch (err: any) {
-          return {
-            content: [{
-              type: "text" as const,
-              text: JSON.stringify({ error: `Failed to probe endpoint: ${String(err.message).slice(0, 1000)}` }),
-            }],
-          };
+          // A forced base/solana probe failure must not refuse a request the
+          // pre-#25 forced flow never probed: no offer is bound, and any
+          // actual charge below still aborts at the signing boundary (the
+          // blocking hook), exactly as amendment 1 specifies.
+          if (!forcedChain) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: JSON.stringify({ error: `Failed to probe endpoint: ${String(err.message).slice(0, 1000)}` }),
+              }],
+            };
+          }
         }
       }
 
@@ -346,7 +370,10 @@ export function registerFetchTool(server: McpServer): void {
           if (intentResult.ok === true) intent = intentResult.intent;
           else blockedCode = intentResult.code;
         } else {
-          // Forced chain skips the probe — there is no offer to bind.
+          // No offer could be observed (an unrecognised forced chain still
+          // skips the probe; a forced-chain probe may legitimately yield
+          // none) — there is nothing to bind, so any payment aborts at the
+          // signing boundary with INTENT_UNAUTHORISED (amendment 1).
           blockedCode = "MALFORMED";
         }
 

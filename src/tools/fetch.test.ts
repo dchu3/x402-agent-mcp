@@ -425,3 +425,266 @@ it('intent boundary integration: an intent that expires before payload creation 
   const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
   assert.ok(!entries.some((e: any) => e.url === url && e.status === 'success'), 'no ledger success for an expired intent');
 });
+
+// ---------------------------------------------------------------------------
+// Issue #25 forced-chain fix — a forced base/solana chain must still observe
+// the offer (the same single free 402 probe the auto-detect path performs) so
+// the payment intent can bind it. The probe never replaces the caller's
+// forced chain and never refuses the HTTP request (amendment 1: the boundary
+// stays at signing). The first two tests would have caught the regression:
+// before the fix a forced chain skipped the probe entirely, probedOffer
+// stayed undefined, and every perfectly payable forced-chain request was
+// refused INTENT_UNAUTHORISED:MALFORMED before signing.
+// ---------------------------------------------------------------------------
+
+// Well-known public protocol identifiers (same convention as the
+// USDC_MAINNET_ADDRESS / WCSPR_ASSETS constants above): the SPL Token
+// program id and the USDC contract on Base. Fake-but-well-formed wallets /
+// blockhashes are 32 bytes base58 / 20 bytes hex — identifiers, not secrets.
+const { TOKEN_PROGRAM_ADDRESS } = await import('@x402/svm') as any;
+const BASE_USDC_ADDRESS = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
+const BASE_CAIP2 = 'eip155:8453';
+const CHARGE_PAYTO_B58 = bs58.encode(Buffer.alloc(32, 0x07));
+const CHARGE_FEE_PAYER_B58 = bs58.encode(Buffer.alloc(32, 0x09));
+const CHARGE_BLOCKHASH_B58 = bs58.encode(Buffer.alloc(32, 0x05));
+const BASE_PAYTO = '0x2222222222222222222222222222222222222222';
+
+/** v2 challenge the SVM scheme can actually sign: feePayer is required by
+ * the scheme, and extra.recentBlockhash avoids the getLatestBlockhash RPC
+ * round-trip (the single mint-metadata fetch is answered by the simulated
+ * RPC below). */
+function chargeableSolanaChallenge(requestUrl: string) {
+  const payload = JSON.stringify({
+    x402Version: 2,
+    resource: { url: requestUrl, description: '', mimeType: 'text/plain' },
+    accepts: [{ scheme: 'exact', network: SOLANA_CAIP2, asset: BINDABLE_SOLANA_ASSET, amount: '10000', payTo: CHARGE_PAYTO_B58, maxTimeoutSeconds: 60, extra: { name: 'USDC', feePayer: CHARGE_FEE_PAYER_B58, recentBlockhash: CHARGE_BLOCKHASH_B58 } }],
+  });
+  return new Response('Payment Required', { status: 402, headers: { 'payment-required': b64url(payload) } });
+}
+
+/** v2 challenge the EVM scheme signs fully locally (EIP-3009 signTypedData)
+ * — extra.name/version are the EIP-712 domain parameters the scheme requires. */
+function chargeableBaseChallenge(requestUrl: string) {
+  const payload = JSON.stringify({
+    x402Version: 2,
+    resource: { url: requestUrl, description: '', mimeType: 'text/plain' },
+    accepts: [{ scheme: 'exact', network: BASE_CAIP2, asset: BASE_USDC_ADDRESS, amount: '10000', payTo: BASE_PAYTO, maxTimeoutSeconds: 60, extra: { name: 'USD Coin', version: '2' } }],
+  });
+  return new Response('Payment Required', { status: 402, headers: { 'payment-required': b64url(payload) } });
+}
+
+const RPC_SIM_URL = 'https://rpc-sim.invalid';
+
+/** A valid 82-byte SPL mint account: owner = Token program, decimals 6,
+ * initialized, COption<Pubkey> authorities as u32 0 + 32 zero bytes. */
+const MINT_ACCOUNT_B64 = (() => {
+  const mint = Buffer.alloc(82);
+  mint.writeUInt8(6, 44); // decimals
+  mint.writeUInt8(1, 45); // isInitialized
+  return mint.toString('base64');
+})();
+
+function rpcSimResponse(rpcBody: string) {
+  const { id, method } = JSON.parse(rpcBody);
+  assert.equal(method, 'getAccountInfo', 'the only RPC touchpoint left is the mint-metadata fetch (recentBlockhash is bound in the offer)');
+  return new Response(JSON.stringify({
+    jsonrpc: '2.0', id,
+    result: { context: { apiVersion: '2.2.0', slot: 1234 }, value: { data: [MINT_ACCOUNT_B64, 'base64'], executable: false, lamports: 1000000, owner: TOKEN_PROGRAM_ADDRESS, rentEpoch: 0, space: 82 } },
+  }), { status: 200, headers: { 'content-type': 'application/json' } });
+}
+
+async function requestBodyText(input: unknown, init: unknown): Promise<string> {
+  if (init && typeof (init as any).body === 'string') return (init as any).body;
+  if (input instanceof Request) return await input.clone().text();
+  return '';
+}
+
+it('forced chain solana: a well-formed bindable offer binds an intent and the paid flow completes (the regression test)', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  process.env.SOLANA_RPC_URL = RPC_SIM_URL;
+  const url = 'https://forced-solana-happy-test.invalid/api';
+  let probes = 0, paidAttempts = 0, rpcCalls = 0, signedRetries = 0;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    const urlStr = input instanceof Request ? input.url : String(input);
+    if (urlStr.startsWith(RPC_SIM_URL)) {
+      rpcCalls++;
+      return rpcSimResponse(await requestBodyText(input, init));
+    }
+    assert.equal(urlStr, url, 'no other endpoint call may happen');
+    if (noSignatureHeader(input, init)) {
+      signedRetries++;
+      return new Response('{"result":"ok"}', { status: 200, headers: { 'PAYMENT-RESPONSE': receiptB64 } });
+    }
+    if (probes === 0) { probes++; return chargeableSolanaChallenge(url); } // the forced-chain probe (free: a 402, no payment)
+    paidAttempts++;
+    return chargeableSolanaChallenge(url); // the paid leg — binds, validates, signs, retries
+  }) as any;
+  const before = ledgerLines();
+  const result = await handler()({ url, chain: 'solana' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(probes, 1, 'a forced base/solana chain must still run the single free probe to observe the offer');
+  assert.equal(paidAttempts, 1);
+  assert.equal(rpcCalls, 1, 'payload creation ran — the intent bound the offer instead of blocking it');
+  assert.equal(signedRetries, 1, 'the payment was signed and retried — the regression refused exactly here');
+  assert.equal(parsed.status, 200);
+  assert.equal(parsed.paid, true);
+  assert.equal(parsed.chain, 'solana');
+  assert.equal(parsed.cost_usdc, 0.01);
+  assert.equal(parsed.payment_receipt, receiptB64);
+  assert.equal(parsed.policy_decision, undefined, 'ALLOW adds no policy keys to the success output');
+  const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
+  assert.equal(entries.find((e: any) => e.url === url)?.status, 'success', 'a completed forced-chain payment is accounted as success');
+});
+
+it('forced chain base: a well-formed bindable EVM offer binds an intent and the paid flow completes', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  process.env.EVM_PRIVATE_KEY = `0x${'11'.repeat(32)}`; // throwaway key — EIP-3009 signing is fully local
+  const url = 'https://forced-base-happy-test.invalid/api';
+  let probes = 0, paidAttempts = 0, signedRetries = 0;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    const urlStr = input instanceof Request ? input.url : String(input);
+    assert.equal(urlStr, url, 'the EVM path must make no other network calls');
+    if (noSignatureHeader(input, init)) {
+      signedRetries++;
+      return new Response('{"result":"ok"}', { status: 200, headers: { 'PAYMENT-RESPONSE': receiptB64 } });
+    }
+    if (probes === 0) { probes++; return chargeableBaseChallenge(url); } // the forced-chain probe
+    paidAttempts++;
+    return chargeableBaseChallenge(url); // the paid leg
+  }) as any;
+  const before = ledgerLines();
+  const result = await handler()({ url, chain: 'base' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(probes, 1, 'forced base must observe the offer through the same single probe');
+  assert.equal(paidAttempts, 1);
+  assert.equal(signedRetries, 1, 'the payment was signed — the forced-chain boundary did not refuse it');
+  assert.equal(parsed.status, 200);
+  assert.equal(parsed.paid, true);
+  assert.equal(parsed.chain, 'base');
+  assert.equal(parsed.cost_usdc, 0.01);
+  const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
+  assert.equal(entries.find((e: any) => e.url === url)?.status, 'success');
+});
+
+it('forced chain solana: an unbindable probed offer (no amount) is still refused before signing — the fix opens no hole', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  const url = 'https://forced-unbindable-amount-test.invalid/api';
+  function unbindableAmountChallenge() {
+    // Malformed/legacy-shaped offer: no amount, no asset — money cannot be bound.
+    const payload = JSON.stringify({
+      x402Version: 2,
+      accepts: [{ scheme: 'exact', network: SOLANA_CAIP2, payTo: CHARGE_PAYTO_B58, extra: { name: 'USDC' } }],
+    });
+    return new Response('Payment Required', { status: 402, headers: { 'payment-required': b64url(payload) } });
+  }
+  let probes = 0, paidAttempts = 0;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    assert.equal(noSignatureHeader(input, init), false, 'payment-payload creation must never happen');
+    if (probes === 0) { probes++; return unbindableAmountChallenge(); } // probe: unbindable
+    paidAttempts++;
+    return chargeableSolanaChallenge(url); // the paid leg WOULD charge — blocked at the hook
+  }) as any;
+  const before = ledgerLines();
+  const result = await handler()({ url, chain: 'solana' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(probes, 1);
+  assert.equal(paidAttempts, 1, 'the HTTP request is never refused — the refusal lands at signing');
+  assert.equal(parsed.policy_decision, 'ALLOW', 'policy allowed; the intent boundary is what refused');
+  assert.deepEqual(parsed.reasons.map((r: any) => r.code), ['INTENT_UNAUTHORISED', 'AMOUNT_UNBINDABLE']);
+  assert.match(parsed.error, /payment-intent boundary/);
+  for (const key of ['error', 'url', 'chain', 'estimated_cost_usdc', 'daily_spent_usdc', 'max_per_call', 'max_daily']) {
+    assert.ok(key in parsed, `refusal keeps the #19 key ${key}`);
+  }
+  const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
+  assert.ok(!entries.some((e: any) => e.url === url && e.status === 'success'), 'no ledger success for a refused payment');
+});
+
+it('forced chain solana: a probed offer with no payTo cannot bind a recipient — refused before signing (MALFORMED)', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  const url = 'https://forced-no-payto-test.invalid/api';
+  function noPayToChallenge() {
+    const payload = JSON.stringify({
+      x402Version: 2,
+      accepts: [{ scheme: 'exact', network: SOLANA_CAIP2, asset: BINDABLE_SOLANA_ASSET, amount: '10000', extra: { name: 'USDC' } }], // no payTo
+    });
+    return new Response('Payment Required', { status: 402, headers: { 'payment-required': b64url(payload) } });
+  }
+  let probes = 0, paidAttempts = 0;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    assert.equal(noSignatureHeader(input, init), false, 'payment-payload creation must never happen');
+    if (probes === 0) { probes++; return noPayToChallenge(); }
+    paidAttempts++;
+    return chargeableSolanaChallenge(url); // would charge — blocked at the hook
+  }) as any;
+  const before = ledgerLines();
+  const result = await handler()({ url, chain: 'solana' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(probes, 1);
+  assert.equal(paidAttempts, 1);
+  assert.equal(parsed.policy_decision, 'ALLOW');
+  assert.deepEqual(parsed.reasons.map((r: any) => r.code), ['INTENT_UNAUTHORISED', 'MALFORMED']);
+  const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
+  assert.ok(!entries.some((e: any) => e.url === url && e.status === 'success'), 'no ledger success for a refused payment');
+});
+
+it('auto-detect control: chain omitted still binds from the probe offer and completes the paid flow (auto-detect behaviour unchanged)', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  process.env.SOLANA_RPC_URL = RPC_SIM_URL;
+  const url = 'https://auto-detect-control-test.invalid/api';
+  let probes = 0, paidAttempts = 0, rpcCalls = 0, signedRetries = 0;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    const urlStr = input instanceof Request ? input.url : String(input);
+    if (urlStr.startsWith(RPC_SIM_URL)) {
+      rpcCalls++;
+      return rpcSimResponse(await requestBodyText(input, init));
+    }
+    assert.equal(urlStr, url, 'no other endpoint call may happen');
+    if (noSignatureHeader(input, init)) {
+      signedRetries++;
+      return new Response('{"result":"ok"}', { status: 200 });
+    }
+    if (probes === 0) { probes++; return chargeableSolanaChallenge(url); }
+    paidAttempts++;
+    return chargeableSolanaChallenge(url);
+  }) as any;
+  const before = ledgerLines();
+  const result = await handler()({ url }); // no chain — the auto-detect path drove this suite from the start
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(probes, 1);
+  assert.equal(paidAttempts, 1);
+  assert.equal(rpcCalls, 1);
+  assert.equal(signedRetries, 1, 'auto-detect still signs and completes exactly as before');
+  assert.equal(parsed.status, 200);
+  assert.equal(parsed.paid, true);
+  assert.equal(parsed.chain, 'solana', 'chain is still detected from the probed offer');
+  assert.equal(parsed.cost_usdc, 0.01);
+  assert.equal(parsed.policy_decision, undefined);
+  const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
+  assert.equal(entries.find((e: any) => e.url === url)?.status, 'success');
+});
+
+it('forced chain solana: an endpoint that does not charge (probe answers 200) passes through unchanged — the probe never refuses the request', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  const url = 'https://forced-passthrough-test.invalid/api';
+  let calls = 0;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    calls++;
+    assert.equal(noSignatureHeader(input, init), false, 'no payment payload was ever created or attached');
+    return new Response('{"result":"ok"}', { status: 200 });
+  }) as any;
+  const before = ledgerLines();
+  const result = await handler()({ url, chain: 'solana' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(calls, 2, 'probe + paid fetch — a free endpoint under a forced chain is never refused');
+  assert.equal(parsed.status, 200);
+  assert.equal(parsed.paid, true);
+  assert.equal(parsed.policy_decision, undefined, 'ALLOW adds no policy keys to the success output');
+  const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
+  assert.equal(entries.find((e: any) => e.url === url)?.status, 'success');
+});
