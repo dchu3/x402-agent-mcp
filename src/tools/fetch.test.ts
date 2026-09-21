@@ -265,3 +265,426 @@ it('concurrent budget consumption through the policy engine: 5 parallel requests
   assert.equal(getDailySpent(), 0.40);
   assert.equal(getPerServiceSpent('conc.example'), 0.40, 'per-service store tracks the same consumption');
 });
+
+// ---------------------------------------------------------------------------
+// Issue #25 — the payment-intent boundary in x402_fetch.
+//
+// The boundary is at signing/payload creation, never at the HTTP request
+// (amendment 1): the retained probe offer is bound to a payment intent after
+// the policy ALLOW; the x402 client's onBeforePaymentCreation hook aborts any
+// payload whose selected requirements drift from the intent; an offer that
+// cannot be bound registers a blocking hook so it can never be PAID, while
+// unpaid/non-402 responses pass through unchanged.
+// ---------------------------------------------------------------------------
+
+// The SDK's spendControls reject non-default assets BEFORE hooks run, so the
+// paid-leg challenge must advertise the SDK's own well-known USDC mint
+// constant (a public protocol identifier, not a secret) — same convention as
+// the WCSPR_ASSETS constants used by the Casper tests above.
+const { USDC_MAINNET_ADDRESS } = await import('@x402/svm') as any;
+const BINDABLE_SOLANA_ASSET: string = USDC_MAINNET_ADDRESS;
+
+/** Full x402 v2 challenge the SDK can parse on the PAID leg. */
+function bindableSolanaChallenge(amount: string, requestUrl: string) {
+  const payload = JSON.stringify({
+    x402Version: 2,
+    resource: { url: requestUrl, description: '', mimeType: 'text/plain' },
+    accepts: [{ scheme: 'exact', network: SOLANA_CAIP2, asset: BINDABLE_SOLANA_ASSET, amount, payTo: 'SoLWallet', maxTimeoutSeconds: 60, extra: { name: 'USDC' } }],
+  });
+  return new Response('Payment Required', { status: 402, headers: { 'payment-required': b64url(payload) } });
+}
+
+function noSignatureHeader(input: unknown, init: unknown): boolean {
+  const headers = new Headers(input instanceof Request ? input.headers : (init as any)?.headers);
+  return headers.has('payment-signature');
+}
+
+it('intent boundary: price raised between probe and paid challenge ⇒ abort before signing, structured refusal, no ledger success', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  const url = 'https://price-raised-test.invalid/api';
+  let calls = 0;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    calls++;
+    assert.equal(noSignatureHeader(input, init), false, 'a signature must never exist for a mismatched offer');
+    if (calls === 1) return bindableSolanaChallenge('10000', url); // probe: $0.01 offer
+    return bindableSolanaChallenge('20000', url);                  // paid leg: price doubled
+  }) as any;
+  const before = ledgerLines();
+  const result = await handler()({ url });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(calls, 2, 'probe + one paid attempt — the abort happens before any signed retry');
+  assert.equal(parsed.policy_decision, 'ALLOW', 'policy allowed; the intent boundary is what refused');
+  assert.deepEqual(parsed.reasons.map((r: any) => r.code), ['INTENT_UNAUTHORISED', 'OFFER_MISMATCH']);
+  assert.match(parsed.error, /payment-intent boundary/);
+  assert.match(parsed.reasons[1].message, /amount/, 'the drifted field is named');
+  for (const key of ['error', 'url', 'chain', 'estimated_cost_usdc', 'daily_spent_usdc', 'max_per_call', 'max_daily']) {
+    assert.ok(key in parsed, `refusal keeps the #19 key ${key}`);
+  }
+  const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
+  assert.ok(!entries.some((e: any) => e.url === url && e.status === 'success'), 'no ledger success for an aborted payment');
+  assert.equal(entries.find((e: any) => e.url === url)?.status, 'failed', 'the aborted attempt is audited like any other failure');
+});
+
+it('intent boundary: an offer with an unbindable amount/asset can never be paid (INTENT_UNAUTHORISED — amendment 1)', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  const url = 'https://unbindable-test.invalid/api';
+  function unbindableProbe() {
+    // Malformed/legacy-shaped offer: no amount, no asset.
+    const payload = JSON.stringify({
+      x402Version: 2,
+      accepts: [{ scheme: 'exact', network: SOLANA_CAIP2, payTo: 'SoLWallet', extra: { name: 'USDC' } }],
+    });
+    return new Response('Payment Required', { status: 402, headers: { 'payment-required': b64url(payload) } });
+  }
+  let calls = 0;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    calls++;
+    assert.equal(noSignatureHeader(input, init), false, 'payment-payload creation must never happen');
+    if (calls === 1) return unbindableProbe();
+    return bindableSolanaChallenge('10000', url); // the paid leg WOULD charge — blocked at the hook
+  }) as any;
+  const before = ledgerLines();
+  const result = await handler()({ url });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(calls, 2, 'the HTTP request is never refused — the paid fetch runs and signing is blocked');
+  assert.equal(parsed.policy_decision, 'ALLOW');
+  assert.deepEqual(parsed.reasons.map((r: any) => r.code), ['INTENT_UNAUTHORISED', 'AMOUNT_UNBINDABLE']);
+  const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
+  assert.ok(!entries.some((e: any) => e.url === url && e.status === 'success'), 'no ledger success');
+});
+
+it('intent boundary compat proof: an unpaid endpoint answers 200 directly — no payload creation occurred', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  let calls = 0;
+  let signatureSeen = false;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    calls++;
+    if (noSignatureHeader(input, init)) signatureSeen = true;
+    if (calls === 1) return probeChallengeFixed(); // legacy-shaped offer (no asset) — intent binds asset ''
+    return new Response('{"result":"ok"}', { status: 200 }); // call 2 answers 200 directly: the SDK never creates a payload
+  }) as any;
+  const result = await handler()({ url: 'https://intent-compat-test.invalid/api' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(calls, 2, 'the pass-through claim is proven: probe + direct 200');
+  assert.equal(signatureSeen, false, 'no payment payload was ever created or attached');
+  assert.equal(parsed.status, 200);
+  assert.equal(parsed.paid, true);
+  assert.equal(parsed.cost_usdc, 0.01);
+  assert.equal(parsed.policy_decision, undefined, 'ALLOW adds no policy keys to the success output');
+});
+
+it('intent boundary: Casper payTo swapped between probe and payment ⇒ aborted before budget reserve', async () => {
+  process.env.CASPER_MAX_PAYMENT_PER_CALL = '1';
+  process.env.CASPER_MAX_DAILY_SPEND = '10';
+  process.env.CASPER_PRIVATE_KEY = '11'.repeat(32);
+  const url = 'https://casper-swap-test.invalid/api';
+  const originalPayTo = '00' + 'ab'.repeat(32);
+  const swappedPayTo = '00' + 'cd'.repeat(32);
+  function casperChallengeWith(payTo: string) {
+    const payload = JSON.stringify({
+      x402Version: 2,
+      resource: { url, description: '', mimeType: 'text/plain' },
+      accepts: [{ scheme: 'exact', network: 'casper:casper', asset: WCSPR_ASSETS['casper:casper'], payTo, amount: '1000000000', maxTimeoutSeconds: 60, extra: { name: 'wCSPR' } }],
+    });
+    return new Response(payload, { status: 402, headers: { 'payment-required': Buffer.from(payload).toString('base64') } });
+  }
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls++;
+    return casperChallengeWith(calls === 1 ? originalPayTo : swappedPayTo);
+  }) as any;
+  const { casperBudget } = await import('../casper/budget.js');
+  const before = casperBudget.getDailySpent();
+  const result = await handler()({ url, chain: 'casper' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(calls, 2, 'probe + one paid attempt — signing aborts at the hook');
+  assert.match(parsed.error, /failed/, 'a swapped offer must fail, never pay the stranger');
+  assert.equal(casperBudget.getDailySpent(), before, 'the intent hook runs BEFORE guardCasperPayments: no budget reserve happened');
+});
+
+it('intent boundary integration: an intent that expires before payload creation is refused at signing (INTENT_EXPIRED)', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  process.env.X402_INTENT_TTL_MS = '1'; // 1 ms TTL — deterministic expiry once the paid leg arrives later
+  const url = 'https://intent-expiry-test.invalid/api';
+  let calls = 0;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    calls++;
+    assert.equal(noSignatureHeader(input, init), false, 'an expired intent must never produce a signature');
+    if (calls > 1) await new Promise((r) => setTimeout(r, 10)); // let the TTL elapse before the paid challenge arrives
+    return bindableSolanaChallenge('10000', url);
+  }) as any;
+  const before = ledgerLines();
+  const result = await handler()({ url });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(calls, 2, 'probe + one paid attempt — expiry aborts inside the SDK hook');
+  assert.deepEqual(parsed.reasons.map((r: any) => r.code), ['INTENT_UNAUTHORISED', 'EXPIRED']);
+  const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
+  assert.ok(!entries.some((e: any) => e.url === url && e.status === 'success'), 'no ledger success for an expired intent');
+});
+
+// ---------------------------------------------------------------------------
+// Issue #25 forced-chain fix — a forced base/solana chain must still observe
+// the offer (the same single free 402 probe the auto-detect path performs) so
+// the payment intent can bind it. The probe never replaces the caller's
+// forced chain and never refuses the HTTP request (amendment 1: the boundary
+// stays at signing). The first two tests would have caught the regression:
+// before the fix a forced chain skipped the probe entirely, probedOffer
+// stayed undefined, and every perfectly payable forced-chain request was
+// refused INTENT_UNAUTHORISED:MALFORMED before signing.
+// ---------------------------------------------------------------------------
+
+// Well-known public protocol identifiers (same convention as the
+// USDC_MAINNET_ADDRESS / WCSPR_ASSETS constants above): the SPL Token
+// program id and the USDC contract on Base. Fake-but-well-formed wallets /
+// blockhashes are 32 bytes base58 / 20 bytes hex — identifiers, not secrets.
+const { TOKEN_PROGRAM_ADDRESS } = await import('@x402/svm') as any;
+const BASE_USDC_ADDRESS = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
+const BASE_CAIP2 = 'eip155:8453';
+const CHARGE_PAYTO_B58 = bs58.encode(Buffer.alloc(32, 0x07));
+const CHARGE_FEE_PAYER_B58 = bs58.encode(Buffer.alloc(32, 0x09));
+const CHARGE_BLOCKHASH_B58 = bs58.encode(Buffer.alloc(32, 0x05));
+const BASE_PAYTO = '0x2222222222222222222222222222222222222222';
+
+/** v2 challenge the SVM scheme can actually sign: feePayer is required by
+ * the scheme, and extra.recentBlockhash avoids the getLatestBlockhash RPC
+ * round-trip (the single mint-metadata fetch is answered by the simulated
+ * RPC below). */
+function chargeableSolanaChallenge(requestUrl: string) {
+  const payload = JSON.stringify({
+    x402Version: 2,
+    resource: { url: requestUrl, description: '', mimeType: 'text/plain' },
+    accepts: [{ scheme: 'exact', network: SOLANA_CAIP2, asset: BINDABLE_SOLANA_ASSET, amount: '10000', payTo: CHARGE_PAYTO_B58, maxTimeoutSeconds: 60, extra: { name: 'USDC', feePayer: CHARGE_FEE_PAYER_B58, recentBlockhash: CHARGE_BLOCKHASH_B58 } }],
+  });
+  return new Response('Payment Required', { status: 402, headers: { 'payment-required': b64url(payload) } });
+}
+
+/** v2 challenge the EVM scheme signs fully locally (EIP-3009 signTypedData)
+ * — extra.name/version are the EIP-712 domain parameters the scheme requires. */
+function chargeableBaseChallenge(requestUrl: string) {
+  const payload = JSON.stringify({
+    x402Version: 2,
+    resource: { url: requestUrl, description: '', mimeType: 'text/plain' },
+    accepts: [{ scheme: 'exact', network: BASE_CAIP2, asset: BASE_USDC_ADDRESS, amount: '10000', payTo: BASE_PAYTO, maxTimeoutSeconds: 60, extra: { name: 'USD Coin', version: '2' } }],
+  });
+  return new Response('Payment Required', { status: 402, headers: { 'payment-required': b64url(payload) } });
+}
+
+const RPC_SIM_URL = 'https://rpc-sim.invalid';
+
+/** A valid 82-byte SPL mint account: owner = Token program, decimals 6,
+ * initialized, COption<Pubkey> authorities as u32 0 + 32 zero bytes. */
+const MINT_ACCOUNT_B64 = (() => {
+  const mint = Buffer.alloc(82);
+  mint.writeUInt8(6, 44); // decimals
+  mint.writeUInt8(1, 45); // isInitialized
+  return mint.toString('base64');
+})();
+
+function rpcSimResponse(rpcBody: string) {
+  const { id, method } = JSON.parse(rpcBody);
+  assert.equal(method, 'getAccountInfo', 'the only RPC touchpoint left is the mint-metadata fetch (recentBlockhash is bound in the offer)');
+  return new Response(JSON.stringify({
+    jsonrpc: '2.0', id,
+    result: { context: { apiVersion: '2.2.0', slot: 1234 }, value: { data: [MINT_ACCOUNT_B64, 'base64'], executable: false, lamports: 1000000, owner: TOKEN_PROGRAM_ADDRESS, rentEpoch: 0, space: 82 } },
+  }), { status: 200, headers: { 'content-type': 'application/json' } });
+}
+
+async function requestBodyText(input: unknown, init: unknown): Promise<string> {
+  if (init && typeof (init as any).body === 'string') return (init as any).body;
+  if (input instanceof Request) return await input.clone().text();
+  return '';
+}
+
+it('forced chain solana: a well-formed bindable offer binds an intent and the paid flow completes (the regression test)', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  process.env.SOLANA_RPC_URL = RPC_SIM_URL;
+  const url = 'https://forced-solana-happy-test.invalid/api';
+  let probes = 0, paidAttempts = 0, rpcCalls = 0, signedRetries = 0;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    const urlStr = input instanceof Request ? input.url : String(input);
+    if (urlStr.startsWith(RPC_SIM_URL)) {
+      rpcCalls++;
+      return rpcSimResponse(await requestBodyText(input, init));
+    }
+    assert.equal(urlStr, url, 'no other endpoint call may happen');
+    if (noSignatureHeader(input, init)) {
+      signedRetries++;
+      return new Response('{"result":"ok"}', { status: 200, headers: { 'PAYMENT-RESPONSE': receiptB64 } });
+    }
+    if (probes === 0) { probes++; return chargeableSolanaChallenge(url); } // the forced-chain probe (free: a 402, no payment)
+    paidAttempts++;
+    return chargeableSolanaChallenge(url); // the paid leg — binds, validates, signs, retries
+  }) as any;
+  const before = ledgerLines();
+  const result = await handler()({ url, chain: 'solana' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(probes, 1, 'a forced base/solana chain must still run the single free probe to observe the offer');
+  assert.equal(paidAttempts, 1);
+  assert.equal(rpcCalls, 1, 'payload creation ran — the intent bound the offer instead of blocking it');
+  assert.equal(signedRetries, 1, 'the payment was signed and retried — the regression refused exactly here');
+  assert.equal(parsed.status, 200);
+  assert.equal(parsed.paid, true);
+  assert.equal(parsed.chain, 'solana');
+  assert.equal(parsed.cost_usdc, 0.01);
+  assert.equal(parsed.payment_receipt, receiptB64);
+  assert.equal(parsed.policy_decision, undefined, 'ALLOW adds no policy keys to the success output');
+  const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
+  assert.equal(entries.find((e: any) => e.url === url)?.status, 'success', 'a completed forced-chain payment is accounted as success');
+});
+
+it('forced chain base: a well-formed bindable EVM offer binds an intent and the paid flow completes', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  process.env.EVM_PRIVATE_KEY = `0x${'11'.repeat(32)}`; // throwaway key — EIP-3009 signing is fully local
+  const url = 'https://forced-base-happy-test.invalid/api';
+  let probes = 0, paidAttempts = 0, signedRetries = 0;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    const urlStr = input instanceof Request ? input.url : String(input);
+    assert.equal(urlStr, url, 'the EVM path must make no other network calls');
+    if (noSignatureHeader(input, init)) {
+      signedRetries++;
+      return new Response('{"result":"ok"}', { status: 200, headers: { 'PAYMENT-RESPONSE': receiptB64 } });
+    }
+    if (probes === 0) { probes++; return chargeableBaseChallenge(url); } // the forced-chain probe
+    paidAttempts++;
+    return chargeableBaseChallenge(url); // the paid leg
+  }) as any;
+  const before = ledgerLines();
+  const result = await handler()({ url, chain: 'base' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(probes, 1, 'forced base must observe the offer through the same single probe');
+  assert.equal(paidAttempts, 1);
+  assert.equal(signedRetries, 1, 'the payment was signed — the forced-chain boundary did not refuse it');
+  assert.equal(parsed.status, 200);
+  assert.equal(parsed.paid, true);
+  assert.equal(parsed.chain, 'base');
+  assert.equal(parsed.cost_usdc, 0.01);
+  const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
+  assert.equal(entries.find((e: any) => e.url === url)?.status, 'success');
+});
+
+it('forced chain solana: an unbindable probed offer (no amount) is still refused before signing — the fix opens no hole', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  const url = 'https://forced-unbindable-amount-test.invalid/api';
+  function unbindableAmountChallenge() {
+    // Malformed/legacy-shaped offer: no amount, no asset — money cannot be bound.
+    const payload = JSON.stringify({
+      x402Version: 2,
+      accepts: [{ scheme: 'exact', network: SOLANA_CAIP2, payTo: CHARGE_PAYTO_B58, extra: { name: 'USDC' } }],
+    });
+    return new Response('Payment Required', { status: 402, headers: { 'payment-required': b64url(payload) } });
+  }
+  let probes = 0, paidAttempts = 0;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    assert.equal(noSignatureHeader(input, init), false, 'payment-payload creation must never happen');
+    if (probes === 0) { probes++; return unbindableAmountChallenge(); } // probe: unbindable
+    paidAttempts++;
+    return chargeableSolanaChallenge(url); // the paid leg WOULD charge — blocked at the hook
+  }) as any;
+  const before = ledgerLines();
+  const result = await handler()({ url, chain: 'solana' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(probes, 1);
+  assert.equal(paidAttempts, 1, 'the HTTP request is never refused — the refusal lands at signing');
+  assert.equal(parsed.policy_decision, 'ALLOW', 'policy allowed; the intent boundary is what refused');
+  assert.deepEqual(parsed.reasons.map((r: any) => r.code), ['INTENT_UNAUTHORISED', 'AMOUNT_UNBINDABLE']);
+  assert.match(parsed.error, /payment-intent boundary/);
+  for (const key of ['error', 'url', 'chain', 'estimated_cost_usdc', 'daily_spent_usdc', 'max_per_call', 'max_daily']) {
+    assert.ok(key in parsed, `refusal keeps the #19 key ${key}`);
+  }
+  const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
+  assert.ok(!entries.some((e: any) => e.url === url && e.status === 'success'), 'no ledger success for a refused payment');
+});
+
+it('forced chain solana: a probed offer with no payTo cannot bind a recipient — refused before signing (MALFORMED)', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  const url = 'https://forced-no-payto-test.invalid/api';
+  function noPayToChallenge() {
+    const payload = JSON.stringify({
+      x402Version: 2,
+      accepts: [{ scheme: 'exact', network: SOLANA_CAIP2, asset: BINDABLE_SOLANA_ASSET, amount: '10000', extra: { name: 'USDC' } }], // no payTo
+    });
+    return new Response('Payment Required', { status: 402, headers: { 'payment-required': b64url(payload) } });
+  }
+  let probes = 0, paidAttempts = 0;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    assert.equal(noSignatureHeader(input, init), false, 'payment-payload creation must never happen');
+    if (probes === 0) { probes++; return noPayToChallenge(); }
+    paidAttempts++;
+    return chargeableSolanaChallenge(url); // would charge — blocked at the hook
+  }) as any;
+  const before = ledgerLines();
+  const result = await handler()({ url, chain: 'solana' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(probes, 1);
+  assert.equal(paidAttempts, 1);
+  assert.equal(parsed.policy_decision, 'ALLOW');
+  assert.deepEqual(parsed.reasons.map((r: any) => r.code), ['INTENT_UNAUTHORISED', 'MALFORMED']);
+  const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
+  assert.ok(!entries.some((e: any) => e.url === url && e.status === 'success'), 'no ledger success for a refused payment');
+});
+
+it('auto-detect control: chain omitted still binds from the probe offer and completes the paid flow (auto-detect behaviour unchanged)', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  process.env.SOLANA_RPC_URL = RPC_SIM_URL;
+  const url = 'https://auto-detect-control-test.invalid/api';
+  let probes = 0, paidAttempts = 0, rpcCalls = 0, signedRetries = 0;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    const urlStr = input instanceof Request ? input.url : String(input);
+    if (urlStr.startsWith(RPC_SIM_URL)) {
+      rpcCalls++;
+      return rpcSimResponse(await requestBodyText(input, init));
+    }
+    assert.equal(urlStr, url, 'no other endpoint call may happen');
+    if (noSignatureHeader(input, init)) {
+      signedRetries++;
+      return new Response('{"result":"ok"}', { status: 200 });
+    }
+    if (probes === 0) { probes++; return chargeableSolanaChallenge(url); }
+    paidAttempts++;
+    return chargeableSolanaChallenge(url);
+  }) as any;
+  const before = ledgerLines();
+  const result = await handler()({ url }); // no chain — the auto-detect path drove this suite from the start
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(probes, 1);
+  assert.equal(paidAttempts, 1);
+  assert.equal(rpcCalls, 1);
+  assert.equal(signedRetries, 1, 'auto-detect still signs and completes exactly as before');
+  assert.equal(parsed.status, 200);
+  assert.equal(parsed.paid, true);
+  assert.equal(parsed.chain, 'solana', 'chain is still detected from the probed offer');
+  assert.equal(parsed.cost_usdc, 0.01);
+  assert.equal(parsed.policy_decision, undefined);
+  const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
+  assert.equal(entries.find((e: any) => e.url === url)?.status, 'success');
+});
+
+it('forced chain solana: an endpoint that does not charge (probe answers 200) passes through unchanged — the probe never refuses the request', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  const url = 'https://forced-passthrough-test.invalid/api';
+  let calls = 0;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    calls++;
+    assert.equal(noSignatureHeader(input, init), false, 'no payment payload was ever created or attached');
+    return new Response('{"result":"ok"}', { status: 200 });
+  }) as any;
+  const before = ledgerLines();
+  const result = await handler()({ url, chain: 'solana' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(calls, 2, 'probe + paid fetch — a free endpoint under a forced chain is never refused');
+  assert.equal(parsed.status, 200);
+  assert.equal(parsed.paid, true);
+  assert.equal(parsed.policy_decision, undefined, 'ALLOW adds no policy keys to the success output');
+  const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
+  assert.equal(entries.find((e: any) => e.url === url)?.status, 'success');
+});
