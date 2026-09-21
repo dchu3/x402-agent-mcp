@@ -1,0 +1,36 @@
+{
+  "payments": {
+    "enabled": true,
+    "maxPerRequest": 0.5,
+    "maxDaily": 5.0
+  },
+  "services": {
+    "unknown": {
+      "action": "deny"
+    },
+    "discovered": {
+      "action": "allow",
+      "maxPerRequest": 0.25,
+      "maxDaily": 2.0
+    },
+    "trusted": {
+      "action": "allow",
+      "maxPerRequest": 1.0,
+      "maxDaily": 4.0
+    },
+    "blocked": {
+      "action": "deny"
+    }
+  },
+  "networks": {
+    "allowed": [
+      "solana",
+      "base"
+    ]
+  },
+  "tokens": {
+    "allowed": [
+      "USDC"
+    ]
+  }
+}
