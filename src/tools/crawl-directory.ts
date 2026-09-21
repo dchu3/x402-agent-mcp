@@ -115,26 +115,72 @@ async function probeUrl(baseUrl: string): Promise<CrawledService | null> {
   }
 }
 
+// x402scan retired its /resources page (now 404) and has no public JSON
+// listing endpoint (/api/public/services is also 404), so scraping the
+// server-rendered /all page — the "All" sellers tab — is the only supported
+// source. Its payload embeds each service's origin, which is what we scrape.
+// Ordered scrape candidates, tried in sequence — the first source to serve an
+// OK page wins. /all is the cleanest listing (~293 candidate hosts after
+// extraction); the homepage embeds the same seller payloads with ~5x the
+// noise (duplicate origin variants, shared-deploy and static asset hosts),
+// so it stays the backup. A future URL move or outage at any one source
+// degrades to the next candidate instead of killing the crawl.
+export const X402SCAN_SOURCES = [
+  "https://www.x402scan.com/all",
+  "https://www.x402scan.com/",
+] as const;
+
+async function fetchListingHtml(pageUrl: string): Promise<string> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  try {
+    const resp = await fetch(pageUrl, { signal: controller.signal });
+    // fetch resolves on ANY status. A 404/redirect-to-error page returns HTML
+    // with no service URLs — fail loudly with the HTTP status instead of
+    // silently scraping an error page.
+    if (!resp.ok) {
+      throw new Error(`${pageUrl} returned HTTP ${resp.status}`);
+    }
+    return await resp.text();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export function registerCrawlX402ScanTool(server: McpServer): void {
   server.tool(
     "x402_crawl_directory",
-    "Crawl x402scan.com resources page to discover new x402 endpoints. Extracts service URLs, probes each for x402 support, and auto-adds confirmed services to the local directory. Returns summary of newly discovered services.",
+    "Crawl the x402scan.com all-services page to discover new x402 endpoints. Extracts service URLs, probes each for x402 support, and auto-adds confirmed services to the local directory. Returns summary of newly discovered services.",
     {
       max_results: z.number().optional().describe("Maximum number of new services to add (default: 20)"),
     },
     async (args) => {
       const maxResults = args.max_results || 20;
 
-      // Step 1: Scrape x402scan resources page
+      // Step 1: Scrape the x402scan listing. Iterate the candidate sources in
+      // order — the first that serves HTML wins, and a dead or moved source
+      // degrades to the next instead of dying. All candidates failing is an
+      // explicit error naming each failure.
       let urls: string[] = [];
       try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 15000);
-        const resp = await fetch("https://www.x402scan.com/resources", {
-          signal: controller.signal,
-        });
-        clearTimeout(timeout);
-        const html = await resp.text();
+        let html: string | null = null;
+        const failures: string[] = [];
+        for (const source of X402SCAN_SOURCES) {
+          try {
+            html = await fetchListingHtml(source);
+            break;
+          } catch (err: any) {
+            failures.push(err.message);
+          }
+        }
+        if (html === null) {
+          throw new Error(`all sources failed (${failures.join("; ")})`);
+        }
+        // An OK page that yields zero candidate URLs is a legitimate,
+        // distinguishable outcome — the listing may genuinely be empty or
+        // match nothing. The normal summary reports urls_scraped: 0. Only
+        // fetch-level failure (non-OK / throw / every candidate down) is an
+        // error; content emptiness is data.
         urls = extractUrlsFromHtml(html);
       } catch (err: any) {
         return {
