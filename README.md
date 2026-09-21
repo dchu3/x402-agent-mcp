@@ -15,7 +15,7 @@ Agent: "I need news data"
 
 The agent never sees wallets, private keys, or x402 protocol details. Just search, discover, fetch.
 
-## Tools (8)
+## Tools (9)
 
 | Tool | Cost | Description |
 |------|------|-------------|
@@ -26,6 +26,7 @@ The agent never sees wallets, private keys, or x402 protocol details. Just searc
 | `x402_health` | Free | Check if a service is live and responding with 402 |
 | `x402_discover_urls` | Free | Batch discover multiple x402 services in parallel |
 | `x402_crawl_directory` | Free | Crawl x402scan.com to discover new x402 services and auto-add to directory |
+| `x402_check_payment` | Free | Evaluate a prospective payment against policy — ALLOW / DENY / APPROVAL_REQUIRED with reason codes. **Never pays.** |
 | `x402_fetch` | Endpoint price | Fetch any x402 endpoint — handles 402 payment on Base, Solana or Casper |
 
 ## Multi-Chain Support
@@ -107,6 +108,133 @@ Counters are process-local and reset at UTC midnight or process restart. They ar
 - **Multiple instances = separate budgets.** Running two MCP processes gives each its own counter, so the real daily spend can reach N × `MAX_DAILY_SPEND`. Durable multi-instance enforcement requires an external store and is on the roadmap; until then, run one instance per budget scope.
 - **The USDC daily cap can be overshot by in-flight concurrency.** The guard checks `MAX_DAILY_SPEND` before paying and records spend only after settlement; the await points between the check and the log inside a paid fetch mean several in-flight requests can pass the same check. The synchronous check-then-log span itself is exact (locked by the concurrent-consumption test in `src/payment-utils.rehydrate.test.ts`), but cross-await atomicity must not be assumed.
 - **Casper is the fail-closed equivalent class.** Casper reserves budget synchronously *before* signing, so concurrent Casper calls cannot overspend, and an unset or invalid budget disables Casper payments entirely. Verified by `src/casper/budget.test.ts`: "daily reservations prevent concurrent callers overspending", "checks changed requirements at signing and blocks retries", "unset either Casper budget disables signing", "invalid, zero and negative budgets disable payment", and "rolls only the Casper counter at UTC day change".
+
+## Payment Policy Engine (Phase 1)
+
+Every payment passes a deterministic policy gate **before any payment code runs**. The policy engine (in `src/policy/`) is deliberately small, pure (same inputs → same decision, always) and independent of payment mechanics: `x402_fetch` calls `policyEngine.evaluate(context, budgetState)` and refuses to pay unless the decision is `ALLOW`. The pre-existing budget guards stay in place as belt-and-braces inside the payment layer — the policy engine is the outer gate, not a replacement.
+
+```
+Agent request (x402_fetch or x402_check_payment)
+   |
+   v
+Policy Engine  ← policy config + trust level + today's budget state
+   |
+   +-- DENY -------------> structured refusal, NO payment
+   |
+   +-- APPROVAL_REQUIRED -> refusal with that reason code (Phase 1: see below)
+   |
+   +-- ALLOW
+          |
+          v
+     belt-and-braces budget checks (payment-utils / casper budget)
+          |
+          v
+     payment execution (x402 protocol, unchanged)
+          |
+          v
+     settlement receipt (server-attested — see Trust Model)
+```
+
+### Decisions and reason codes
+
+Decisions are exactly `ALLOW`, `DENY`, `APPROVAL_REQUIRED`. Every non-ALLOW result carries stable machine-readable reason codes — code against these, never against the human-readable message:
+
+| Reason code | Fires when |
+|-------------|------------|
+| `PAYMENTS_DISABLED` | Global payments kill switch (`payments.enabled: false`) |
+| `REQUEST_LIMIT_EXCEEDED` | Amount above the per-request cap (level override or global); also fails closed on non-finite/negative amounts |
+| `DAILY_LIMIT_EXCEEDED` | Today's global spend + amount would exceed the daily cap |
+| `SERVICE_LIMIT_EXCEEDED` | Today's spend for this service would exceed its per-service daily cap |
+| `CHAIN_NOT_ALLOWED` | Chain not in the network allowlist |
+| `TOKEN_NOT_ALLOWED` | Token not in the token allowlist |
+| `SERVICE_BLOCKED` | Host is BLOCKED, or its trust level is configured to deny |
+| `UNKNOWN_SERVICE` | Host is not in the directory while `services.unknown` is configured to deny |
+| `APPROVAL_REQUIRED` | The trust level is configured to `approval` (Phase 1: treated as a refusal — see below) |
+| `CONFIG_INVALID` | Policy configuration failed validation — the engine fails closed |
+| `RECIPIENT_NOT_ALLOWED` | Reserved for recipient allowlisting (a deliberately deferred future extension — no Phase 1 rule emits it) |
+
+Rules are evaluated in a fixed, documented order and reasons **accumulate** (all triggered codes are returned, not just the first). `DENY` outranks `APPROVAL_REQUIRED` outranks `ALLOW`. Cap boundaries match the inner payment guards exactly: `> cap` denies, reaching the cap exactly is allowed.
+
+### Trust levels
+
+Derived from operator env allowlists plus directory provenance (the `source` metadata on directory entries). No reputation system.
+
+| Level | Derived from | Default behavior |
+|-------|--------------|------------------|
+| `BLOCKED` | host listed in `POLICY_BLOCKED_HOSTS` (comma-separated) | always deny |
+| `TRUSTED` | host listed in `POLICY_TRUSTED_HOSTS` (user-managed allowlist) | payable at global caps |
+| `DISCOVERED` | host is a directory entry (`source: "seed"` or `"discovery"`) | payable at global caps |
+| `UNKNOWN` | host not in the directory | governed by `services.unknown` (default: allow — see the compat decision below) |
+
+Precedence is fail-closed: `BLOCKED` > `TRUSTED` > directory > `UNKNOWN`. Per-level configuration can tighten any level (`deny`, `approval`, or a lower `maxPerRequest` / per-service `maxDaily`).
+
+### Configuration
+
+JSON via `POLICY_CONFIG_PATH` (no new dependencies), with `X402_POLICY_*` env overrides. Precedence: `MAX_PAYMENT_PER_CALL` / `MAX_DAILY_SPEND` (the legacy defaults) < config file < env overrides.
+
+```json
+{
+  "payments": {
+    "enabled": true,
+    "maxPerRequest": 0.50,
+    "maxDaily": 10.00
+  },
+  "services": {
+    "unknown":    { "action": "deny" },
+    "discovered": { "action": "allow", "maxPerRequest": 0.25, "maxDaily": 1.00 },
+    "verified":   { "action": "allow" },
+    "trusted":    { "action": "allow", "maxPerRequest": 5.00 },
+    "blocked":    { "action": "deny" }
+  },
+  "networks": { "allowed": ["base", "solana", "casper"] },
+  "tokens":   { "allowed": ["USDC", "wCSPR"] }
+}
+```
+
+Env overrides (each fails closed on a malformed value — never silently ignored):
+
+| Env var | Overrides |
+|---------|-----------|
+| `X402_POLICY_PAYMENTS_ENABLED` | `true` / `false` (exact strings) |
+| `X402_POLICY_MAX_PER_REQUEST` | global per-request cap |
+| `X402_POLICY_MAX_DAILY` | global daily cap |
+| `X402_POLICY_NETWORKS` | comma-separated network allowlist |
+| `X402_POLICY_TOKENS` | comma-separated token allowlist |
+| `X402_POLICY_SERVICE_<LEVEL>` | `allow` / `deny` / `approval` for `unknown\|discovered\|verified\|trusted\|blocked` |
+| `X402_POLICY_SERVICE_<LEVEL>_MAX_PER_REQUEST` / `_MAX_DAILY` | per-level caps |
+| `POLICY_TRUSTED_HOSTS` / `POLICY_BLOCKED_HOSTS` | comma-separated hostnames for the `TRUSTED` / `BLOCKED` trust levels |
+
+**Fail closed.** A config file with malformed JSON, wrong types, missing critical fields (`payments` is required), unrecognized keys (typo protection — a misspelled cap is an error, not a silent no-op), or unparseable env values puts the engine into a payments-disabled error state: `evaluate()` returns `DENY` with `CONFIG_INVALID` + `PAYMENTS_DISABLED` for **every** request. A missing file at `POLICY_CONFIG_PATH` loads the default policy (fail-closed applies to unusable content, not to an absent file). The policy layer never weakens a malformed setting into a permissive one.
+
+### The two explicit Phase 1 decisions
+
+1. **`APPROVAL_REQUIRED` is a refusal in Phase 1.** This MCP runs over stdio and has no human-approval channel; returning a decision the agent could treat as "pending" would be worse than refusing. The engine returns `APPROVAL_REQUIRED` with that reason code preserved, and `x402_fetch` refuses to pay — the issue's fail-closed principle applied to the approval gap.
+
+2. **The default policy reproduces pre-policy behavior exactly** (the explicit backwards-compatibility decision the issue demands — made explicit here rather than silently weakening the safety model): payments enabled, caps from `MAX_PAYMENT_PER_CALL` (default $0.50) / `MAX_DAILY_SPEND` (default $10.00), networks `[base, solana, casper]`, tokens `[USDC, wCSPR]`, every directory service payable at the global caps, and `services.unknown: allow` — because today **any** host is payable at the global caps (directory membership plays no role in the pre-policy gate), and the unchanged test suite is the proof of that compatibility. Tightening — e.g. `services.unknown: "deny"` so non-directory hosts are refused — is opt-in via config. The zero-behavior-change claim is test-locked: the full pre-existing suite passes unchanged under the default policy, and the fetch integration tests assert both the refusal path and the untouched default path.
+
+### Inspecting a payment without paying
+
+`x402_check_payment` evaluates a prospective payment and returns the structured decision — it never touches payment code paths (locked by a zero-payment-calls test):
+
+```json
+{
+  "decision": "DENY",
+  "service": "example.com",
+  "amount": "2.50",
+  "currency": "USDC",
+  "chain": "base",
+  "trust_level": "DISCOVERED",
+  "reasons": [
+    { "code": "SERVICE_LIMIT_EXCEEDED", "message": "Service example.com daily limit is $1.00 and $0.27 remains" }
+  ],
+  "limits": { "trustLevel": "DISCOVERED", "maxPerRequest": 0.5, "maxDaily": 10, "perServiceDaily": 1.0 },
+  "note": "Inspection only — no payment was attempted. Resolve DENY reasons before calling x402_fetch."
+}
+```
+
+Per-service daily spend is tracked in the same payment ledger (grouped by URL hostname, rehydrated like the global counter — no parallel state). Per-service caps are enforced for USD-settled chains (Base/Solana); Casper remains governed by its mote budgets (`CASPER_MAX_PAYMENT_PER_CALL` / `CASPER_MAX_DAILY_SPEND`) inside the payment layer.
+
+Deliberately **not** in Phase 1 (future extensions, tracked separately in issue #19): approval workflows, recipient allowlists, price-change/anomaly detection, payment velocity limits, circuit breakers, transaction simulation, response size limits, untrusted-data labelling, prompt-injection-aware response handling, and a persistent audit ledger.
 
 ## Trust Model
 
