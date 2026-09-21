@@ -8,10 +8,11 @@ import { registerDiscoverUrlTool } from "./tools/discover-url.js";
 import { registerHealthCheckTool } from "./tools/health.js";
 import { registerBatchDiscoverTool } from "./tools/batch-discover.js";
 import { registerCrawlX402ScanTool } from "./tools/crawl-directory.js";
+import { VERSION } from "./version.js";
 
 const server = new McpServer({
   name: "x402-agent-mcp",
-  version: "1.3.0",
+  version: VERSION,
 });
 
 // Register tools
