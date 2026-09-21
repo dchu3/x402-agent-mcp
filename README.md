@@ -180,14 +180,26 @@ JSON via `POLICY_CONFIG_PATH` (no new dependencies), with `X402_POLICY_*` env ov
     "maxDaily": 10.00
   },
   "services": {
-    "unknown":    { "action": "deny" },
-    "discovered": { "action": "allow", "maxPerRequest": 0.25, "maxDaily": 1.00 },
+    "unknown":    { "action": "allow" },
+    "discovered": { "action": "allow" },
     "verified":   { "action": "allow" },
-    "trusted":    { "action": "allow", "maxPerRequest": 5.00 },
+    "trusted":    { "action": "allow" },
     "blocked":    { "action": "deny" }
   },
   "networks": { "allowed": ["base", "solana", "casper"] },
   "tokens":   { "allowed": ["USDC", "wCSPR"] }
+}
+```
+
+The example above **is** the behavior-compat default: non-directory hosts are payable at the global caps (`services.unknown: allow` — before the policy engine, directory membership played no role in the limit checks). Tightening is opt-in and never the default — for example, the following refuses every non-directory host and tightens directory-service caps (a copy-paste of the block above does NOT apply any of this):
+
+```json
+{
+  "services": {
+    "unknown":    { "action": "deny" },
+    "discovered": { "action": "allow", "maxPerRequest": 0.25, "maxDaily": 1.00 },
+    "trusted":    { "action": "allow", "maxPerRequest": 5.00 }
+  }
 }
 ```
 
@@ -204,7 +216,7 @@ Env overrides (each fails closed on a malformed value — never silently ignored
 | `X402_POLICY_SERVICE_<LEVEL>_MAX_PER_REQUEST` / `_MAX_DAILY` | per-level caps |
 | `POLICY_TRUSTED_HOSTS` / `POLICY_BLOCKED_HOSTS` | comma-separated hostnames for the `TRUSTED` / `BLOCKED` trust levels |
 
-**Fail closed.** A config file with malformed JSON, wrong types, missing critical fields (`payments` is required), unrecognized keys (typo protection — a misspelled cap is an error, not a silent no-op), or unparseable env values puts the engine into a payments-disabled error state: `evaluate()` returns `DENY` with `CONFIG_INVALID` + `PAYMENTS_DISABLED` for **every** request. A missing file at `POLICY_CONFIG_PATH` loads the default policy (fail-closed applies to unusable content, not to an absent file). The policy layer never weakens a malformed setting into a permissive one.
+**Fail closed.** A config file that is unreadable (e.g. revoked permissions — any read error other than a missing file), malformed JSON, wrong types, missing critical fields (`payments` is required), unrecognized keys (typo protection — a misspelled cap is an error, not a silent no-op), or unparseable env values puts the engine into a payments-disabled error state: `evaluate()` returns `DENY` with `CONFIG_INVALID` + `PAYMENTS_DISABLED` for **every** request. A missing file at `POLICY_CONFIG_PATH` (ENOENT) loads the default policy (fail-closed applies to unusable content, not to an absent file). The policy layer never weakens a malformed setting into a permissive one.
 
 ### The two explicit Phase 1 decisions
 

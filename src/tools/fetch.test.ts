@@ -175,6 +175,65 @@ it('casper default policy: gate passes and the pre-existing budget check still g
   assert.equal(parsed.policy_decision, undefined);
 });
 
+// ---------------------------------------------------------------------------
+// Per-service ledger parity (post-#23 follow-up): the per-service in-memory
+// store and the ledger must agree across a restart. Rehydration filters ledger
+// entries by status === "success", so fetch.ts must apply the SAME accounting
+// rule logPayment applies (resp.status === 200) when calling
+// recordServicePayment — otherwise a non-200 settled response (e.g.
+// 500-after-settlement) counts in-process but vanishes from the ledger,
+// silently loosening the per-service cap across a restart.
+// ---------------------------------------------------------------------------
+
+it('per-service parity control: a 200 settled response still records and rehydrates identically after a restart', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  const host = 'parity-200-test.invalid';
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls++;
+    if (calls === 1) return probeChallengeFixed(); // probe: 402 with a $0.01 Solana offer
+    return new Response('{"result":"ok"}', { status: 200 }); // settled 200
+  }) as any;
+  const result = await handler()({ url: `https://${host}/api` });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.status, 200, 'the flow must reach the accounting block through a settled 200');
+
+  const store = await import('../policy/budget-store.js') as typeof import('../policy/budget-store.js'); // same instance fetch.js records into
+  const inProcess = store.getPerServiceSpent(host);
+  const restarted = await import(`../policy/budget-store.js?parity200=${++bust}`) as typeof import('../policy/budget-store.js'); // "restart": fresh module against the same ledger
+  const rehydrated = restarted.getPerServiceSpent(host);
+  assert.equal(inProcess, 0.01, 'a 200 response must still be recorded in-process');
+  assert.equal(rehydrated, 0.01, 'a 200 response must rehydrate from the ledger after a restart');
+  assert.equal(inProcess, rehydrated, 'in-process and rehydrated per-service spend must be identical');
+});
+
+it('per-service parity: a non-200 settled response (500-after-settlement) must not loosen the cap across a restart', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  const host = 'parity-non200-test.invalid';
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls++;
+    if (calls === 1) return probeChallengeFixed(); // probe: 402 with a $0.01 Solana offer
+    return new Response('server error', { status: 500 }); // settled, then the server failed
+  }) as any;
+  const result = await handler()({ url: `https://${host}/api` });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.status, 500, 'the flow must reach the accounting block through a non-200 response');
+  // The ledger DID capture the attempted settlement (logPayment always logs),
+  // but as status "failed" — exactly the entries rehydration drops.
+  const failedEntry = ledgerLines().map((l) => JSON.parse(l)).find((e: any) => e.url === `https://${host}/api`);
+  assert.ok(failedEntry, 'the non-200 settlement attempt must appear in the ledger');
+  assert.equal(failedEntry.status, 'failed');
+
+  const store = await import('../policy/budget-store.js') as typeof import('../policy/budget-store.js'); // same instance fetch.js records into
+  const inProcess = store.getPerServiceSpent(host);
+  const restarted = await import(`../policy/budget-store.js?paritynon200=${++bust}`) as typeof import('../policy/budget-store.js'); // "restart": fresh module against the same ledger
+  const rehydrated = restarted.getPerServiceSpent(host);
+  assert.equal(inProcess, rehydrated, `PARITY: in-process spend (${inProcess}) must equal post-restart spend (${rehydrated}) for the same ledger`);
+});
+
 it('concurrent budget consumption through the policy engine: 5 parallel requests against 2-worth of budget → exactly 2 allowed', async () => {
   // Mirrors the #18.4 concurrency argument, one layer up: the fetch.ts span
   // around a paid call is evaluate() → logPayment + recordServicePayment, all

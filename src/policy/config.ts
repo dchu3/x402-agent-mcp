@@ -6,9 +6,11 @@
 // 1. JSON config, not YAML (no new dependencies): POLICY_CONFIG_PATH points at
 //    a JSON file; X402_POLICY_* env vars override individual fields. Missing
 //    FILE at POLICY_CONFIG_PATH loads the default policy (ratified); a file
-//    that exists but is malformed/wrong-typed/missing-critical-fields fails
-//    closed: the engine state is "payments disabled" and evaluate() returns
-//    DENY with CONFIG_INVALID + PAYMENTS_DISABLED — never silently permissive.
+//    that exists but is unreadable, malformed/wrong-typed/missing-critical-
+//    fields fails closed: the engine state is "payments disabled" and
+//    evaluate() returns DENY with CONFIG_INVALID + PAYMENTS_DISABLED — never
+//    silently permissive. (Error classes on read: only ENOENT means "no
+//    config"; EACCES/EISDIR/… fail closed.)
 //
 // 2. Behavior-compat default (the explicit decision issue #19 demands):
 //    the default policy reproduces pre-policy behavior EXACTLY — payments
@@ -235,10 +237,24 @@ function applyFileConfig(config: PolicyConfig, errors: string[]): void {
   let raw: string;
   try {
     raw = readFileSync(path, "utf-8");
-  } catch {
+  } catch (err) {
     // Ratified: a MISSING file at POLICY_CONFIG_PATH loads the default policy.
     // (Fail-closed applies to malformed/unusable content, decided explicitly
     // for this repo; a missing file is indistinguishable from "no config".)
+    // Post-#23 follow-up: ENOENT is the ONLY error class with that meaning.
+    // A file that exists but cannot be read (EACCES on revoked permissions,
+    // EISDIR on a directory path, …) is NOT "no config" — swallowing its
+    // error would fail OPEN, silently discarding the operator's tightened
+    // rules and running the permissive default. Every other read error fails
+    // closed: the engine returns DENY with CONFIG_INVALID + PAYMENTS_DISABLED
+    // and the underlying error in the reason message. (A dangling symlink
+    // surfaces as ENOENT on read, so it follows the ratified missing-file
+    // behavior.)
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT") return;
+    errors.push(
+      `POLICY_CONFIG_PATH ${path} exists but could not be read (${err instanceof Error ? err.message : String(err)})`,
+    );
     return;
   }
 
