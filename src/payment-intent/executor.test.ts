@@ -147,7 +147,6 @@ it('intent:null registers a blocking hook — the HTTP request passes through, s
   const free = await executeGuarded({
     intent: null,
     blockedCode: 'AMOUNT_UNBINDABLE',
-    blockedMessage: 'probe offer had no bindable amount',
     manager: intentManager,
     client,
     label: 'x402_fetch',
@@ -164,7 +163,6 @@ it('intent:null registers a blocking hook — the HTTP request passes through, s
     executeGuarded({
       intent: null,
       blockedCode: 'AMOUNT_UNBINDABLE',
-      blockedMessage: 'probe offer had no bindable amount',
       manager: intentManager,
       client: client2,
       label: 'x402_fetch',

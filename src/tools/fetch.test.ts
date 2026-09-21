@@ -265,3 +265,142 @@ it('concurrent budget consumption through the policy engine: 5 parallel requests
   assert.equal(getDailySpent(), 0.40);
   assert.equal(getPerServiceSpent('conc.example'), 0.40, 'per-service store tracks the same consumption');
 });
+
+// ---------------------------------------------------------------------------
+// Issue #25 — the payment-intent boundary in x402_fetch.
+//
+// The boundary is at signing/payload creation, never at the HTTP request
+// (amendment 1): the retained probe offer is bound to a payment intent after
+// the policy ALLOW; the x402 client's onBeforePaymentCreation hook aborts any
+// payload whose selected requirements drift from the intent; an offer that
+// cannot be bound registers a blocking hook so it can never be PAID, while
+// unpaid/non-402 responses pass through unchanged.
+// ---------------------------------------------------------------------------
+
+// The SDK's spendControls reject non-default assets BEFORE hooks run, so the
+// paid-leg challenge must advertise the SDK's own well-known USDC mint
+// constant (a public protocol identifier, not a secret) — same convention as
+// the WCSPR_ASSETS constants used by the Casper tests above.
+const { USDC_MAINNET_ADDRESS } = await import('@x402/svm') as any;
+const BINDABLE_SOLANA_ASSET: string = USDC_MAINNET_ADDRESS;
+
+/** Full x402 v2 challenge the SDK can parse on the PAID leg. */
+function bindableSolanaChallenge(amount: string, requestUrl: string) {
+  const payload = JSON.stringify({
+    x402Version: 2,
+    resource: { url: requestUrl, description: '', mimeType: 'text/plain' },
+    accepts: [{ scheme: 'exact', network: SOLANA_CAIP2, asset: BINDABLE_SOLANA_ASSET, amount, payTo: 'SoLWallet', maxTimeoutSeconds: 60, extra: { name: 'USDC' } }],
+  });
+  return new Response('Payment Required', { status: 402, headers: { 'payment-required': b64url(payload) } });
+}
+
+function noSignatureHeader(input: unknown, init: unknown): boolean {
+  const headers = new Headers(input instanceof Request ? input.headers : (init as any)?.headers);
+  return headers.has('payment-signature');
+}
+
+it('intent boundary: price raised between probe and paid challenge ⇒ abort before signing, structured refusal, no ledger success', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  const url = 'https://price-raised-test.invalid/api';
+  let calls = 0;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    calls++;
+    assert.equal(noSignatureHeader(input, init), false, 'a signature must never exist for a mismatched offer');
+    if (calls === 1) return bindableSolanaChallenge('10000', url); // probe: $0.01 offer
+    return bindableSolanaChallenge('20000', url);                  // paid leg: price doubled
+  }) as any;
+  const before = ledgerLines();
+  const result = await handler()({ url });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(calls, 2, 'probe + one paid attempt — the abort happens before any signed retry');
+  assert.equal(parsed.policy_decision, 'ALLOW', 'policy allowed; the intent boundary is what refused');
+  assert.deepEqual(parsed.reasons.map((r: any) => r.code), ['INTENT_UNAUTHORISED', 'OFFER_MISMATCH']);
+  assert.match(parsed.error, /payment-intent boundary/);
+  assert.match(parsed.reasons[1].message, /amount/, 'the drifted field is named');
+  for (const key of ['error', 'url', 'chain', 'estimated_cost_usdc', 'daily_spent_usdc', 'max_per_call', 'max_daily']) {
+    assert.ok(key in parsed, `refusal keeps the #19 key ${key}`);
+  }
+  const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
+  assert.ok(!entries.some((e: any) => e.url === url && e.status === 'success'), 'no ledger success for an aborted payment');
+  assert.equal(entries.find((e: any) => e.url === url)?.status, 'failed', 'the aborted attempt is audited like any other failure');
+});
+
+it('intent boundary: an offer with an unbindable amount/asset can never be paid (INTENT_UNAUTHORISED — amendment 1)', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  const url = 'https://unbindable-test.invalid/api';
+  function unbindableProbe() {
+    // Malformed/legacy-shaped offer: no amount, no asset.
+    const payload = JSON.stringify({
+      x402Version: 2,
+      accepts: [{ scheme: 'exact', network: SOLANA_CAIP2, payTo: 'SoLWallet', extra: { name: 'USDC' } }],
+    });
+    return new Response('Payment Required', { status: 402, headers: { 'payment-required': b64url(payload) } });
+  }
+  let calls = 0;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    calls++;
+    assert.equal(noSignatureHeader(input, init), false, 'payment-payload creation must never happen');
+    if (calls === 1) return unbindableProbe();
+    return bindableSolanaChallenge('10000', url); // the paid leg WOULD charge — blocked at the hook
+  }) as any;
+  const before = ledgerLines();
+  const result = await handler()({ url });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(calls, 2, 'the HTTP request is never refused — the paid fetch runs and signing is blocked');
+  assert.equal(parsed.policy_decision, 'ALLOW');
+  assert.deepEqual(parsed.reasons.map((r: any) => r.code), ['INTENT_UNAUTHORISED', 'AMOUNT_UNBINDABLE']);
+  const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
+  assert.ok(!entries.some((e: any) => e.url === url && e.status === 'success'), 'no ledger success');
+});
+
+it('intent boundary compat proof: an unpaid endpoint answers 200 directly — no payload creation occurred', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  let calls = 0;
+  let signatureSeen = false;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    calls++;
+    if (noSignatureHeader(input, init)) signatureSeen = true;
+    if (calls === 1) return probeChallengeFixed(); // legacy-shaped offer (no asset) — intent binds asset ''
+    return new Response('{"result":"ok"}', { status: 200 }); // call 2 answers 200 directly: the SDK never creates a payload
+  }) as any;
+  const result = await handler()({ url: 'https://intent-compat-test.invalid/api' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(calls, 2, 'the pass-through claim is proven: probe + direct 200');
+  assert.equal(signatureSeen, false, 'no payment payload was ever created or attached');
+  assert.equal(parsed.status, 200);
+  assert.equal(parsed.paid, true);
+  assert.equal(parsed.cost_usdc, 0.01);
+  assert.equal(parsed.policy_decision, undefined, 'ALLOW adds no policy keys to the success output');
+});
+
+it('intent boundary: Casper payTo swapped between probe and payment ⇒ aborted before budget reserve', async () => {
+  process.env.CASPER_MAX_PAYMENT_PER_CALL = '1';
+  process.env.CASPER_MAX_DAILY_SPEND = '10';
+  process.env.CASPER_PRIVATE_KEY = '11'.repeat(32);
+  const url = 'https://casper-swap-test.invalid/api';
+  const originalPayTo = '00' + 'ab'.repeat(32);
+  const swappedPayTo = '00' + 'cd'.repeat(32);
+  function casperChallengeWith(payTo: string) {
+    const payload = JSON.stringify({
+      x402Version: 2,
+      resource: { url, description: '', mimeType: 'text/plain' },
+      accepts: [{ scheme: 'exact', network: 'casper:casper', asset: WCSPR_ASSETS['casper:casper'], payTo, amount: '1000000000', maxTimeoutSeconds: 60, extra: { name: 'wCSPR' } }],
+    });
+    return new Response(payload, { status: 402, headers: { 'payment-required': Buffer.from(payload).toString('base64') } });
+  }
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls++;
+    return casperChallengeWith(calls === 1 ? originalPayTo : swappedPayTo);
+  }) as any;
+  const { casperBudget } = await import('../casper/budget.js');
+  const before = casperBudget.getDailySpent();
+  const result = await handler()({ url, chain: 'casper' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(calls, 2, 'probe + one paid attempt — signing aborts at the hook');
+  assert.match(parsed.error, /failed/, 'a swapped offer must fail, never pay the stranger');
+  assert.equal(casperBudget.getDailySpent(), before, 'the intent hook runs BEFORE guardCasperPayments: no budget reserve happened');
+});

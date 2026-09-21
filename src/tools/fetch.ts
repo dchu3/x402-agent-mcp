@@ -14,6 +14,9 @@ import { checkSpendingLimit, logPayment, getDailySpent, getMaxPerCall, getMaxDai
 import { getPolicyEngine, buildPolicyContext } from "../policy/config.js";
 import { getPerServiceSpent, recordServicePayment } from "../policy/budget-store.js";
 import { extractSettlementReceipt, RECEIPT_VERIFIED, RECEIPT_NOTE } from "./receipt-utils.js";
+import { createFromOffer, intentManager } from "../payment-intent/manager.js";
+import { executeGuarded } from "../payment-intent/executor.js";
+import type { IntentRejectCode, PaymentIntent } from "../payment-intent/types.js";
 
 /** Structured policy refusal — keeps the pre-policy error shape keys verbatim
  * (error, url, chain, estimated_cost_usdc, daily_spent_usdc, max_per_call,
@@ -41,6 +44,52 @@ function policyRefusal(
       }),
     }],
   };
+}
+
+/** Structured intent refusal (issue #25) — the same refusal shape keys as
+ * policyRefusal (error, url, chain, estimated_cost_usdc, daily_spent_usdc,
+ * max_per_call, max_daily, policy_decision, reasons), with policy_decision +
+ * machine-readable reasons. Only an ALLOWed request can reach the payment
+ * layer, so policy_decision is ALLOW here by construction. */
+function intentRefusal(
+  url: string,
+  chain: string,
+  amountUsdc: number,
+  reasons: Array<{ code: string; message: string }>,
+): { content: Array<{ type: "text"; text: string }> } {
+  return {
+    content: [{
+      type: "text" as const,
+      text: JSON.stringify({
+        error: `Payment refused by the payment-intent boundary (${reasons.map((r) => r.code).join(", ")})`,
+        url,
+        chain,
+        estimated_cost_usdc: amountUsdc,
+        daily_spent_usdc: getDailySpent(),
+        max_per_call: getMaxPerCall(),
+        max_daily: getMaxDailySpend(),
+        policy_decision: "ALLOW",
+        reasons,
+      }),
+    }],
+  };
+}
+
+/** Parse an SDK abort marker out of a payment failure (`Failed to create
+ * payment payload: Payment creation aborted: INTENT_<CODE>[:<field>]`). The
+ * raw SDK string is never returned as the whole message — it is attached as a
+ * prefixed detail after the intent code (issue #25 refusal contract). */
+function intentAbortReasons(message: string): Array<{ code: string; message: string }> | undefined {
+  const m = /Payment creation aborted: INTENT_([A-Z_]+)(?::([A-Za-z_]+))?/.exec(message);
+  if (!m) return undefined;
+  const head = m[1];
+  const sub = m[2];
+  const specific = head === "UNAUTHORISED" ? (sub ?? "MALFORMED") : head;
+  const fieldNote = head !== "UNAUTHORISED" && sub ? ` on field "${sub}"` : "";
+  return [
+    { code: "INTENT_UNAUTHORISED", message: `payment-intent boundary aborted payload creation before signing (${specific}${fieldNote})` },
+    { code: specific, message: `${specific}${fieldNote} — no signature was created; sdk detail: ${message.slice(0, 300)}` },
+  ];
 }
 
 export function registerFetchTool(server: McpServer): void {
@@ -72,6 +121,12 @@ export function registerFetchTool(server: McpServer): void {
       let useChain = (args.chain || "").toLowerCase();
       let probedAmountUsdc = 0; // captured from 402 response
       let casperNetwork = process.env.CASPER_NETWORK || "";
+      // Issue #25: the concrete probe offer, retained so the payment intent
+      // can bind exactly what policy evaluated (the USD estimate alone is not
+      // an authorisation). Undefined when the probe is skipped (forced chain).
+      let probedOffer: { scheme?: string; network?: string; asset?: string; amount?: string; payTo?: string } | undefined;
+      let casperIntent: PaymentIntent | null = null;
+      let casperBlockedCode: IntentRejectCode | undefined;
 
       if (!useChain || useChain === CASPER_CHAIN) {
         try {
@@ -104,6 +159,16 @@ export function registerFetchTool(server: McpServer): void {
           const accepts = paymentInfo.accepts || paymentInfo.accept || [];
           const firstAccept = Array.isArray(accepts) ? accepts[0] : accepts;
           const network = firstAccept?.network || "";
+
+          // Issue #25: retain the concrete offer (chain detection + USD
+          // estimate are derived from the same single probe — no new calls).
+          probedOffer = {
+            scheme: firstAccept?.scheme,
+            network: firstAccept?.network,
+            asset: firstAccept?.asset,
+            amount: firstAccept?.amount,
+            payTo: firstAccept?.payTo,
+          };
 
           // Capture amount for spending limit check
           if (firstAccept?.amount) {
@@ -151,6 +216,25 @@ export function registerFetchTool(server: McpServer): void {
               casperNetwork = toCasperCaip2(casperAccept.network);
               try {
                 assertPayableCasperAccept(casperAccept);
+                // Issue #25: bind the validated offer to a payment intent now
+                // (gate order unchanged: evaluate → intent → budget check).
+                // If it cannot be bound, the flow still continues — with a
+                // blocking hook instead of an executable intent.
+                const casperIntentResult = createFromOffer({
+                  decision: casperPolicy,
+                  url,
+                  chain: CASPER_CHAIN,
+                  token: "wCSPR",
+                  asset: casperAccept.asset,
+                  amountAtomic: casperAmountMotes(casperAccept).toString(),
+                  decimals: 9,
+                  recipient: casperAccept.payTo,
+                  network: casperNetwork,
+                  scheme: casperAccept.scheme,
+                  amountUsdEstimate: 0,
+                });
+                if (casperIntentResult.ok === true) casperIntent = casperIntentResult.intent;
+                else casperBlockedCode = casperIntentResult.code;
                 casperBudget.check(casperAmountMotes(casperAccept));
               } catch (err: any) {
                 return {
@@ -199,8 +283,13 @@ export function registerFetchTool(server: McpServer): void {
       }
 
       if (useChain === CASPER_CHAIN) {
-        return fetchCasper(url, method, args.body, casperKey!, casperNetwork);
+        return fetchCasper(url, method, args.body, casperKey!, casperNetwork, casperIntent, casperBlockedCode);
       }
+
+      // USD estimate for policy evaluation (informational — the intent binds
+      // the atomic amount, never this estimate). Hoisted so the catch block
+      // can render intent refusals with the same estimated_cost_usdc key.
+      const amountUsdc = probedAmountUsdc || 0.01;
 
       // Step 3: Create x402 client with the right scheme
       try {
@@ -225,14 +314,40 @@ export function registerFetchTool(server: McpServer): void {
         // here too (stdio MCP has no human-approval channel in Phase 1 — the
         // issue's fail-closed principle; the APPROVAL_REQUIRED reason code is
         // preserved so callers see why).
-        const amountUsdc = probedAmountUsdc || 0.01; // use probed amount or default estimate
-
         const policyResult = getPolicyEngine().evaluate(
           buildPolicyContext(url, useChain, "USDC", amountUsdc),
           { dailySpentUsd: getDailySpent(), perServiceSpentUsd: getPerServiceSpent(serviceHost) },
         );
         if (policyResult.decision !== "ALLOW") {
           return policyRefusal(policyResult, url, useChain, amountUsdc);
+        }
+
+        // Issue #25: bind exactly what policy evaluated to a payment intent.
+        // An offer that cannot be bound can never be PAID: the paid fetch
+        // continues with a blocking hook (INTENT_UNAUTHORISED) so endpoints
+        // that do not actually charge pass through unchanged, while any
+        // payment-payload creation aborts before signing (amendment 1).
+        let intent: PaymentIntent | null = null;
+        let blockedCode: IntentRejectCode | undefined;
+        if (probedOffer) {
+          const intentResult = createFromOffer({
+            decision: policyResult,
+            url,
+            chain: useChain,
+            token: "USDC",
+            asset: probedOffer.asset ?? "",
+            amountAtomic: probedOffer.amount ?? "",
+            decimals: 6,
+            recipient: probedOffer.payTo ?? "",
+            network: probedOffer.network ?? "",
+            scheme: probedOffer.scheme ?? "",
+            amountUsdEstimate: amountUsdc,
+          });
+          if (intentResult.ok === true) intent = intentResult.intent;
+          else blockedCode = intentResult.code;
+        } else {
+          // Forced chain skips the probe — there is no offer to bind.
+          blockedCode = "MALFORMED";
         }
 
         // Belt-and-braces INSIDE the payment layer (operator decision #5):
@@ -256,13 +371,32 @@ export function registerFetchTool(server: McpServer): void {
           };
         }
 
-        // Step 4: Make the paid request
-        const paidFetch = wrapFetchWithPayment(fetch, client);
-        const resp = await paidFetch(url, {
-          method,
-          headers: args.body ? { "Content-Type": "application/json" } : {},
-          body: args.body || undefined,
+        // Step 4: Make the paid request — only through the guarded executor,
+        // which validates/begins the intent and registers the enforcement (or
+        // blocking) hook on the client before any payload can be signed.
+        const guarded = await executeGuarded({
+          intent,
+          blockedCode,
+          manager: intentManager,
+          client,
+          label: "x402_fetch",
+          run: async () => {
+            const paidFetch = wrapFetchWithPayment(fetch, client);
+            return paidFetch(url, {
+              method,
+              headers: args.body ? { "Content-Type": "application/json" } : {},
+              body: args.body || undefined,
+            });
+          },
         });
+        if (guarded.ok === false) {
+          // validate/beginAttempt failed — the payment layer never ran.
+          return intentRefusal(url, useChain, amountUsdc, [
+            { code: "INTENT_UNAUTHORISED", message: `payment-intent boundary refused execution (${guarded.code})` },
+            { code: guarded.code, message: `${guarded.code}: ${guarded.message}` },
+          ]);
+        }
+        const resp = guarded.result;
 
         const text = await resp.text();
         let bodyResult: unknown;
@@ -336,6 +470,14 @@ export function registerFetchTool(server: McpServer): void {
           status: "failed",
           error: err.message,
         });
+
+        // Issue #25: an intent-boundary abort means signing was refused before
+        // any payload existed — surface the structured refusal, never the raw
+        // SDK error string as the message.
+        const abortReasons = intentAbortReasons(String(err?.message ?? err));
+        if (abortReasons) {
+          return intentRefusal(url, useChain, amountUsdc, abortReasons);
+        }
 
         return {
           content: [{

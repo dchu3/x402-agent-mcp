@@ -71,7 +71,6 @@ export interface ExecuteGuardedArgs<T> {
   intent: PaymentIntent | null;
   /** Why no intent exists (required when intent === null). */
   blockedCode?: IntentRejectCode;
-  blockedMessage?: string;
   manager: IntentManager;
   client: HookRegistrar;
   /** The executor: performs the paid fetch through the x402 client. */
