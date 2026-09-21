@@ -95,6 +95,7 @@ Check the payment ledger for an entry with `currency: "wCSPR"` and an exact `amo
 | `MAX_DAILY_SPEND` | 10.00 | Reject after cumulative daily spend exceeded (USDC) |
 | `PAYMENT_LOG_PATH` | ./x402-payments.jsonl | Path to payment log file (gitignored) |
 | `X402_DIRECTORY_PATH` | ./endpoints.json | Path to the endpoint directory file (gitignored); set to isolate tests/sandboxes from the live directory |
+| `X402_INTENT_TTL_MS` | 60000 | Payment-intent time-to-live in milliseconds (see Payment Intent Boundary); an expired intent can never be signed |
 
 Payments share one `x402-payments.jsonl` ledger with timestamp, URL, chain, amount, tx hash, and status. USDC entries use `amount_usdc`; Casper entries use `currency: "wCSPR"` and an exact `amount_motes` string. Base/Solana counters are tracked by chain and summed for the existing USD daily limit. Casper has an independent mote counter.
 
@@ -247,6 +248,49 @@ Env overrides (each fails closed on a malformed value — never silently ignored
 Per-service daily spend is tracked in the same payment ledger (grouped by URL hostname, rehydrated like the global counter — no parallel state). Per-service caps are enforced for USD-settled chains (Base/Solana); Casper remains governed by its mote budgets (`CASPER_MAX_PAYMENT_PER_CALL` / `CASPER_MAX_DAILY_SPEND`) inside the payment layer.
 
 Deliberately **not** in Phase 1 (future extensions, tracked separately in issue #19): approval workflows, recipient allowlists, price-change/anomaly detection, payment velocity limits, circuit breakers, transaction simulation, response size limits, untrusted-data labelling, prompt-injection-aware response handling, and a persistent audit ledger.
+
+## Payment Intent Boundary (issue #25)
+
+Between the policy decision and the wallet there is a second, internal authorisation boundary. The layers have distinct jobs — **policy engine: "is this permitted?"; payment intent: "exactly what was authorised"; executor: "how it is executed"** on Base, Solana or Casper. After the policy gate returns `ALLOW`, `x402_fetch` binds the evaluated offer (service, URL, chain, CAIP-2 network, token, asset, integer atomic amount, recipient, scheme) into a short-lived, immutable **payment intent**, and the payment layer can only sign through an intent-validating executor:
+
+```
+LLM input (URL/method/body — no payment parameters)
+   |
+   v
+Policy decision (ALLOW / DENY / APPROVAL_REQUIRED)
+   |
+   +-- not ALLOW -----------> structured refusal, NO intent, NO payment
+   |
+   v
+Authorised payment intent  (in-memory registry; paramsHash +
+   |                        policyDecisionId bound at creation;
+   |                        TTL-bounded, one-shot)
+   v
+Validated executor         (executeGuarded: validate + beginAttempt,
+   |                        enforcement hook on the x402 client)
+   v
+Wallet / signing           (onBeforePaymentCreation: final check
+                            immediately BEFORE payload is signed)
+```
+
+The enforcement point is the x402 SDK's `onBeforePaymentCreation` hook — exactly where parameters become a signature. Any drift between the authorised intent and the offer the SDK actually selected (amount, recipient, asset, network, scheme) aborts with `OFFER_MISMATCH` before a signature exists. **The boundary is at signing/payload creation, never at the HTTP request:** an endpoint that answers the paid request without a 402 passes through unchanged, while any attempt to charge is verified against the intent.
+
+Six security properties:
+
+1. **Immutable after authorisation.** The registry keeps a frozen record; `paramsHash` (sha256 over the security-sensitive fields in fixed canonical order) and `policyDecisionId` (sha256 of `decision:paramsHash`) are recomputed and deep-compared at validation. Tampering any field ⇒ `PARAM_MISMATCH`.
+2. **Policy binding.** Only an `ALLOW` decision can mint an executable intent; `DENY` / `APPROVAL_REQUIRED` ⇒ `NOT_AUTHORISED`. The engine itself is untouched (the intent layer never re-implements policy rules).
+3. **Expiry.** Intents live for `X402_INTENT_TTL_MS` (default 60 s, invalid values fall back to the default). After that, validation ⇒ `EXPIRED`.
+4. **Replay protection.** One authorisation per intent: `issued → in-flight → consumed`; a second execution or consume ⇒ `ALREADY_USED`.
+5. **Fail closed.** Unknown, malformed, mismatched, expired or replayed ⇒ a structured reason code (`NOT_AUTHORISED` / `MALFORMED` / `UNKNOWN_INTENT` / `PARAM_MISMATCH` / `EXPIRED` / `ALREADY_USED` / `OFFER_MISMATCH` / `AMOUNT_UNBINDABLE`), never a guess, never a default price. Money is integer atomic units (`amountAtomic`); the USD figure policy evaluated is informational only and never the binding.
+6. **No bypass.** A structural test (`src/payment-intent/no-bypass.test.ts`) locks `wrapFetchWithPayment(` / `new x402Client(` to the sanctioned call sites; any new payment path added elsewhere fails the suite.
+
+The intent registry is **in-memory per process** — the same limitation class as the budget counters (see Limitations above): intents cannot be forged from the MCP tool surface (the LLM never sees intents), and a restart simply invalidates all of them.
+
+**Deliberate tightening (`AMOUNT_UNBINDABLE`).** Previously, when the probe offer had no parseable amount, `x402_fetch` fell back to a `$0.01` *estimate* for the policy/limit checks and the real amount was only discovered when the SDK built the payload. Now: an offer that cannot be bound to a payment intent can never be **paid** — the payment-payload creation aborts before any signing (`INTENT_UNAUTHORISED`). Unpaid/non-402 responses still pass through unchanged, so endpoints that do not actually charge are unaffected. The same rule applies when `chain` forces `base`/`solana` (which skips the probe: there is no retained offer to bind) — omit `chain` to let the probe bind the offer. The policy's USD estimate for such offers remains the informational fallback for the policy evaluation itself.
+
+**Structured refusals.** Intent refusals reuse the #19 refusal shape keys (`error`, `url`, `chain`, `estimated_cost_usdc`, `daily_spent_usdc`, `max_per_call`, `max_daily`, `policy_decision`, `reasons[{code, message}]`) with primary reason code `INTENT_UNAUTHORISED` plus the specific intent code.
+
+The boundary is internal to the server: no new MCP tool, no new tool argument, and nothing about intents (or wallets) is exposed to the agent.
 
 ## Trust Model
 
@@ -453,6 +497,7 @@ Explicitly deferred — tracked here so the boundary is visible, not forgotten:
 - **Self-describing service manifests (issue #18.7)** — machine-readable service metadata is an ecosystem-wide direction: services must publish manifests before clients can consume them. Deferred to the ecosystem roadmap; `x402_discover_url` already consumes `/.well-known/ai-catalog.json` and `/.well-known/x402` where present.
 - **Multi-instance budget durability** — enforcing one budget across several MCP processes needs an external spend store (see Limitations under Spending Limits).
 - **On-chain settlement-receipt verification** — independently verifying receipts needs a chain client per network (see Trust Model).
+- **Persistent audit ledger for payments/intents** — durable, multi-instance audit trails (payment intents are process-local by design, like the budget counters); needs an external store and is deferred with the multi-instance budget work.
 
 ## Disclaimer
 
