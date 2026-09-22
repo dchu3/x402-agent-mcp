@@ -96,6 +96,8 @@ it('cap enforcement per service while global cap intact (engine + store together
       networks: { allowed: ['base', 'solana', 'casper'] },
       tokens: { allowed: ['USDC', 'wCSPR'] },
       recipients: { mode: 'change-detect', allowed: [], perService: {}, known: {} },
+      // Issue #30 compat default: the anomaly gate ships disabled.
+      anomaly: { enabled: false, window: 20, warnZ: 2.0, denyZ: 3.0, minSamples: 5, seedFromDirectory: true, defaultTolerance: 2.0 },
     },
     configErrors: [],
   });

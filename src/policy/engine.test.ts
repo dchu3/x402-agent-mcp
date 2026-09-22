@@ -21,6 +21,10 @@ function cfg(overrides: Partial<PolicyConfig> = {}): PolicyConfig {
     networks: { allowed: ['base', 'solana', 'casper'] },
     tokens: { allowed: ['USDC', 'wCSPR'] },
     recipients: { mode: 'change-detect', allowed: [], perService: {}, known: {} },
+    // Issue #30 compat default: the price anomaly gate ships DISABLED —
+    // enabling it is an operator opt-in (conflict B), so existing decisions
+    // are unchanged.
+    anomaly: { enabled: false, window: 20, warnZ: 2.0, denyZ: 3.0, minSamples: 5, seedFromDirectory: true, defaultTolerance: 2.0 },
     ...overrides,
   };
 }

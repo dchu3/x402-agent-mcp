@@ -39,8 +39,10 @@
 
 import { readFileSync } from "fs";
 import { PolicyEngine } from "./engine.js";
+import { DEFAULT_ANOMALY_CONFIG } from "./anomaly.js";
 import { loadDirectory } from "../directory.js";
 import type {
+  AnomalyConfig,
   PolicyConfig,
   PolicyContext,
   PolicyEngineState,
@@ -90,6 +92,13 @@ export function defaultPolicyConfig(errors: string[] = []): PolicyConfig {
     // map the recipient gate never fires and today's decisions are unchanged
     // (the unchanged test suite is the proof, README "compat default").
     recipients: { mode: "change-detect", allowed: [], perService: {}, known: {} },
+    // Issue #30 compat default (conflict B): the anomaly block ships DISABLED —
+    // an always-on price gate could hard-deny a previously allowed payment (a
+    // legitimate provider price rise looks exactly like an attack), so turning
+    // it on is an operator opt-in, exactly like services.unknown: deny and the
+    // recipient allowlist. DEFAULT_POLICY_CONFIG.anomaly.enabled === false and
+    // the untouched existing test suite are the compat proof.
+    anomaly: { ...DEFAULT_ANOMALY_CONFIG },
   };
 }
 /** Frozen snapshot of the compat default, exported for documentation/tests.
@@ -116,6 +125,9 @@ function failClosedConfig(errors: string[]): PolicyConfig {
     // every recipient — consistent with this state's "nothing is payable"
     // content (the engine additionally short-circuits on configErrors).
     recipients: { mode: "allowlist", allowed: [], perService: {}, known: {} },
+    // Fail-closed anomaly state: the disabled default (payments are disabled
+    // here anyway — the engine short-circuits on configErrors before any rule).
+    anomaly: { ...DEFAULT_ANOMALY_CONFIG },
   };
 }
 
@@ -207,9 +219,35 @@ function recipientsPolicy(v: unknown, path: string, errors: string[]): void {
   }
 }
 
+function anomalyPolicy(v: unknown, path: string, errors: string[]): void {
+  if (!isPlainObject(v)) {
+    errors.push(`${path} must be an object with an "enabled" boolean (issue #30)`);
+    return;
+  }
+  const known = new Set(["enabled", "window", "warnZ", "denyZ", "minSamples", "seedFromDirectory", "defaultTolerance"]);
+  for (const key of Object.keys(v)) {
+    if (!known.has(key)) errors.push(`${path}.${key} is not a recognised policy key (typo protection)`);
+  }
+  if (v.enabled !== undefined && typeof v.enabled !== "boolean") errors.push(`${path}.enabled must be a boolean`);
+  if (v.seedFromDirectory !== undefined && typeof v.seedFromDirectory !== "boolean") {
+    errors.push(`${path}.seedFromDirectory must be a boolean`);
+  }
+  if (v.window !== undefined && !(typeof v.window === "number" && Number.isInteger(v.window) && v.window >= 1)) {
+    errors.push(`${path}.window must be an integer >= 1`);
+  }
+  if (v.minSamples !== undefined && !(typeof v.minSamples === "number" && Number.isInteger(v.minSamples) && v.minSamples >= 1)) {
+    errors.push(`${path}.minSamples must be an integer >= 1`);
+  }
+  if (v.warnZ !== undefined && !finiteNonNegative(v.warnZ)) errors.push(`${path}.warnZ must be a finite non-negative number`);
+  if (v.denyZ !== undefined && !finiteNonNegative(v.denyZ)) errors.push(`${path}.denyZ must be a finite non-negative number`);
+  if (v.defaultTolerance !== undefined && !(typeof v.defaultTolerance === "number" && Number.isFinite(v.defaultTolerance) && v.defaultTolerance >= 1)) {
+    errors.push(`${path}.defaultTolerance must be a finite number >= 1`);
+  }
+}
+
 /** Strict validation of a parsed config document against the schema. Only
  * `payments` is required (safety-critical — the issue's fail-closed rule);
- * services/networks/tokens/recipients are optional and merge over the
+ * services/networks/tokens/recipients/anomaly are optional and merge over the
  * defaults. Unknown keys are errors everywhere (typo protection: a misspelled
  * cap must never be silently ignored). */
 function validateDocument(doc: unknown, errors: string[]): void {
@@ -217,7 +255,7 @@ function validateDocument(doc: unknown, errors: string[]): void {
     errors.push("policy config must be a JSON object");
     return;
   }
-  const knownTop = new Set(["payments", "services", "networks", "tokens", "recipients"]);
+  const knownTop = new Set(["payments", "services", "networks", "tokens", "recipients", "anomaly"]);
   for (const key of Object.keys(doc)) {
     if (!knownTop.has(key)) errors.push(`policy config key "${key}" is not recognised (typo protection)`);
   }
@@ -274,6 +312,15 @@ function validateDocument(doc: unknown, errors: string[]): void {
   // (an allowlist mode with an empty effective list denies — fail-closed).
   if (doc.recipients !== undefined) {
     recipientsPolicy(doc.recipients, "recipients", errors);
+  }
+
+  // anomaly — optional; strict shape (issue #30). No env override (the
+  // recipients precedent). A partial block merges over the defaults
+  // field-by-field in applyFileConfig; the warnZ < denyZ ORDERING is checked
+  // there too, on the merged values (a partial block that only raises warnZ
+  // above the default denyZ must fail closed just the same).
+  if (doc.anomaly !== undefined) {
+    anomalyPolicy(doc.anomaly, "anomaly", errors);
   }
 }
 
@@ -332,6 +379,7 @@ function applyFileConfig(config: PolicyConfig, errors: string[]): void {
       perService?: Record<string, string[]>;
       known?: Record<string, string>;
     };
+    anomaly?: Partial<AnomalyConfig>;
   };
 
   // payments is fully specified (required) — replace wholesale.
@@ -362,6 +410,28 @@ function applyFileConfig(config: PolicyConfig, errors: string[]): void {
         : config.recipients.perService,
       known: d.recipients.known !== undefined ? { ...d.recipients.known } : config.recipients.known,
     };
+  }
+
+  // Issue #30: merge anomaly over the default ONLY when the section is
+  // present, field-by-field, copying fresh values — never aliasing
+  // DEFAULT_ANOMALY_CONFIG (the default template must stay pristine). Shapes
+  // are guaranteed by validateDocument.
+  if (d.anomaly) {
+    config.anomaly = {
+      enabled: d.anomaly.enabled ?? config.anomaly.enabled,
+      window: d.anomaly.window ?? config.anomaly.window,
+      warnZ: d.anomaly.warnZ ?? config.anomaly.warnZ,
+      denyZ: d.anomaly.denyZ ?? config.anomaly.denyZ,
+      minSamples: d.anomaly.minSamples ?? config.anomaly.minSamples,
+      seedFromDirectory: d.anomaly.seedFromDirectory ?? config.anomaly.seedFromDirectory,
+      defaultTolerance: d.anomaly.defaultTolerance ?? config.anomaly.defaultTolerance,
+    };
+    // Cross-field ordering is validated on the MERGED values: a partial block
+    // that only raises warnZ above the default denyZ (or lowers denyZ below a
+    // raised warnZ) must fail closed like any other malformed input.
+    if (!(config.anomaly.warnZ >= 0) || !(config.anomaly.warnZ < config.anomaly.denyZ)) {
+      errors.push(`anomaly.warnZ must satisfy 0 <= anomaly.warnZ < anomaly.denyZ (got warnZ ${config.anomaly.warnZ}, denyZ ${config.anomaly.denyZ} after merging over the defaults)`);
+    }
   }
 }
 
@@ -418,6 +488,10 @@ function applyEnvOverrides(config: PolicyConfig, errors: string[]): void {
     const list = parseListOverride(tokens, "X402_POLICY_TOKENS", errors);
     if (list) config.tokens = { allowed: list };
   }
+
+  // NOTE (issue #30): the `anomaly` block has deliberately NO X402_POLICY_*
+  // override — same precedent as `recipients`: the thresholds/seed settings
+  // are file-only operator config (see applyFileConfig).
 
   // Per-level service overrides: X402_POLICY_SERVICE_<LEVEL> = allow|deny|approval
   // plus optional X402_POLICY_SERVICE_<LEVEL>_MAX_PER_REQUEST / _MAX_DAILY.
