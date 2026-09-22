@@ -468,3 +468,138 @@ describe('rule 4.5: ordering and aggregation', () => {
     assert.deepEqual(codes(result), ['RECIPIENT_NOT_ALLOWED', 'REQUEST_LIMIT_EXCEEDED']);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Issue #30 — rule 4.6: the price anomaly gate (PRICE_ANOMALY). Sits after
+// rule 4.5 and before rule 5 (fixed rule order). The band decides routing:
+// the approval band pushes PRICE_ANOMALY + APPROVAL_REQUIRED (the existing
+// aggregation ranks it); the deny band sets a local hardDeny flag —
+// PRICE_ANOMALY is deliberately NOT a DENY_CODES member (conflict C). Casper
+// (amount 0 by design) is inert (conflict A); the compat default disables the
+// rule entirely (conflict B).
+// ---------------------------------------------------------------------------
+
+import type { AnomalyConfig, PriceBaseline } from './types.js';
+
+function anomalyCfg(overrides: Partial<AnomalyConfig> = {}): PolicyConfig {
+  return cfg({
+    anomaly: { enabled: true, window: 20, warnZ: 2.0, denyZ: 3.0, minSamples: 5, seedFromDirectory: true, defaultTolerance: 2.0, ...overrides },
+  });
+}
+
+// Hand-set stats (baselines are inputs — the engine trusts them; updateBaseline's
+// math is unit-tested in anomaly.test.ts): mean 0.1, stdev 0.05 ⇒ z = (amount − 0.1)/0.05.
+const Z_BASELINE: PriceBaseline = { samples: [0.1, 0.1, 0.1, 0.1, 0.1], mean: 0.1, stdev: 0.05 };
+
+describe('rule 4.6: price anomaly gate', () => {
+  it('a normal payment against the settled baseline is ALLOWed with no reasons', () => {
+    const engine = new PolicyEngine({ config: anomalyCfg(), configErrors: [] });
+    const result = engine.evaluate(ctx({ amount: 0.1 }), {}, { baseline: Z_BASELINE });
+    assert.equal(result.decision, 'ALLOW');
+    assert.deepEqual(result.reasons, []);
+  });
+
+  it('a z below warnZ stays ALLOW and emits no reason (nothing annotated)', () => {
+    const engine = new PolicyEngine({ config: anomalyCfg(), configErrors: [] });
+    const result = engine.evaluate(ctx({ amount: 0.14 }), {}, { baseline: Z_BASELINE }); // z ≈ 0.8
+    assert.equal(result.decision, 'ALLOW');
+    assert.deepEqual(result.reasons, []);
+  });
+
+  it('a mild spike lands in the approval band — APPROVAL_REQUIRED with a PRICE_ANOMALY reason carrying z detail', () => {
+    const engine = new PolicyEngine({ config: anomalyCfg(), configErrors: [] });
+    const result = engine.evaluate(ctx({ amount: 0.2 }), {}, { baseline: Z_BASELINE }); // z ≈ 2
+    assert.equal(result.decision, 'APPROVAL_REQUIRED');
+    assert.deepEqual(codes(result), ['PRICE_ANOMALY', 'APPROVAL_REQUIRED']);
+    const detail = result.reasons[0].detail!;
+    assert.ok(Math.abs((detail.zScore as number) - 2) < 1e-9, `z should be ~2, got ${detail.zScore}`);
+    assert.equal(detail.band, 'approval');
+    assert.equal(detail.mean, 0.1);
+    assert.equal(detail.stdev, 0.05);
+    assert.equal(detail.samples, 5);
+    assert.equal(detail.window, 20);
+    assert.equal(detail.amount, 0.2);
+    assert.equal(detail.host, 'example.com');
+    assert.match(result.reasons[0].message, /human confirmation/);
+  });
+
+  it('a severe spike is hard-denied with PRICE_ANOMALY (routed by the band, not DENY_CODES)', () => {
+    const engine = new PolicyEngine({ config: anomalyCfg(), configErrors: [] });
+    const result = engine.evaluate(ctx({ amount: 0.3 }), {}, { baseline: Z_BASELINE }); // z ≈ 4
+    assert.equal(result.decision, 'DENY');
+    assert.deepEqual(codes(result), ['PRICE_ANOMALY']);
+    const detail = result.reasons[0].detail!;
+    assert.ok(Math.abs((detail.zScore as number) - 4) < 1e-9, `z should be ~4, got ${detail.zScore}`);
+    assert.equal(detail.band, 'deny');
+    assert.match(result.reasons[0].message, /denied/);
+  });
+
+  it('Casper is inert (amount 0 by design) — no PRICE_ANOMALY for the mote-denominated leg', () => {
+    const engine = new PolicyEngine({ config: anomalyCfg(), configErrors: [] });
+    const result = engine.evaluate(ctx({ chain: 'casper', token: 'wCSPR', amount: 0 }), {}, { baseline: Z_BASELINE });
+    assert.equal(result.decision, 'ALLOW');
+    assert.deepEqual(result.reasons, []);
+  });
+
+  it('a non-positive amount on a USD chain is a hard deny with the non-positive-amount detail', () => {
+    const engine = new PolicyEngine({ config: anomalyCfg(), configErrors: [] });
+    // amount 0 is spendable under the pre-existing rule 6 — only rule 4.6 fires.
+    const zero = engine.evaluate(ctx({ amount: 0 }), {}, { baseline: Z_BASELINE });
+    assert.equal(zero.decision, 'DENY', 'amount 0 must not be authorised');
+    assert.deepEqual(codes(zero), ['PRICE_ANOMALY']);
+    assert.equal(zero.reasons[0].detail!.reason, 'non-positive-amount');
+    // A negative amount ALSO accumulates the pre-existing rule 6 fail-closed reason.
+    const negative = engine.evaluate(ctx({ amount: -0.01 }), {}, { baseline: Z_BASELINE });
+    assert.equal(negative.decision, 'DENY');
+    assert.deepEqual(codes(negative), ['PRICE_ANOMALY', 'REQUEST_LIMIT_EXCEEDED']);
+    // Non-finite amounts likewise accumulate rule 6.
+    const nan = engine.evaluate(ctx({ amount: Number.NaN }), {}, { baseline: Z_BASELINE });
+    assert.equal(nan.decision, 'DENY');
+    assert.deepEqual(codes(nan), ['PRICE_ANOMALY', 'REQUEST_LIMIT_EXCEEDED']);
+  });
+
+  it('a thin or zero-variance baseline can only reach the approval band, never hard deny (conflict D)', () => {
+    // Caps raised so the spike itself is not refused by the pre-existing per-request cap.
+    const engine = new PolicyEngine({
+      config: cfg({ payments: { enabled: true, maxPerRequest: 50, maxDaily: 100 }, anomaly: { enabled: true, window: 20, warnZ: 2.0, denyZ: 3.0, minSamples: 5, seedFromDirectory: true, defaultTolerance: 2.0 } }),
+      configErrors: [],
+    });
+    const thin: PriceBaseline = { samples: [0.5, 0.5], mean: 0.5, stdev: 0 }; // 2 samples < minSamples 5, stdev 0
+    const approval = engine.evaluate(ctx({ amount: 10 }), {}, { baseline: thin });
+    assert.equal(approval.decision, 'APPROVAL_REQUIRED');
+    assert.equal(approval.reasons[0].code, 'PRICE_ANOMALY');
+    assert.ok(Math.abs((approval.reasons[0].detail!.ratio as number) - 20) < 1e-9);
+    assert.equal(approval.reasons[1].code, 'APPROVAL_REQUIRED');
+  });
+
+  it('the compat default keeps the gate inert (anomaly.enabled false — the operator opt-in)', () => {
+    const engine = new PolicyEngine({ config: cfg(), configErrors: [] }); // anomaly disabled
+    // A 4.5x spike that would be denied with the gate on: with the compat
+    // default it annotates nothing and the payment stays ALLOW.
+    const result = engine.evaluate(ctx({ amount: 0.45 }), {}, { baseline: Z_BASELINE });
+    assert.equal(result.decision, 'ALLOW');
+    assert.deepEqual(result.reasons, []);
+  });
+
+  it('a denied evaluation never touches the input baseline object (purity of AnomalyInputs)', () => {
+    const engine = new PolicyEngine({ config: anomalyCfg(), configErrors: [] });
+    const baseline: PriceBaseline = { samples: [0.1, 0.1, 0.1, 0.1, 0.1], mean: 0.1, stdev: 0.05 };
+    const snapshot = JSON.stringify(baseline);
+    engine.evaluate(ctx({ amount: 5 }), {}, { baseline }); // over the per-request cap too ⇒ DENY
+    assert.equal(JSON.stringify(baseline), snapshot, 'the engine must never mutate the caller-supplied baseline');
+  });
+
+  it('rule 4.6 accumulates between rule 4.5-era codes and rule 5 (fixed rule order)', () => {
+    const engine = new PolicyEngine({
+      config: cfg({
+        anomaly: { enabled: true, window: 20, warnZ: 2.0, denyZ: 3.0, minSamples: 5, seedFromDirectory: true, defaultTolerance: 2.0 },
+        tokens: { allowed: ['USDC'] },
+        services: { unknown: { action: 'deny' }, discovered: { action: 'allow' }, verified: { action: 'allow' }, trusted: { action: 'allow' }, blocked: { action: 'deny' } },
+      }),
+      configErrors: [],
+    });
+    const result = engine.evaluate(ctx({ token: 'wCSPR', trustLevel: 'UNKNOWN', amount: 0.3 }), {}, { baseline: Z_BASELINE });
+    assert.equal(result.decision, 'DENY');
+    assert.deepEqual(codes(result), ['TOKEN_NOT_ALLOWED', 'PRICE_ANOMALY', 'UNKNOWN_SERVICE']);
+  });
+});
