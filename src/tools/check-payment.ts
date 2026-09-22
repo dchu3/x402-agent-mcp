@@ -14,7 +14,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { loadDirectory } from "../directory.js";
+import { advertisedPriceUsd, loadDirectory } from "../directory.js";
 import { getPolicyEngine, buildPolicyContext } from "../policy/config.js";
 import { normalizeRecipient } from "../policy/recipient.js";
 import { getDailySpent } from "../payment-utils.js";
@@ -64,23 +64,14 @@ export function registerCheckPaymentTool(server: McpServer): void {
       // TOKEN_NOT_ALLOWED deny — fail-closed direction, but a wrong answer.
       const token = args.token || "USDC";
 
-      // Amount: explicit argument wins; otherwise the directory price for the
-      // matching path; otherwise 0 (chain/token/service rules still evaluated).
+      // Amount: explicit argument wins; otherwise the advertised directory
+      // price for the matching path (advertisedPriceUsd — the shared helper
+      // the rule 4.6 seed uses, replacing this tool's former inline duplicate);
+      // otherwise 0 (chain/token/service rules still evaluated).
       let amount = args.amount;
-      if (amount === undefined && entry) {
-        try {
-          const parsed = new URL(args.url);
-          const match = entry.endpoints.find((e) => {
-            const ePath = e.path.startsWith("/") ? e.path : `/${e.path}`;
-            return ePath === parsed.pathname;
-          });
-          if (match && match.price_usdc) {
-            const price = Number(match.price_usdc);
-            if (Number.isFinite(price) && price >= 0) amount = price;
-          }
-        } catch {
-          // unparseable URL — amount stays unknown (0)
-        }
+      if (amount === undefined) {
+        const price = advertisedPriceUsd(args.url);
+        if (price !== undefined) amount = price;
       }
       const amountUsd = amount ?? 0;
 
