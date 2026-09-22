@@ -153,8 +153,9 @@ Decisions are exactly `ALLOW`, `DENY`, `APPROVAL_REQUIRED`. Every non-ALLOW resu
 | `APPROVAL_REQUIRED` | The trust level is configured to `approval` (Phase 1: treated as a refusal — see below) |
 | `CONFIG_INVALID` | Policy configuration failed validation — the engine fails closed |
 | `RECIPIENT_NOT_ALLOWED` | Rule 4.5 recipient gate (issue #26): the probed recipient is not on the effective allowlist (allowlist mode — fail-closed on an empty effective list or a missing/unusable probed recipient), or differs from the recorded baseline (change-detect mode) |
+| `PRICE_ANOMALY` | Rule 4.6 price anomaly gate (issue #30): the amount is outside the tolerance of the per-service settled-amount baseline — a mild spike routes to `APPROVAL_REQUIRED`, a severe spike (or a non-positive amount on a USD chain) hard-**DENY**s. The reason carries a `detail` payload with the z-score (or fallback ratio) plus baseline stats |
 
-Rules are evaluated in a fixed, documented order and reasons **accumulate** (all triggered codes are returned, not just the first). `DENY` outranks `APPROVAL_REQUIRED` outranks `ALLOW`. Cap boundaries match the inner payment guards exactly: `> cap` denies, reaching the cap exactly is allowed.
+Rules are evaluated in a fixed, documented order and reasons **accumulate** (all triggered codes are returned, not just the first): 1 `SERVICE_BLOCKED`, 2 `PAYMENTS_DISABLED`, 3 `CHAIN_NOT_ALLOWED`, 4 `TOKEN_NOT_ALLOWED`, 4.5 `RECIPIENT_NOT_ALLOWED` (issue #26), 4.6 `PRICE_ANOMALY` (issue #30), 5 `UNKNOWN_SERVICE`, 6 `REQUEST_LIMIT_EXCEEDED`, 7 `DAILY_LIMIT_EXCEEDED`, 8 `SERVICE_LIMIT_EXCEEDED`, 9 `APPROVAL_REQUIRED`. `DENY` outranks `APPROVAL_REQUIRED` outranks `ALLOW`. Cap boundaries match the inner payment guards exactly: `> cap` denies, reaching the cap exactly is allowed.
 
 ### Trust levels
 
@@ -189,11 +190,12 @@ JSON via `POLICY_CONFIG_PATH` (no new dependencies), with `X402_POLICY_*` env ov
   },
   "networks": { "allowed": ["base", "solana", "casper"] },
   "tokens":   { "allowed": ["USDC", "wCSPR"] },
-  "recipients": { "mode": "change-detect", "allowed": [], "perService": {}, "known": {} }
+  "recipients": { "mode": "change-detect", "allowed": [], "perService": {}, "known": {} },
+  "anomaly": { "enabled": false, "window": 20, "warnZ": 2.0, "denyZ": 3.0, "minSamples": 5, "seedFromDirectory": true, "defaultTolerance": 2.0 }
 }
 ```
 
-The example above **is** the behavior-compat default: non-directory hosts are payable at the global caps (`services.unknown: allow` — before the policy engine, directory membership played no role in the limit checks), and the recipient gate is inactive by construction (`recipients` defaults to `change-detect` with **no** recorded baselines — nothing to compare, so rule 4.5 never fires). Tightening is opt-in and never the default — for example, the following refuses every non-directory host and tightens directory-service caps (a copy-paste of the block above does NOT apply any of this):
+The example above **is** the behavior-compat default: non-directory hosts are payable at the global caps (`services.unknown: allow` — before the policy engine, directory membership played no role in the limit checks), the recipient gate is inactive by construction (`recipients` defaults to `change-detect` with **no** recorded baselines — nothing to compare, so rule 4.5 never fires), and the price anomaly gate ships disabled (`anomaly.enabled: false`, issue #30). Tightening is opt-in and never the default — for example, the following refuses every non-directory host and tightens directory-service caps (a copy-paste of the block above does NOT apply any of this):
 
 ```json
 {
@@ -240,6 +242,34 @@ Tightening example — only ever pay one global recipient, except one host which
 
 **The `recipients` block is file-only.** A per-host map cannot be expressed cleanly as a flat env var, so unlike the sections above there is deliberately **no** `X402_POLICY_*` override for it (the other sections keep their knobs, below). Unknown keys inside `recipients` are errors (typo protection), like everywhere else. In `allowlist` mode, `x402_fetch` passes the `payTo` address from the 402 challenge into the gate for both the USD legs (Base/Solana) and the Casper leg, so the recipient is validated **before** any payment machinery runs; the payment intent then binds exactly the validated value.
 
+**Price anomaly detection (issue #30) — the `anomaly` block, rule 4.6.** Caps track *cumulative* spend; they cannot see one service being paid 10× its normal rate. Rule 4.6 adds a second spend axis: each non-Casper service keeps a baseline of its last N **settled** amounts (ledger-backed, rehydrated like the budget counters — no parallel state), and every prospective payment is compared against it. `PRICE_ANOMALY` is deliberately **not** a `DENY_CODES` member: the *band* decides the routing.
+
+Compat default block (the gate ships **disabled** — enabling it is an operator opt-in, exactly like `services.unknown: deny` and the recipient allowlist):
+
+```json
+{
+  "anomaly": {
+    "enabled": false,
+    "window": 20,
+    "warnZ": 2.0,
+    "denyZ": 3.0,
+    "minSamples": 5,
+    "seedFromDirectory": true,
+    "defaultTolerance": 2.0
+  }
+}
+```
+
+With `enabled: true`, rule 4.6 (evaluated after rule 4.5, before `UNKNOWN_SERVICE` — the fixed rule order is unchanged) routes in bands:
+
+- **z-score band** (baseline has ≥ `minSamples` samples and non-zero variance): `z < warnZ` annotates nothing; `warnZ ≤ z < denyZ` routes to `APPROVAL_REQUIRED` with a `PRICE_ANOMALY` reason; `z ≥ denyZ` hard-**DENY**s with that reason. `PRICE_ANOMALY` is intentionally absent from `DENY_CODES` — membership would force DENY whenever it appears and make the approval band unreachable.
+- **Thin-baseline fallback** (fewer than `minSamples` samples, or zero variance): the payment is compared against the reference price (the baseline mean, else the advertised directory price) with the `defaultTolerance` multiplier — exceeding it routes to `APPROVAL_REQUIRED`, **never** to a hard deny. Statistics are the evidence for a hard deny; a stub baseline is not (1–2 samples yield `stdev = 0` ⇒ `z = ∞`, which would deny everything).
+- **Non-positive amount** on a USD chain (0, negative, non-finite): hard **DENY** — the gate fails closed on amounts it cannot reason about.
+- **Casper is excluded**: the Casper leg passes `amount: 0` by design (amounts are mote-denominated and have no USD price at that layer), so rule 4.6 is inert for it — `casper/budget.ts` remains Casper's spend authority, the same scope rule the USD-ledger stores document.
+- **First call, graceful seeding**: with `seedFromDirectory: true`, a host with no settled baseline yet is softly compared against the advertised directory price (a one-sample seed, derived per call, never stored) and can only reach the approval band. Once the first real settlement lands (recorded **only** on a successful settlement, next to `recordServicePayment`, under the same `resp.status === 200` guard), it becomes the first real sample — a denied spike can never poison the baseline.
+
+Every `PRICE_ANOMALY` reason carries an optional `detail` payload for the audit log — `{zScore | ratio, mean, stdev, samples, window, band, amount, host}` (or `{reason: "non-positive-amount", amount, host}`) — surfaced verbatim in `x402_fetch`'s structured refusal and in `x402_check_payment` output. The block is **file-only** like `recipients`: no `X402_POLICY_*` override (thresholds are deliberate operator config), and unknown keys inside it are errors (typo protection).
+
 Env overrides (each fails closed on a malformed value — never silently ignored):
 
 | Env var | Overrides |
@@ -283,9 +313,9 @@ Env overrides (each fails closed on a malformed value — never silently ignored
 
 Per-service daily spend is tracked in the same payment ledger (grouped by URL hostname, rehydrated like the global counter — no parallel state). Per-service caps are enforced for USD-settled chains (Base/Solana); Casper remains governed by its mote budgets (`CASPER_MAX_PAYMENT_PER_CALL` / `CASPER_MAX_DAILY_SPEND`) inside the payment layer.
 
-`x402_check_payment` also accepts an optional **`recipient`** argument (issue #26) — the `payTo` address from the 402 challenge — so the recipient gate can be checked before fetching. In `allowlist` mode the argument is **required** (without it the gate denies); in `change-detect` mode it is compared against the recorded baseline. The response echoes `recipient` verbatim plus `recipient_normalized`, the canonical form rule 4.5 compares (`null` when no recipient was supplied or it is not a valid address for the chain).
+`x402_check_payment` also accepts an optional **`recipient`** argument (issue #26) — the `payTo` address from the 402 challenge — so the recipient gate can be checked before fetching. In `allowlist` mode the argument is **required** (without it the gate denies); in `change-detect` mode it is compared against the recorded baseline. The response echoes `recipient` verbatim plus `recipient_normalized`, the canonical form rule 4.5 compares (`null` when no recipient was supplied or it is not a valid address for the chain). With the price anomaly gate **enabled** (issue #30), omitting `amount` means checking a $0 payment — which rule 4.6 hard-denies on USD chains — so pass the real amount from the 402 challenge when the anomaly gate is on; with the compat default (disabled) today's behavior is unchanged. When a reason carries one, the response includes its `detail` payload (e.g. the `PRICE_ANOMALY` z-score/baseline stats).
 
-Deliberately **not** in Phase 1 (future extensions, tracked separately in issue #19): approval workflows, price-change/anomaly detection, payment velocity limits, circuit breakers, transaction simulation, response size limits, untrusted-data labelling, prompt-injection-aware response handling, and a persistent audit ledger. (Recipient allowlisting — formerly on this list — shipped as rule 4.5, issue #26.)
+Deliberately **not** in Phase 1 (future extensions, tracked separately in issue #19): approval workflows, payment velocity limits, circuit breakers, transaction simulation, response size limits, untrusted-data labelling, prompt-injection-aware response handling, and a persistent audit ledger. (Recipient allowlisting — formerly on this list — shipped as rule 4.5, issue #26. Price anomaly detection — formerly on this list — shipped as rule 4.6, issue #30.)
 
 ## Payment Intent Boundary (issue #25)
 

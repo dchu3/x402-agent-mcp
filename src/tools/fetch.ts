@@ -13,6 +13,7 @@ import { CASPER_CHAIN, isCasperNetwork, toCasperCaip2 } from "../casper/networks
 import { checkSpendingLimit, logPayment, getDailySpent, getMaxPerCall, getMaxDailySpend } from "../payment-utils.js";
 import { getPolicyEngine, buildPolicyContext } from "../policy/config.js";
 import { getPerServiceSpent, recordServicePayment } from "../policy/budget-store.js";
+import { getAnomalyInputs, recordSettledAmount } from "../policy/anomaly-store.js";
 import { extractSettlementReceipt, RECEIPT_VERIFIED, RECEIPT_NOTE } from "./receipt-utils.js";
 import { createFromOffer, intentManager } from "../payment-intent/manager.js";
 import { executeGuarded } from "../payment-intent/executor.js";
@@ -20,8 +21,10 @@ import type { IntentRejectCode, PaymentIntent } from "../payment-intent/types.js
 
 /** Structured policy refusal — keeps the pre-policy error shape keys verbatim
  * (error, url, chain, estimated_cost_usdc, daily_spent_usdc, max_per_call,
- * max_daily) and adds policy_decision + reasons[{code, message}] (issue #19
- * Phase 6: machine-readable codes, never message-only). */
+ * max_daily) and adds policy_decision + reasons (issue #19 Phase 6:
+ * machine-readable codes, never message-only). Reasons pass through verbatim,
+ * including their optional detail payload (issue #30: PRICE_ANOMALY carries
+ * the z-score / fallback ratio plus baseline stats there for the audit log). */
 function policyRefusal(
   result: ReturnType<ReturnType<typeof getPolicyEngine>["evaluate"]>,
   url: string,
@@ -228,6 +231,8 @@ export function registerFetchTool(server: McpServer): void {
               // payment layer. Casper amounts have no USD price at this layer,
               // so amount 0 — mote budgets remain the spend control, and the
               // engine enforces chain/token/service/recipient rules + global kill switch.
+              // Rule 4.6 (issue #30) is inert on this mote-denominated leg, so
+              // no anomaly inputs are passed (conflict A).
               const casperPolicy = getPolicyEngine().evaluate(
                 buildPolicyContext(url, CASPER_CHAIN, "wCSPR", 0, { recipient: casperAccept?.payTo }),
                 { dailySpentUsd: getDailySpent(), perServiceSpentUsd: getPerServiceSpent(serviceHost) },
@@ -347,9 +352,14 @@ export function registerFetchTool(server: McpServer): void {
         // preserved so callers see why). Issue #26: the probed payTo enters
         // the gate as the recipient (rule 4.5) — the same single probe value
         // the intent binds below, so policy validates exactly what is signed.
+        // Issue #30: the third argument carries the price-anomaly inputs —
+        // the per-service settled-amount baseline (ledger-backed) and the
+        // advertised directory price — built OUTSIDE the engine so the pure
+        // core never touches the ledger or the directory.
         const policyResult = getPolicyEngine().evaluate(
           buildPolicyContext(url, useChain, "USDC", amountUsdc, { recipient: probedOffer?.payTo }),
           { dailySpentUsd: getDailySpent(), perServiceSpentUsd: getPerServiceSpent(serviceHost) },
+          getAnomalyInputs(url),
         );
         if (policyResult.decision !== "ALLOW") {
           return policyRefusal(policyResult, url, useChain, amountUsdc);
@@ -476,6 +486,13 @@ export function registerFetchTool(server: McpServer): void {
         // a restart (in-process vs post-restart spend divergence).
         if (isSuccessfulPayment) {
           recordServicePayment(url, actualCost);
+          // Issue #30: the settled amount feeds the per-service price baseline
+          // (rule 4.6) — recorded ONLY on a successful settlement, next to
+          // recordServicePayment under the SAME guard logPayment counts by, so
+          // a denied or failed payment can never poison the baseline and the
+          // ledger rehydrates identical values after a restart. Never logged on
+          // the failure path.
+          recordSettledAmount(url, actualCost);
         }
 
         return {

@@ -96,3 +96,71 @@ be inspected BEFORE x402_fetch: in allowlist mode it is required, in
 change-detect mode it is compared against the baseline. The tool response
 echoes 'recipient' verbatim plus 'recipient_normalized' (the canonical form
 rule 4.5 compares; null when unusable).
+
+---------------------------------------------------------------------------
+Price anomaly detection (issue #30) — the 'anomaly' block (rule 4.6,
+PRICE_ANOMALY)
+---------------------------------------------------------------------------
+
+The example ships the COMPAT DEFAULT: the gate is DISABLED ('enabled': false).
+An always-on price gate could hard-deny a previously allowed payment — a
+legitimate provider price rise looks exactly like an attack — so enabling the
+gate is an operator opt-in, exactly like 'services.unknown: deny' and the
+recipient allowlist. With the default block nothing changes: rule 4.6 is
+inert and today's decisions are unchanged.
+
+Rule 4.6 adds a second spend axis beside the caps: caps track cumulative
+spend and cannot see one service being paid 10x its normal rate. The gate
+keeps a per-service baseline of the last N SETTLED amounts (ledger-backed,
+rehydrated like the budget counters — no parallel state file) and compares
+every prospective payment against it. PRICE_ANOMALY is deliberately NOT a
+DENY code: the BAND decides the routing.
+
+Fields:
+
+  'enabled'            — operator opt-in (false in the compat default).
+  'window'             — baseline window: the last N settled amounts.
+  'warnZ' / 'denyZ'    — z-score thresholds; 0 <= warnZ < denyZ is validated
+                         (including against the defaults when only one is
+                         set in the file).
+  'minSamples'         — minimum baseline size before the z-score path is
+                         trusted (default 5).
+  'seedFromDirectory'  — softly compare the first payment for a host against
+                         the advertised directory price (a one-sample seed,
+                         derived per call, never stored).
+  'defaultTolerance'   — fallback multiplier (>= 1) while the baseline is too
+                         thin for statistics.
+
+Bands (with 'enabled': true):
+
+  z-score path (>= minSamples samples, non-zero variance):
+    z < warnZ                      -> nothing annotated (ALLOW)
+    warnZ <= z < denyZ             -> APPROVAL_REQUIRED + PRICE_ANOMALY
+    z >= denyZ                     -> hard DENY + PRICE_ANOMALY
+  thin baseline (below minSamples, or stdev = 0):
+    amount > reference * defaultTolerance -> APPROVAL_REQUIRED, NEVER deny
+    (statistics are the evidence for a hard deny; a stub baseline is not —
+    1-2 samples yield stdev = 0, z = infinity, which would deny everything)
+  non-positive amount on a USD chain (0 / negative / non-finite):
+                                     -> hard DENY (fail-closed)
+  Casper leg:                        -> inert. The Casper gate passes amount 0
+    by design (mote-denominated, no USD price at that layer); casper/budget.ts
+    remains Casper's spend authority.
+
+Every PRICE_ANOMALY reason carries a 'detail' payload for the audit log:
+{zScore | ratio, mean, stdev, samples, window, band, amount, host} (or
+{reason: 'non-positive-amount', amount, host}) — surfaced verbatim by
+x402_fetch's structured refusal and by x402_check_payment. The baseline moves
+ONLY on a successful settlement (the same resp.status === 200 guard as the
+per-service budget store), so a denied or failed payment can never poison it.
+The first settled amount becomes the first real sample when there is no
+directory price — the graceful fallback.
+
+This block is FILE-ONLY: there is deliberately no X402_POLICY_* env override
+for it (thresholds are deliberate operator config). Unknown keys inside the
+block are errors (typo protection), like everywhere else in the config.
+
+x402_check_payment note: with the gate ENABLED, omitting 'amount' means
+checking a $0 payment — which rule 4.6 hard-denies on USD chains — so pass
+the real amount from the 402 challenge when the gate is on. With the compat
+default (disabled), today's behavior is unchanged.

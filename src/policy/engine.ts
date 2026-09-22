@@ -1,9 +1,10 @@
 // Issue #19 — pure policy evaluation core. The engine decides whether a
 // payment is permitted BEFORE any payment code runs. It is a pure function of
-// (engine state, context, budget state): no clocks, no env reads, no I/O, no
-// randomness — same input ⇒ same output, always (issue: "deterministic and
-// explainable"). Ledger rehydration, day rollover and trust-level derivation
-// live in the callers (src/policy/budget-store.ts, src/policy/config.ts).
+// (engine state, context, budget state, anomaly inputs): no clocks, no env
+// reads, no I/O, no randomness — same input ⇒ same output, always (issue:
+// "deterministic and explainable"). Ledger rehydration, day rollover and
+// trust-level derivation live in the callers (src/policy/budget-store.ts,
+// src/policy/anomaly-store.ts, src/policy/config.ts).
 //
 // Fixed rule order (documented contract — do not reorder without a reason-code
 // stability review; reasons accumulate in this order, not first-only):
@@ -16,6 +17,11 @@
 //      missing/unusable probed recipient); change-detect mode is ACTIVE only
 //      for a host with a recorded baseline (denies only when the probed
 //      recipient differs from it). Comparison is on normalized recipients.
+//   4.6 PRICE_ANOMALY           — price anomaly gate (issue #30): z-score (or
+//      fallback multiplier) of the payment amount against the per-service
+//      settled-amount baseline. Middle band ⇒ APPROVAL_REQUIRED, high band ⇒
+//      hard deny; inert for the mote-denominated Casper leg and when
+//      anomaly.enabled is false (the compat default).
 //   5. UNKNOWN_SERVICE          — services.unknown = deny and level UNKNOWN
 //   6. REQUEST_LIMIT_EXCEEDED   — per-request cap (level override ?? global)
 //   7. DAILY_LIMIT_EXCEEDED     — global daily cap
@@ -28,8 +34,10 @@
 // per-request denies when amount > cap; daily denies when spent + amount > cap
 // (reaching the cap exactly is allowed).
 
+import { evaluatePriceAnomaly } from "./anomaly.js";
 import { normalizeRecipient } from "./recipient.js";
 import type {
+  AnomalyInputs,
   PolicyBudgetState,
   PolicyConfig,
   PolicyContext,
@@ -40,7 +48,15 @@ import type {
   ReasonCode,
 } from "./types.js";
 
-/** Codes whose presence forces a DENY decision. */
+/** Codes whose presence forces a DENY decision.
+ *
+ * PRICE_ANOMALY (rule 4.6, issue #30) is deliberately NOT a member: the same
+ * code must route to APPROVAL_REQUIRED in the middle band and to a hard deny
+ * in the high band, and membership here would force DENY whenever it appears,
+ * making the approval band unreachable (conflict C). The band decides the
+ * routing instead: the deny band sets an engine-local hardDeny flag consulted
+ * in the final decision expression; the approval band additionally pushes
+ * APPROVAL_REQUIRED, which the existing aggregation already ranks. */
 const DENY_CODES: ReadonlySet<ReasonCode> = new Set([
   "SERVICE_BLOCKED",
   "PAYMENTS_DISABLED",
@@ -57,7 +73,14 @@ const DENY_CODES: ReadonlySet<ReasonCode> = new Set([
 export class PolicyEngine {
   constructor(private readonly state: PolicyEngineState) {}
 
-  evaluate(ctx: PolicyContext, budget: PolicyBudgetState = {}): PolicyResult {
+  /** Evaluate a payment decision. `budget` carries today's spend; `anomaly`
+   * (issue #30) carries the per-service settled-amount baseline and the
+   * advertised directory price — a distinct input class from spend, supplied
+   * by the caller (anomaly-store) so the engine never touches the ledger or
+   * the directory itself. Both parameters are optional: existing two-argument
+   * call sites are unaffected, and an absent anomaly input degrades rule 4.6
+   * to its seed band (or to inert when the compat default is disabled). */
+  evaluate(ctx: PolicyContext, budget: PolicyBudgetState = {}, anomaly: AnomalyInputs = {}): PolicyResult {
     // Fail-closed short circuit: an unusable configuration can never authorise
     // a payment (operator decision — never silently permissive).
     if (this.state.configErrors.length > 0) {
@@ -74,6 +97,10 @@ export class PolicyEngine {
     const cfg = this.state.config;
     const svc = cfg.services[ctx.trustLevel.toLowerCase() as keyof PolicyConfig["services"]];
     const reasons: PolicyReason[] = [];
+    // Rule 4.6 deny band (issue #30): PRICE_ANOMALY is not a DENY_CODES member
+    // (see the comment there) — the deny band routes through this local flag
+    // instead, consulted in the final decision expression.
+    let hardDeny = false;
 
     // Missing per-level service policy is a config defect — fail closed rather
     // than guess (the config loader validates this; the engine defends too).
@@ -158,6 +185,24 @@ export class PolicyEngine {
       }
     }
 
+    // Rule 4.6: price anomaly gate (issue #30). Pure inputs only: the
+    // baseline and the advertised price arrive via the `anomaly` parameter —
+    // the engine never reads the ledger, the directory or the env. Inert for
+    // the mote-denominated Casper leg (its spend authority is casper/budget.ts
+    // — the gate passes amount 0 by design) and when anomaly.enabled is false
+    // (the compat default). The band decides routing: approval pushes the
+    // PRICE_ANOMALY reason AND an APPROVAL_REQUIRED reason (the aggregation
+    // already ranks APPROVAL_REQUIRED); deny pushes PRICE_ANOMALY and sets
+    // hardDeny. No existing rule's order or message is changed by this rule.
+    const anomalyEval = evaluatePriceAnomaly(cfg.anomaly, ctx.chain, ctx.service, ctx.amount, anomaly);
+    if (anomalyEval.band === "approval") {
+      reasons.push(anomalyEval.reason!);
+      reasons.push({ code: "APPROVAL_REQUIRED", message: `Price anomaly at ${ctx.service} requires payment approval (Phase 1: refused — no approval channel)` });
+    } else if (anomalyEval.band === "deny") {
+      reasons.push(anomalyEval.reason!);
+      hardDeny = true;
+    }
+
     // Rule 5: unknown service (services.unknown = deny refuses non-directory
     // services; the behavior-compat default config allows them — see config.ts).
     if (ctx.trustLevel === "UNKNOWN" && svc.action === "deny") {
@@ -192,7 +237,7 @@ export class PolicyEngine {
       reasons.push({ code: "APPROVAL_REQUIRED", message: `Service trust level ${ctx.trustLevel} requires payment approval (Phase 1: refused — no approval channel)` });
     }
 
-    const decision = reasons.some((r) => DENY_CODES.has(r.code))
+    const decision = hardDeny || reasons.some((r) => DENY_CODES.has(r.code))
       ? "DENY"
       : reasons.some((r) => r.code === "APPROVAL_REQUIRED")
         ? "APPROVAL_REQUIRED"

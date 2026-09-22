@@ -4,21 +4,25 @@
 // returns the structured decision. It NEVER performs a payment: it imports no
 // wallet/payment-execution code, makes no network calls, and writes nothing to
 // the payment ledger. Its only ledger interaction is reading today's spend
-// (payment-utils.getDailySpent / budget-store.getPerServiceSpent) so the
-// verdict reflects real budget state, deterministically.
+// (payment-utils.getDailySpent / budget-store.getPerServiceSpent) and the
+// per-service price baseline (anomaly-store.getAnomalyInputs — read-only) so
+// the verdict reflects real budget/baseline state, deterministically.
 //
 // Output follows the issue's response shape: { decision, service, amount,
-// currency, chain, reasons: [{code, message}] } plus trust_level and limits
-// for explainability. Machine-readable reason codes are the contract —
-// never rely on the human-readable message (issue Phase 6).
+// currency, chain, reasons: [{code, message, detail?}] } plus trust_level and
+// limits for explainability. Machine-readable reason codes are the contract —
+// never rely on the human-readable message (issue Phase 6); reasons carry
+// their optional detail payload verbatim (issue #30: PRICE_ANOMALY carries
+// z-score/baseline stats there).
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { loadDirectory } from "../directory.js";
+import { advertisedPriceUsd, loadDirectory } from "../directory.js";
 import { getPolicyEngine, buildPolicyContext } from "../policy/config.js";
 import { normalizeRecipient } from "../policy/recipient.js";
 import { getDailySpent } from "../payment-utils.js";
 import { getPerServiceSpent } from "../policy/budget-store.js";
+import { getAnomalyInputs } from "../policy/anomaly-store.js";
 
 /** Directory entry for a hostname, or null. Case-insensitive hostname match —
  * the same rule resolveTrustLevel uses for DISCOVERED classification. */
@@ -64,31 +68,26 @@ export function registerCheckPaymentTool(server: McpServer): void {
       // TOKEN_NOT_ALLOWED deny — fail-closed direction, but a wrong answer.
       const token = args.token || "USDC";
 
-      // Amount: explicit argument wins; otherwise the directory price for the
-      // matching path; otherwise 0 (chain/token/service rules still evaluated).
+      // Amount: explicit argument wins; otherwise the advertised directory
+      // price for the matching path (advertisedPriceUsd — the shared helper
+      // the rule 4.6 seed uses, replacing this tool's former inline duplicate);
+      // otherwise 0 (chain/token/service rules still evaluated).
       let amount = args.amount;
-      if (amount === undefined && entry) {
-        try {
-          const parsed = new URL(args.url);
-          const match = entry.endpoints.find((e) => {
-            const ePath = e.path.startsWith("/") ? e.path : `/${e.path}`;
-            return ePath === parsed.pathname;
-          });
-          if (match && match.price_usdc) {
-            const price = Number(match.price_usdc);
-            if (Number.isFinite(price) && price >= 0) amount = price;
-          }
-        } catch {
-          // unparseable URL — amount stays unknown (0)
-        }
+      if (amount === undefined) {
+        const price = advertisedPriceUsd(args.url);
+        if (price !== undefined) amount = price;
       }
       const amountUsd = amount ?? 0;
 
       const ctx = buildPolicyContext(args.url, chain, token, amountUsd, { recipient: args.recipient });
+      // Issue #30: the price-anomaly inputs (per-service settled-amount
+      // baseline + advertised directory price) enter the evaluation as a
+      // third argument. Read-only: this tool never records baselines (it
+      // never pays); Casper checks stay inert on rule 4.6 by engine design.
       const result = getPolicyEngine().evaluate(ctx, {
         dailySpentUsd: getDailySpent(),
         perServiceSpentUsd: getPerServiceSpent(host),
-      });
+      }, getAnomalyInputs(args.url));
 
       // Issue #26: echo the probed recipient verbatim plus its normalized
       // (canonical) form — the exact value rule 4.5 compared. null when no
@@ -105,7 +104,8 @@ export function registerCheckPaymentTool(server: McpServer): void {
         chain,
         ...recipientEcho,
         trust_level: result.limits.trustLevel,
-        reasons: result.reasons.map((r) => ({ code: r.code, message: r.message })),
+        // Reasons carry their optional detail payload (issue #30) verbatim.
+        reasons: result.reasons.map((r) => ({ code: r.code, message: r.message, ...(r.detail !== undefined ? { detail: r.detail } : {}) })),
         limits: result.limits,
         note: "Inspection only — no payment was attempted. Resolve DENY reasons before calling x402_fetch.",
       };

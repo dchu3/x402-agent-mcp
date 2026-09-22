@@ -173,6 +173,37 @@ export function loadDirectory(): EndpointDirectory {
   throw new Error("endpoints.json not found in any expected location");
 }
 
+/** Advertised USD price for a URL's endpoint path (issue #30): hostname +
+ * pathname match against the directory's endpoints[].price_usdc — the same
+ * match rule x402_check_payment used to inline. Pure read over the in-memory
+ * cached directory: no network I/O. Any error (unparseable URL, directory
+ * unavailable, malformed entry) ⇒ undefined — never throws, never guesses. */
+export function advertisedPriceUsd(url: string): number | undefined {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    const directory = loadDirectory();
+    for (const entry of directory.endpoints) {
+      try {
+        if (new URL(entry.base_url).hostname.toLowerCase() !== host) continue;
+        const match = entry.endpoints.find((e) => {
+          const ePath = e.path.startsWith("/") ? e.path : `/${e.path}`;
+          return ePath === parsed.pathname;
+        });
+        if (match && match.price_usdc) {
+          const price = Number(match.price_usdc);
+          if (Number.isFinite(price) && price >= 0) return price;
+        }
+      } catch {
+        continue; // malformed base_url can never match — skip the entry
+      }
+    }
+    return undefined;
+  } catch {
+    return undefined; // unparseable URL or directory unavailable
+  }
+}
+
 export function addToDirectory(entry: EndpointEntry): boolean {
   const dir = loadDirectory();
   // Check if already exists (by base_url or name)

@@ -196,3 +196,128 @@ it('recipient argument: the compat default (change-detect, no baselines) ignores
   assert.equal(parsed.recipient_normalized, '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
   assert.equal(payment.calls, 0);
 });
+
+// ---------------------------------------------------------------------------
+// Issue #30 — price anomaly detection in x402_check_payment: the inspection
+// tool passes the per-service settled-amount baseline into the gate (rule 4.6)
+// and echoes the optional reason detail payload. It never records baselines
+// (it never pays) — the ledger must stay byte-identical through every check.
+// ---------------------------------------------------------------------------
+
+import { appendFileSync } from 'node:fs';
+
+const ANOMALY_ENABLED = {
+  enabled: true, window: 20, warnZ: 2.0, denyZ: 3.0, minSamples: 5, seedFromDirectory: true, defaultTolerance: 2.0,
+};
+
+function jsonlLines(...entries: unknown[]): string {
+  return entries.map((e) => JSON.stringify(e)).join('\n');
+}
+
+/** The settled baseline the store rehydrates on its first anomaly-enabled read
+ * (written BEFORE that first read — rehydration is one-shot per instance):
+ * $0.01 ×4 then $0.02 ⇒ mean 0.012, stdev 0.004, 5 samples. */
+const BASELINE_ENTRIES = [
+  { timestamp: new Date().toISOString(), url: 'https://priced.example/api', method: 'GET', chain: 'base', amount_usdc: 0.01, status: 'success' },
+  { timestamp: new Date().toISOString(), url: 'https://priced.example/api', method: 'GET', chain: 'base', amount_usdc: 0.01, status: 'success' },
+  { timestamp: new Date().toISOString(), url: 'https://priced.example/api', method: 'GET', chain: 'base', amount_usdc: 0.01, status: 'success' },
+  { timestamp: new Date().toISOString(), url: 'https://priced.example/api', method: 'GET', chain: 'base', amount_usdc: 0.01, status: 'success' },
+  { timestamp: new Date().toISOString(), url: 'https://priced.example/api', method: 'GET', chain: 'base', amount_usdc: 0.02, status: 'success' },
+];
+
+it('price anomaly: a severe spike against the settled baseline is DENIED with the z-score detail echoed', async () => {
+  const payment = payingFetchMock();
+  // Pre-write the baseline BEFORE the first anomaly-enabled read triggers the
+  // one-shot ledger rehydration for this module instance.
+  appendFileSync(process.env.PAYMENT_LOG_PATH!, jsonlLines(...BASELINE_ENTRIES) + '\n', 'utf8');
+  process.env.POLICY_CONFIG_PATH = recipientsConfigFile({
+    payments: { enabled: true, maxPerRequest: 0.5, maxDaily: 10 },
+    anomaly: ANOMALY_ENABLED,
+  });
+  const result = await handler()({ url: 'https://priced.example/api', amount: 0.05, chain: 'base', token: 'USDC' }); // z ≈ 9.5
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.decision, 'DENY');
+  const reason = parsed.reasons.find((r: any) => r.code === 'PRICE_ANOMALY');
+  assert.ok(reason, 'the PRICE_ANOMALY code must be echoed');
+  assert.ok(Math.abs(reason.detail.zScore - 9.5) < 1e-6, `z should be ~9.5, got ${reason.detail.zScore}`);
+  assert.equal(reason.detail.band, 'deny');
+  assert.equal(reason.detail.samples, 5);
+  assert.equal(reason.detail.window, 20);
+  assert.equal(reason.detail.amount, 0.05);
+  assert.equal(reason.detail.host, 'priced.example');
+  assert.equal(payment.calls, 0, 'x402_check_payment must make ZERO payment-layer calls');
+  assert.deepEqual(ledgerLines(), BASELINE_ENTRIES.map((e) => JSON.stringify(e)), 'inspection must not write to the ledger');
+});
+
+it('price anomaly: a mild spike lands in the approval band with detail (middle band, never a hard deny here)', async () => {
+  const payment = payingFetchMock();
+  process.env.POLICY_CONFIG_PATH = recipientsConfigFile({
+    payments: { enabled: true, maxPerRequest: 0.5, maxDaily: 10 },
+    anomaly: ANOMALY_ENABLED,
+  });
+  const result = await handler()({ url: 'https://priced.example/api', amount: 0.022, chain: 'base', token: 'USDC' }); // z ≈ 2.5
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.decision, 'APPROVAL_REQUIRED');
+  assert.deepEqual(parsed.reasons.map((r: any) => r.code), ['PRICE_ANOMALY', 'APPROVAL_REQUIRED']);
+  const detail = parsed.reasons[0].detail;
+  assert.ok(Math.abs(detail.zScore - 2.5) < 1e-6);
+  assert.equal(detail.band, 'approval');
+  assert.equal(payment.calls, 0);
+});
+
+it('price anomaly: the compat default (no anomaly block) leaves the inspection unchanged', async () => {
+  const payment = payingFetchMock();
+  process.env.POLICY_CONFIG_PATH = recipientsConfigFile({
+    payments: { enabled: true, maxPerRequest: 0.5, maxDaily: 10 },
+  });
+  const result = await handler()({ url: 'https://priced.example/api', amount: 0.05, chain: 'base', token: 'USDC' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.decision, 'ALLOW', 'anomaly disabled ⇒ no PRICE_ANOMALY, decisions unchanged');
+  assert.deepEqual(parsed.reasons, []);
+  assert.equal(parsed.reasons.every((r: any) => r.detail === undefined), true);
+  assert.equal(payment.calls, 0);
+});
+
+it('price anomaly: the directory price seeds the FIRST call — soft approval band only, never a hard deny (conflict D)', async () => {
+  const payment = payingFetchMock();
+  process.env.POLICY_CONFIG_PATH = recipientsConfigFile({
+    payments: { enabled: true, maxPerRequest: 50, maxDaily: 100 },
+    anomaly: ANOMALY_ENABLED,
+  });
+  // analyzer.example/score is priced 0.05 in the directory and has NO settled
+  // baseline — the first check is softly compared against the advertised price.
+  const atPrice = await handler()({ url: 'https://analyzer.example/score', amount: 0.05, chain: 'base', token: 'USDC' });
+  const atPriceParsed = JSON.parse(atPrice.content[0].text);
+  assert.equal(atPriceParsed.decision, 'ALLOW', 'a payment at the advertised price annotates nothing');
+  assert.deepEqual(atPriceParsed.reasons, []);
+
+  const above = await handler()({ url: 'https://analyzer.example/score', amount: 0.2, chain: 'base', token: 'USDC' }); // 4× the price
+  const aboveParsed = JSON.parse(above.content[0].text);
+  assert.equal(aboveParsed.decision, 'APPROVAL_REQUIRED');
+  const reason = aboveParsed.reasons.find((r: any) => r.code === 'PRICE_ANOMALY');
+  assert.ok(reason);
+  assert.equal(reason.detail.band, 'approval');
+  assert.ok(Math.abs(reason.detail.ratio - 4) < 1e-9, 'the seed path carries the ratio, not a z-score');
+  // Even an absurd amount stays in the approval band — a stub baseline is not
+  // evidence for a hard deny (statistics are).
+  const huge = await handler()({ url: 'https://analyzer.example/score', amount: 5.0, chain: 'base', token: 'USDC' });
+  assert.equal(JSON.parse(huge.content[0].text).decision, 'APPROVAL_REQUIRED');
+  assert.equal(JSON.parse(huge.content[0].text).reasons.find((r: any) => r.code === 'PRICE_ANOMALY').detail.band, 'approval');
+  assert.equal(payment.calls, 0);
+  assert.deepEqual(ledgerLines(), BASELINE_ENTRIES.map((e) => JSON.stringify(e)), 'seeding is a pure derivation — nothing stored, nothing written');
+});
+
+it('price anomaly: a Casper inspection stays inert on rule 4.6 (amount 0 by design — conflict A)', async () => {
+  const payment = payingFetchMock();
+  process.env.POLICY_CONFIG_PATH = recipientsConfigFile({
+    payments: { enabled: true, maxPerRequest: 0.5, maxDaily: 10 },
+    anomaly: ANOMALY_ENABLED,
+  });
+  const result = await handler()({ url: 'https://casper-stranger.example/api', chain: 'casper', token: 'wCSPR' }); // amount omitted ⇒ 0
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.decision, 'ALLOW', 'the mote-denominated leg must not hit the price gate');
+  assert.ok(!parsed.reasons.some((r: any) => r.code === 'PRICE_ANOMALY'));
+  assert.equal(parsed.amount, '0.00');
+  assert.equal(payment.calls, 0);
+  assert.deepEqual(ledgerLines(), BASELINE_ENTRIES.map((e) => JSON.stringify(e)), 'inspection must not write to the ledger');
+});

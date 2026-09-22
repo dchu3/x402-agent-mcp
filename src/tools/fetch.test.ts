@@ -791,3 +791,154 @@ it('recipient change-detect: a Casper payTo differing from the recorded baseline
   );
   assert.equal(casperBudget.getDailySpent(), budgetBefore, 'the refusal must precede any casperBudget reserve');
 });
+
+// ---------------------------------------------------------------------------
+// Issue #30 — price anomaly detection wired into x402_fetch: the Base/Solana
+// gate passes the per-service settled-amount baseline into the engine (rule
+// 4.6), and a successful settlement feeds the baseline (recordSettledAmount
+// under the same resp.status === 200 guard as recordServicePayment) so a
+// denied or failed payment can never poison it. Compat default (anomaly
+// disabled): getAnomalyInputs returns {} and nothing changes.
+// ---------------------------------------------------------------------------
+
+/** 402 probe answer advertising a legacy-shaped Solana exact offer with a
+ * parameterized amount (units → USDC at 6 decimals). No asset field: the SDK
+ * passes the paid leg through without creating a payload (the #25 compat
+ * path), so each settled payment is probe (402) + direct 200. */
+function probeChallengeAmount(amountStr: string) {
+  const payload = JSON.stringify({
+    x402Version: 2,
+    accepts: [{ scheme: 'exact', network: SOLANA_CAIP2, amount: amountStr, payTo: 'SoLWallet', extra: { name: 'USDC' } }],
+  });
+  return new Response('Payment Required', { status: 402, headers: { 'payment-required': b64url(payload) } });
+}
+
+const ANOMALY_ENABLED = {
+  enabled: true, window: 20, warnZ: 2.0, denyZ: 3.0, minSamples: 5, seedFromDirectory: true, defaultTolerance: 2.0,
+};
+
+/** Grow the host's in-process baseline through REAL settlements (probe 402 +
+ * settled 200), so the baseline provably comes from the fetch.ts accounting
+ * guard — no ledger pre-writing, no rehydration-timing dependence. */
+async function growBaseline(url: string, probeAmounts: string[]) {
+  let calls = 0;
+  globalThis.fetch = (async (input: unknown) => {
+    calls++;
+    if (calls % 2 === 1) return probeChallengeAmount(probeAmounts[Math.floor(calls / 2)]);
+    return new Response('{"result":"ok"}', { status: 200 }); // settled 200
+  }) as any;
+  for (let i = 0; i < probeAmounts.length; i++) {
+    const r = await handler()({ url });
+    assert.equal(JSON.parse(r.content[0].text).status, 200, `settlement ${i + 1} must complete through the real flow`);
+  }
+}
+
+it('price anomaly: a successful settlement moves the baseline and a severe spike is hard-denied with z detail — and never moves it', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  process.env.POLICY_CONFIG_PATH = policyConfigFile({
+    payments: { enabled: true, maxPerRequest: 0.5, maxDaily: 10 },
+    anomaly: ANOMALY_ENABLED,
+  });
+  const store = await import('../policy/anomaly-store.js') as typeof import('../policy/anomaly-store.js'); // same instance fetch.js records into
+  const host = 'anomaly-severe-test.invalid';
+  const url = `https://${host}/api`;
+  // Five real settlements: $0.01 ×4 then $0.02 ⇒ mean 0.012, stdev 0.004.
+  await growBaseline(url, ['10000', '10000', '10000', '10000', '20000']);
+  const baselineAfterGrowth = store.getBaseline(host);
+  assert.deepEqual(baselineAfterGrowth!.samples, [0.01, 0.01, 0.01, 0.01, 0.02], 'a settled 200 moves the baseline, in settlement order');
+
+  // Severe spike: $0.05 ⇒ z ≈ 9.5 ≥ denyZ 3 ⇒ hard deny BEFORE the payment layer.
+  const before = ledgerLines();
+  let spikeCalls = 0;
+  globalThis.fetch = (async () => { spikeCalls++; return probeChallengeAmount('50000'); }) as any;
+  const result = await handler()({ url });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(spikeCalls, 1, 'only the 402 probe may hit the network — the paid fetch must never run');
+  assert.equal(parsed.policy_decision, 'DENY');
+  const reason = parsed.reasons.find((r: any) => r.code === 'PRICE_ANOMALY');
+  assert.ok(reason, 'the PRICE_ANOMALY code must reach the caller');
+  const detail = reason.detail;
+  assert.ok(detail, 'the refusal carries the detail payload for the audit log');
+  assert.ok(Math.abs(detail.zScore - 9.5) < 1e-6, `z should be ~9.5, got ${detail.zScore}`);
+  assert.equal(detail.band, 'deny');
+  assert.equal(detail.samples, 5);
+  assert.equal(detail.window, 20);
+  assert.equal(detail.amount, 0.05);
+  assert.equal(detail.host, host);
+  assert.ok(Math.abs(detail.mean - 0.012) < 1e-9);
+  assert.deepEqual(ledgerLines(), before, 'a policy DENY must not write to the payment ledger');
+  assert.deepEqual(store.getBaseline(host)!.samples, [0.01, 0.01, 0.01, 0.01, 0.02], 'a denied payment must never move the baseline');
+});
+
+it('price anomaly: a mild spike lands in the approval band — refused with PRICE_ANOMALY + APPROVAL_REQUIRED and detail', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  process.env.POLICY_CONFIG_PATH = policyConfigFile({
+    payments: { enabled: true, maxPerRequest: 0.5, maxDaily: 10 },
+    anomaly: ANOMALY_ENABLED,
+  });
+  const host = 'anomaly-approval-test.invalid';
+  const url = `https://${host}/api`;
+  await growBaseline(url, ['10000', '10000', '10000', '10000', '20000']); // mean 0.012, stdev 0.004
+  const beforeSpike = ledgerLines();
+  globalThis.fetch = (async () => probeChallengeAmount('22000')) as any; // $0.022 ⇒ z ≈ 2.5
+  const result = await handler()({ url });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.policy_decision, 'APPROVAL_REQUIRED');
+  assert.deepEqual(parsed.reasons.map((r: any) => r.code), ['PRICE_ANOMALY', 'APPROVAL_REQUIRED']);
+  const detail = parsed.reasons[0].detail;
+  assert.ok(Math.abs(detail.zScore - 2.5) < 1e-6, `z should be ~2.5, got ${detail.zScore}`);
+  assert.equal(detail.band, 'approval');
+  assert.equal(parsed.reasons[0].message.includes('human confirmation'), true, 'the approval-band message asks for human confirmation');
+  assert.deepEqual(ledgerLines(), beforeSpike, 'an approval-banded refusal must not write to the payment ledger');
+});
+
+it('price anomaly: a non-200 settled response never moves the baseline (same guard as logPayment/recordServicePayment)', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  process.env.POLICY_CONFIG_PATH = policyConfigFile({
+    payments: { enabled: true, maxPerRequest: 0.5, maxDaily: 10 },
+    anomaly: ANOMALY_ENABLED,
+  });
+  const store = await import('../policy/anomaly-store.js') as typeof import('../policy/anomaly-store.js');
+  const host = 'anomaly-non200-test.invalid';
+  const url = `https://${host}/api`;
+  await growBaseline(url, ['10000']); // one settled $0.01
+  assert.deepEqual(store.getBaseline(host)!.samples, [0.01]);
+  // Second attempt: probe 402, paid leg settles then the server fails with 500.
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls++;
+    if (calls === 1) return probeChallengeAmount('10000');
+    return new Response('server error', { status: 500 });
+  }) as any;
+  const result = await handler()({ url });
+  assert.equal(JSON.parse(result.content[0].text).status, 500, 'the flow must reach the accounting block through a non-200 response');
+  const entries = ledgerLines().map((l) => JSON.parse(l)).filter((e: any) => e.url === url);
+  assert.equal(entries[entries.length - 1].status, 'failed', 'the non-200 settlement is logged as failed');
+  assert.deepEqual(store.getBaseline(host)!.samples, [0.01], 'a failed settlement must never move the baseline');
+});
+
+it('price anomaly: the compat default keeps the flow untouched — the spike pays as before (enabled false ⇒ no inputs, no refusal)', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  // No POLICY_CONFIG_PATH ⇒ the behavior-compat default (anomaly disabled).
+  const store = await import('../policy/anomaly-store.js') as typeof import('../policy/anomaly-store.js');
+  const host = 'anomaly-compat-test.invalid';
+  const url = `https://${host}/api`;
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls++;
+    if (calls === 1) return probeChallengeAmount('50000'); // a $0.05 spike offer
+    return new Response('{"result":"ok"}', { status: 200 });
+  }) as any;
+  const result = await handler()({ url });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.status, 200);
+  assert.equal(parsed.paid, true);
+  assert.equal(parsed.policy_decision, undefined, 'ALLOW adds no policy keys to the success output');
+  // The settled amount still feeds the (ungated) baseline writer so a later
+  // opt-in rehydrates the history — but reads stay gated on enabled.
+  assert.deepEqual(store.getBaseline(host)!.samples, [0.05]);
+});

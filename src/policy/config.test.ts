@@ -380,6 +380,103 @@ it('loading a recipients-bearing file never mutates DEFAULT_POLICY_CONFIG', () =
   assert.equal(JSON.stringify(DEFAULT_POLICY_CONFIG), snapshot, 'loadPolicyConfig must never mutate the default template (recipients included)');
 });
 
+// ---------------------------------------------------------------------------
+// Issue #30 — the top-level `anomaly` block (price anomaly detection, rule
+// 4.6). Strict validation in the same style as every other block; unknown
+// keys inside the block are errors (typo protection). The COMPAT DEFAULT is
+// `enabled: false` (conflict B): an always-on price gate could hard-deny a
+// previously allowed payment, so enabling it is an operator opt-in. There is
+// deliberately NO X402_POLICY_* env override (the recipients precedent).
+// ---------------------------------------------------------------------------
+
+const DEFAULT_ANOMALY = { enabled: false, window: 20, warnZ: 2.0, denyZ: 3.0, minSamples: 5, seedFromDirectory: true, defaultTolerance: 2.0 };
+const VALID_ANOMALY = { enabled: true, window: 30, warnZ: 1.5, denyZ: 4, minSamples: 3, seedFromDirectory: false, defaultTolerance: 1.5 };
+
+it('DEFAULT_POLICY_CONFIG.anomaly is the documented compat default: disabled, with the issue thresholds', () => {
+  assert.deepEqual(DEFAULT_POLICY_CONFIG.anomaly, DEFAULT_ANOMALY);
+  assert.equal(DEFAULT_POLICY_CONFIG.anomaly.enabled, false, 'the anomaly gate must ship disabled (operator opt-in, conflict B)');
+});
+
+it('no POLICY_CONFIG_PATH loads the anomaly compat default (enabled false)', () => {
+  const state = loadPolicyConfig();
+  assert.deepEqual(state.configErrors, []);
+  assert.deepEqual(state.config.anomaly, DEFAULT_ANOMALY);
+});
+
+it('a file with a valid anomaly block loads clean and replaces the default block', () => {
+  process.env.POLICY_CONFIG_PATH = configFile('anomaly-valid.json', validFileJson({ anomaly: VALID_ANOMALY }));
+  const state = loadPolicyConfig();
+  assert.deepEqual(state.configErrors, []);
+  assert.deepEqual(state.config.anomaly, VALID_ANOMALY);
+});
+
+it('a partial anomaly block merges over the defaults field-by-field (fresh values, never aliased)', () => {
+  process.env.POLICY_CONFIG_PATH = configFile('anomaly-partial.json', validFileJson({ anomaly: { enabled: true, warnZ: 1.0 } }));
+  const state = loadPolicyConfig();
+  assert.deepEqual(state.configErrors, []);
+  // Fields present in the file override; warnZ 1 < denyZ 3 keeps the merged ordering valid.
+  assert.deepEqual(state.config.anomaly, { ...DEFAULT_ANOMALY, enabled: true, warnZ: 1 });
+  // The default template is untouched.
+  assert.deepEqual(DEFAULT_POLICY_CONFIG.anomaly, DEFAULT_ANOMALY);
+});
+
+it('a file WITHOUT an anomaly block keeps the behavior-compat default (disabled)', () => {
+  process.env.POLICY_CONFIG_PATH = configFile('no-anomaly.json', validFileJson());
+  const state = loadPolicyConfig();
+  assert.deepEqual(state.configErrors, []);
+  assert.deepEqual(state.config.anomaly, DEFAULT_ANOMALY);
+});
+
+it('an unknown key inside the anomaly block fails closed (typo protection)', () => {
+  process.env.POLICY_CONFIG_PATH = configFile('anomaly-typo.json', validFileJson({
+    anomaly: { ...VALID_ANOMALY, warnz: 2 },
+  }));
+  const result = getPolicyEngine().evaluate(discoveredCtx);
+  assert.equal(result.decision, 'DENY');
+  assert.ok(result.reasons.some((r) => r.code === 'CONFIG_INVALID' && r.message.includes('warnz')));
+});
+
+it('malformed anomaly values fail closed (CONFIG_INVALID)', () => {
+  for (const bad of [
+    { ...VALID_ANOMALY, enabled: 'true' },          // non-boolean
+    { ...VALID_ANOMALY, window: 0 },                // window < 1
+    { ...VALID_ANOMALY, window: 2.5 },              // non-integer window
+    { ...VALID_ANOMALY, minSamples: 0 },            // minSamples < 1
+    { ...VALID_ANOMALY, minSamples: 1.5 },          // non-integer minSamples
+    { ...VALID_ANOMALY, warnZ: -1 },                // negative warnZ
+    { ...VALID_ANOMALY, denyZ: '3' },               // non-number denyZ
+    { ...VALID_ANOMALY, defaultTolerance: 0.5 },    // below the >= 1 floor
+    { ...VALID_ANOMALY, seedFromDirectory: 'yes' }, // non-boolean
+    'yes',                                          // not an object at all
+  ]) {
+    process.env.POLICY_CONFIG_PATH = configFile('anomaly-bad.json', validFileJson({ anomaly: bad }));
+    const result = getPolicyEngine().evaluate(discoveredCtx);
+    assert.equal(result.decision, 'DENY', `anomaly block ${JSON.stringify(bad)} must fail closed`);
+    assert.ok(result.reasons.some((r) => r.code === 'CONFIG_INVALID'));
+  }
+});
+
+it('an inverted warnZ/denyZ ordering fails closed — including against the defaults after merging', () => {
+  for (const bad of [
+    { ...VALID_ANOMALY, warnZ: 5, denyZ: 3 },  // both present, inverted
+    { ...VALID_ANOMALY, warnZ: 3, denyZ: 3 },  // equal is not <
+    { warnZ: 5 },                              // partial block: warnZ raised above the DEFAULT denyZ 3
+    { denyZ: 1 },                              // partial block: denyZ lowered below the DEFAULT warnZ 2
+  ]) {
+    process.env.POLICY_CONFIG_PATH = configFile('anomaly-order.json', validFileJson({ anomaly: bad }));
+    const result = getPolicyEngine().evaluate(discoveredCtx);
+    assert.equal(result.decision, 'DENY', `anomaly block ${JSON.stringify(bad)} must fail closed`);
+    assert.ok(result.reasons.some((r) => r.code === 'CONFIG_INVALID' && r.message.includes('warnZ')));
+  }
+});
+
+it('loading an anomaly-bearing file never mutates DEFAULT_POLICY_CONFIG', () => {
+  const snapshot = JSON.stringify(DEFAULT_POLICY_CONFIG);
+  process.env.POLICY_CONFIG_PATH = configFile('anomaly-snapshot.json', validFileJson({ anomaly: VALID_ANOMALY }));
+  loadPolicyConfig();
+  assert.equal(JSON.stringify(DEFAULT_POLICY_CONFIG), snapshot, 'loadPolicyConfig must never mutate the default template (anomaly included)');
+});
+
 it('DEFAULT_POLICY_CONFIG is the documented compat default and is not mutated by loading', () => {
   const snapshot = JSON.stringify(DEFAULT_POLICY_CONFIG);
   process.env.POLICY_CONFIG_PATH = configFile('policy.json', validFileJson({ payments: { enabled: true, maxPerRequest: 0.1, maxDaily: 1 } }));

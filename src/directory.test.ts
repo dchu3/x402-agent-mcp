@@ -12,7 +12,7 @@ const overridePath = join(dir, 'endpoints.json');
 const env = { ...process.env };
 process.env.X402_DIRECTORY_PATH = overridePath;
 
-const { addToDirectory, loadDirectory, clearDirectoryCache, atomicWriteFileSync } = await import('./directory.js');
+const { addToDirectory, loadDirectory, clearDirectoryCache, atomicWriteFileSync, advertisedPriceUsd } = await import('./directory.js');
 
 // endpoints.json at the repo root is gitignored operator data; its absence
 // (clean checkout) is the normal case. Snapshot it once at module load if it
@@ -162,4 +162,32 @@ it('atomic write cleans up its temp file on failure (read-only directory)', () =
     chmodSync(roDir, 0o755); // restore so cleanup can remove the dir
   }
   assert.deepEqual(readdirSync(roDir).filter((f) => f.includes('.tmp-')), [], 'temp file removed after failed write');
+});
+
+// ---------------------------------------------------------------------------
+// Issue #30 — advertisedPriceUsd: the directory's advertised price for a URL's
+// endpoint path (hostname + pathname match). Pure read over the cached
+// directory; any error ⇒ undefined. This is the shared helper x402_check-
+// _payment switched to (replacing its inline duplicate) and the rule 4.6 seed
+// uses.
+// ---------------------------------------------------------------------------
+
+it('advertisedPriceUsd matches hostname + path and tolerates garbage', () => {
+  writeFileSync(overridePath, JSON.stringify({
+    endpoints: [
+      { ...entry, base_url: 'https://priced.invalid', endpoints: [{ path: '/score', method: 'POST', price_usdc: '0.05', description: 'd' }] },
+      { ...entry, base_url: 'https://malformed.invalid', endpoints: [{ path: '/x', method: 'GET', price_usdc: 'oops', description: 'd' }] },
+      { ...entry, base_url: 'not-a-url' },
+    ],
+    categories: [], last_updated: '2026-09-21',
+  }), 'utf8');
+  clearDirectoryCache();
+  assert.equal(advertisedPriceUsd('https://priced.invalid/score'), 0.05);
+  assert.equal(advertisedPriceUsd('https://priced.invalid/other'), undefined, 'no matching path ⇒ undefined');
+  assert.equal(advertisedPriceUsd('https://stranger.invalid/score'), undefined, 'no matching host ⇒ undefined');
+  assert.equal(advertisedPriceUsd('https://priced.invalid'), undefined, 'no path at all ⇒ undefined');
+  assert.equal(advertisedPriceUsd('not-a-url'), undefined, 'unparseable URL ⇒ undefined (never throws)');
+  // The malformed-price and malformed-base_url entries never throw — the scan
+  // skips them and keeps looking at the rest of the directory.
+  assert.equal(advertisedPriceUsd('https://malformed.invalid/x'), undefined, 'a non-numeric price_usdc ⇒ undefined');
 });
