@@ -1,5 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { it, describe } from 'node:test';
+import bs58 from 'bs58';
 import { PolicyEngine } from './engine.js';
 import type { PolicyBudgetState, PolicyConfig, PolicyContext } from './types.js';
 
@@ -19,6 +20,7 @@ function cfg(overrides: Partial<PolicyConfig> = {}): PolicyConfig {
     },
     networks: { allowed: ['base', 'solana', 'casper'] },
     tokens: { allowed: ['USDC', 'wCSPR'] },
+    recipients: { mode: 'change-detect', allowed: [], perService: {}, known: {} },
     ...overrides,
   };
 }
@@ -259,4 +261,206 @@ it('is deterministic: same input three times → identical output', () => {
   assert.deepEqual(runs[0], runs[1]);
   assert.deepEqual(runs[1], runs[2]);
   assert.equal(runs[0].decision, 'DENY'); // 0.65 + 0.4 > 1.0 per-service cap
+});
+
+// ---------------------------------------------------------------------------
+// Issue #26 — rule 4.5: the recipient gate (RECIPIENT_NOT_ALLOWED). The gate
+// sits between rule 4 (TOKEN_NOT_ALLOWED) and rule 5 (UNKNOWN_SERVICE) in the
+// fixed rule order. Two modes:
+//   allowlist    — ACTIVE always; fail-closed on an empty effective list and
+//                  on a missing/unusable probed recipient.
+//   change-detect— ACTIVE only for a host with a recorded baseline in `known`;
+//                  no baseline ⇒ no reason at all (what keeps the compat
+//                  default inert).
+// perService REPLACES the global list for that host; host keys match
+// lowercase; comparison happens on normalized (canonical) recipients.
+// ---------------------------------------------------------------------------
+
+const EVM_A = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+const EVM_B = '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+const EVM_CHECKSUMMED = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'; // same as EVM_A's lowercase
+const SOL_A = bs58.encode(Buffer.alloc(32, 0x07));
+const SOL_B = bs58.encode(Buffer.alloc(32, 0x08));
+const CASPER_A = '00' + 'ab'.repeat(32);
+const CASPER_B = '00' + 'cd'.repeat(32);
+const CASPER_A_PREFIXED_UPPER = 'account-hash-' + '00' + 'AB'.repeat(32);
+
+function rcpt(overrides: Partial<PolicyConfig['recipients']> = {}): PolicyConfig['recipients'] {
+  return { mode: 'allowlist', allowed: [], perService: {}, known: {}, ...overrides };
+}
+
+function rcptCfg(recipients: PolicyConfig['recipients'], overrides: Partial<PolicyConfig> = {}): PolicyConfig {
+  return cfg({ recipients, ...overrides });
+}
+
+describe('rule 4.5: allowlist mode', () => {
+  it('allows a listed recipient and denies an unlisted one (RECIPIENT_NOT_ALLOWED alone ⇒ DENY)', () => {
+    const engine = new PolicyEngine({ config: rcptCfg(rcpt({ allowed: [EVM_A] })), configErrors: [] });
+    const allowed = engine.evaluate(ctx({ recipient: EVM_A }));
+    assert.equal(allowed.decision, 'ALLOW');
+    assert.deepEqual(allowed.reasons, []);
+    const denied = engine.evaluate(ctx({ recipient: EVM_B }));
+    assert.equal(denied.decision, 'DENY');
+    assert.deepEqual(codes(denied), ['RECIPIENT_NOT_ALLOWED']);
+  });
+
+  it('denies when the effective list is empty — global empty AND per-service empty (fail-closed)', () => {
+    const engine = new PolicyEngine({ config: rcptCfg(rcpt({ allowed: [] })), configErrors: [] });
+    const globalEmpty = engine.evaluate(ctx({ recipient: EVM_A }));
+    assert.equal(globalEmpty.decision, 'DENY');
+    assert.deepEqual(codes(globalEmpty), ['RECIPIENT_NOT_ALLOWED']);
+    const perServiceEmpty = new PolicyEngine({
+      config: rcptCfg(rcpt({ allowed: [EVM_A], perService: { 'example.com': [] } })),
+      configErrors: [],
+    });
+    const emptyOverride = perServiceEmpty.evaluate(ctx({ recipient: EVM_A }));
+    assert.equal(emptyOverride.decision, 'DENY');
+    assert.deepEqual(codes(emptyOverride), ['RECIPIENT_NOT_ALLOWED']);
+  });
+
+  it('denies when ctx.recipient is missing while the mode is active (membership cannot be proven)', () => {
+    const engine = new PolicyEngine({ config: rcptCfg(rcpt({ allowed: [EVM_A] })), configErrors: [] });
+    for (const recipient of [undefined, '']) {
+      const result = engine.evaluate(ctx({ recipient }));
+      assert.equal(result.decision, 'DENY');
+      assert.deepEqual(codes(result), ['RECIPIENT_NOT_ALLOWED']);
+    }
+  });
+
+  it('perService REPLACES the global list for that host (listed-globally ⇒ deny there, per-service-listed ⇒ allow)', () => {
+    const engine = new PolicyEngine({
+      config: rcptCfg(rcpt({ allowed: [EVM_A], perService: { 'example.com': [EVM_B] } })),
+      configErrors: [],
+    });
+    // EVM_A is listed globally but NOT on example.com — the per-service list replaces it.
+    const overridden = engine.evaluate(ctx({ recipient: EVM_A }));
+    assert.equal(overridden.decision, 'DENY');
+    assert.deepEqual(codes(overridden), ['RECIPIENT_NOT_ALLOWED']);
+    // EVM_B is only on the per-service list — allowed for that host.
+    assert.equal(engine.evaluate(ctx({ recipient: EVM_B })).decision, 'ALLOW');
+    // A different host is still governed by the GLOBAL list.
+    const otherAllowed = engine.evaluate(ctx({ service: 'other.example', recipient: EVM_A }));
+    assert.equal(otherAllowed.decision, 'ALLOW');
+    const otherDenied = engine.evaluate(ctx({ service: 'other.example', recipient: EVM_B }));
+    assert.equal(otherDenied.decision, 'DENY');
+  });
+
+  it('host keys are matched lowercase (buildPolicyContext lowercases ctx.service)', () => {
+    const engine = new PolicyEngine({
+      config: rcptCfg(rcpt({ allowed: [EVM_A], perService: { 'example.com': [EVM_B] } })),
+      configErrors: [],
+    });
+    // Uppercase ctx spelling still hits the lowercase per-service entry.
+    assert.equal(engine.evaluate(ctx({ service: 'Example.COM', recipient: EVM_B })).decision, 'ALLOW');
+  });
+
+  it('formatting differences never bypass the gate — normalization makes them match (or fail closed)', () => {
+    // EVM: entry checksummed, probed lowercase ⇒ match (and the reverse).
+    const evm = new PolicyEngine({
+      config: rcptCfg(rcpt({ allowed: [EVM_CHECKSUMMED] })),
+      configErrors: [],
+    });
+    assert.equal(evm.evaluate(ctx({ recipient: EVM_CHECKSUMMED.toLowerCase() })).decision, 'ALLOW');
+    const evmReverse = new PolicyEngine({
+      config: rcptCfg(rcpt({ allowed: [EVM_CHECKSUMMED.toLowerCase()] })),
+      configErrors: [],
+    });
+    assert.equal(evmReverse.evaluate(ctx({ recipient: EVM_CHECKSUMMED })).decision, 'ALLOW');
+    // Solana: base58 wallets contain uppercase characters — an exact wallet matches.
+    const sol = new PolicyEngine({ config: rcptCfg(rcpt({ allowed: [SOL_A] })), configErrors: [] });
+    assert.equal(sol.evaluate(ctx({ chain: 'solana', recipient: SOL_A })).decision, 'ALLOW');
+    assert.equal(sol.evaluate(ctx({ chain: 'solana', recipient: SOL_B })).decision, 'DENY');
+    // Casper: case-differing + account-hash- prefixed entry matches the bare lowercase probed recipient.
+    const casper = new PolicyEngine({ config: rcptCfg(rcpt({ allowed: [CASPER_A_PREFIXED_UPPER] })), configErrors: [] });
+    assert.equal(casper.evaluate(ctx({ chain: 'casper', token: 'wCSPR', recipient: CASPER_A })).decision, 'ALLOW');
+    assert.equal(casper.evaluate(ctx({ chain: 'casper', token: 'wCSPR', recipient: CASPER_B })).decision, 'DENY');
+    // A probed recipient that cannot be normalized for the chain can never prove membership.
+    const unnormalizable = evm.evaluate(ctx({ recipient: EVM_CHECKSUMMED.toUpperCase().replace('0X', '0x') }));
+    assert.equal(unnormalizable.decision, 'DENY');
+    assert.deepEqual(codes(unnormalizable), ['RECIPIENT_NOT_ALLOWED']);
+  });
+
+  it('an allowlist entry that cannot be normalized for the evaluated chain never matches (cross-chain confusion)', () => {
+    const engine = new PolicyEngine({
+      config: rcptCfg(rcpt({ allowed: [SOL_A, 'SoLWallet', EVM_A] })), // SOL entries are not EVM addresses
+      configErrors: [],
+    });
+    const result = engine.evaluate(ctx({ chain: 'base', recipient: SOL_A })); // probed a Solana wallet on Base
+    assert.equal(result.decision, 'DENY', 'a Solana address can never satisfy an EVM-context gate');
+    assert.deepEqual(codes(result), ['RECIPIENT_NOT_ALLOWED']);
+  });
+});
+
+describe('rule 4.5: change-detect mode', () => {
+  it('no baseline for the host ⇒ no recipient reason at all (the compat proof)', () => {
+    const engine = new PolicyEngine({
+      config: rcptCfg({ mode: 'change-detect', allowed: [], perService: {}, known: {} }),
+      configErrors: [],
+    });
+    for (const recipient of [undefined, EVM_A, EVM_B]) {
+      const result = engine.evaluate(ctx({ recipient }));
+      assert.equal(result.decision, 'ALLOW');
+      assert.deepEqual(result.reasons, [], `recipient ${String(recipient)} must not trigger anything without a baseline`);
+    }
+  });
+
+  it('a matching baseline allows (canonical equality, formatting-insensitive); a differing baseline denies', () => {
+    const engine = new PolicyEngine({
+      config: rcptCfg({ mode: 'change-detect', allowed: [], perService: {}, known: { 'example.com': CASPER_A_PREFIXED_UPPER } }),
+      configErrors: [],
+    });
+    const match = engine.evaluate(ctx({ chain: 'casper', token: 'wCSPR', recipient: CASPER_A }));
+    assert.equal(match.decision, 'ALLOW');
+    assert.deepEqual(match.reasons, []);
+    const differ = engine.evaluate(ctx({ chain: 'casper', token: 'wCSPR', recipient: CASPER_B }));
+    assert.equal(differ.decision, 'DENY');
+    assert.deepEqual(codes(differ), ['RECIPIENT_NOT_ALLOWED']);
+  });
+
+  it('an unnormalizable or missing probed recipient against a recorded baseline is denied', () => {
+    const engine = new PolicyEngine({
+      config: rcptCfg({ mode: 'change-detect', allowed: [], perService: {}, known: { 'example.com': EVM_A } }),
+      configErrors: [],
+    });
+    const missing = engine.evaluate(ctx({}));
+    assert.equal(missing.decision, 'DENY');
+    assert.deepEqual(codes(missing), ['RECIPIENT_NOT_ALLOWED']);
+    const unusable = engine.evaluate(ctx({ recipient: EVM_CHECKSUMMED.toUpperCase().replace('0X', '0x') }));
+    assert.equal(unusable.decision, 'DENY');
+    assert.deepEqual(codes(unusable), ['RECIPIENT_NOT_ALLOWED']);
+    // A wrong-chain probed value cannot match either (normalization is chain-aware).
+    const wrongChain = engine.evaluate(ctx({ recipient: SOL_A }));
+    assert.equal(wrongChain.decision, 'DENY');
+  });
+
+  it('an unnormalizable baseline denies every probed recipient for that host (fail-closed, never open)', () => {
+    const engine = new PolicyEngine({
+      config: rcptCfg({ mode: 'change-detect', allowed: [], perService: {}, known: { 'example.com': 'SoLWallet' } }),
+      configErrors: [],
+    });
+    for (const recipient of [EVM_A, SOL_A]) {
+      const result = engine.evaluate(ctx({ recipient }));
+      assert.equal(result.decision, 'DENY', `unusable baseline must deny even ${String(recipient)}`);
+      assert.deepEqual(codes(result), ['RECIPIENT_NOT_ALLOWED']);
+    }
+  });
+});
+
+describe('rule 4.5: ordering and aggregation', () => {
+  it('the recipient reason accumulates between TOKEN_NOT_ALLOWED and UNKNOWN_SERVICE (fixed rule order)', () => {
+    const engine = new PolicyEngine({
+      config: rcptCfg(rcpt({ allowed: [EVM_A] }), { tokens: { allowed: ['USDC'] } }),
+      configErrors: [],
+    });
+    const result = engine.evaluate(ctx({ token: 'wCSPR', trustLevel: 'UNKNOWN', recipient: EVM_B }));
+    assert.equal(result.decision, 'DENY');
+    assert.deepEqual(codes(result), ['TOKEN_NOT_ALLOWED', 'RECIPIENT_NOT_ALLOWED', 'UNKNOWN_SERVICE']);
+  });
+
+  it('the decision stays DENY when the recipient reason is combined with cap reasons', () => {
+    const engine = new PolicyEngine({ config: rcptCfg(rcpt({ allowed: [EVM_A] })), configErrors: [] });
+    const result = engine.evaluate(ctx({ recipient: EVM_B, amount: 0.51 }));
+    assert.equal(result.decision, 'DENY');
+    assert.deepEqual(codes(result), ['RECIPIENT_NOT_ALLOWED', 'REQUEST_LIMIT_EXCEEDED']);
+  });
 });

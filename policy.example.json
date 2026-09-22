@@ -34,5 +34,11 @@
       "USDC",
       "wCSPR"
     ]
+  },
+  "recipients": {
+    "mode": "change-detect",
+    "allowed": [],
+    "perService": {},
+    "known": {}
   }
 }
