@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import bs58 from 'bs58';
-import { normalizeRecipient } from './recipient.js';
+import { normalizeRecipient, parseRecipientEntry } from './recipient.js';
 
 // Issue #26 — chain-aware recipient normalization for the recipient gate.
 // normalizeRecipient is total and pure: undefined means "not a valid address
@@ -82,7 +82,10 @@ it('rejects malformed Casper recipients: wrong prefix, odd length, missing 00, e
 });
 
 it('returns undefined for an unknown chain (fail-closed: nothing matches by accident)', () => {
-  assert.equal(normalizeRecipient('ethereum', EVM_LOWER), undefined);
+  // Issue #32 note: 'ethereum' is no longer unknown — it is a recognised EVM
+  // alias (rule 3 hard-denies it ALWAYS, so it can never be PAID, but its
+  // addresses normalise). Truly unrecognised chains still yield undefined.
+  assert.equal(normalizeRecipient('optimism', EVM_LOWER), undefined, 'optimism is not in the chain vocabulary');
   assert.equal(normalizeRecipient('casper-test', casperLower), undefined);
   assert.equal(normalizeRecipient('', EVM_LOWER), undefined);
 });
@@ -107,6 +110,41 @@ it('is total: undefined chain or non-string inputs never throw', () => {
   assert.equal(normalizeRecipient(undefined as unknown as string, EVM_LOWER), undefined);
   assert.equal(normalizeRecipient('base', undefined as unknown as string), undefined);
   assert.equal(normalizeRecipient('solana', 42 as unknown as string), undefined);
+});
+
+// ---------------------------------------------------------------------------
+// Issue #32 (R6) — chain-scoped recipient entries and the wider EVM alias
+// vocabulary in normalization. The entry grammar: "<alias>:<address>" (the
+// EVM aliases or "*" = any chain); a BARE address is the legacy unqualified
+// form scoped to base; an unrecognised qualifier makes the entry unusable.
+// ---------------------------------------------------------------------------
+
+it('normalizeRecipient canonicalises EVM addresses on every EVM alias and any eip155:* id', () => {
+  for (const chain of ['polygon', 'arbitrum', 'base-sepolia', 'ethereum', 'eip155:137', 'eip155:42161', 'eip155:10']) {
+    assert.equal(normalizeRecipient(chain, EVM_CHECKSUMMED), EVM_LOWER, `${chain} must canonicalise like base`);
+    assert.equal(normalizeRecipient(chain, EVM_CHECKSUMMED.toUpperCase().replace('0X', '0x')), undefined, `${chain} still rejects wrong checksums`);
+    assert.equal(normalizeRecipient(chain, SOL_WALLET), undefined, `${chain} must not accept a Solana address`);
+  }
+});
+
+it('parseRecipientEntry: bare addresses are the legacy base-scoped form; known aliases and * parse', () => {
+  assert.deepEqual(parseRecipientEntry(EVM_CHECKSUMMED), { chain: 'base', address: EVM_CHECKSUMMED }, 'bare EVM ⇒ base scope');
+  assert.deepEqual(parseRecipientEntry(SOL_WALLET), { chain: 'base', address: SOL_WALLET }, 'bare Solana ⇒ base scope label (address form still governs on non-EVM chains)');
+  assert.deepEqual(parseRecipientEntry(`polygon:${EVM_CHECKSUMMED}`), { chain: 'polygon', address: EVM_CHECKSUMMED });
+  assert.deepEqual(parseRecipientEntry(`arbitrum:${EVM_CHECKSUMMED}`), { chain: 'arbitrum', address: EVM_CHECKSUMMED });
+  assert.deepEqual(parseRecipientEntry(`base:${EVM_CHECKSUMMED}`), { chain: 'base', address: EVM_CHECKSUMMED });
+  assert.deepEqual(parseRecipientEntry(`*:${EVM_CHECKSUMMED}`), { chain: '*', address: EVM_CHECKSUMMED });
+  assert.deepEqual(parseRecipientEntry(` *:${EVM_CHECKSUMMED} `), { chain: '*', address: EVM_CHECKSUMMED }, 'whitespace is trimmed');
+});
+
+it('parseRecipientEntry: unrecognised qualifiers and empty parts are unusable (fail closed)', () => {
+  assert.equal(parseRecipientEntry(`optimism:${EVM_CHECKSUMMED}`), undefined, 'unknown alias; policy would deny it anyway');
+  assert.equal(parseRecipientEntry(`eip155:137:${EVM_CHECKSUMMED}`), undefined, 'CAIP-2 prefixes are not entry qualifiers');
+  assert.equal(parseRecipientEntry(`solana:${SOL_WALLET}`), undefined, 'solana is not an entry qualifier in the #32 grammar');
+  assert.equal(parseRecipientEntry('polygon:'), undefined, 'empty address part');
+  assert.equal(parseRecipientEntry(''), undefined);
+  assert.equal(parseRecipientEntry('   '), undefined);
+  assert.equal(parseRecipientEntry(undefined as unknown as string), undefined);
 });
 
 // ---------------------------------------------------------------------------

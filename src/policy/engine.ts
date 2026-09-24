@@ -22,6 +22,10 @@
 //      missing/unusable probed recipient); change-detect mode is ACTIVE only
 //      for a host with a recorded baseline (denies only when the probed
 //      recipient differs from it). Comparison is on normalized recipients.
+//      Entries are chain-scoped (issue #32, R6): "<alias>:<address>" matches
+//      only that chain, "*:<address>" any chain, and a BARE address is the
+//      legacy unqualified form scoped to base (never widens onto a new EVM
+//      chain); an unrecognised qualifier makes the entry unusable.
 //   4.6 PRICE_ANOMALY           — price anomaly gate (issue #30): z-score (or
 //      fallback multiplier) of the payment amount against the per-service
 //      settled-amount baseline. Middle band ⇒ APPROVAL_REQUIRED, high band ⇒
@@ -40,8 +44,8 @@
 // (reaching the cap exactly is allowed).
 
 import { evaluatePriceAnomaly } from "./anomaly.js";
-import { normalizeRecipient } from "./recipient.js";
-import { caip2Of, isEvmNetwork, L1_CAIP2 } from "../evm/networks.js";
+import { normalizeRecipient, parseRecipientEntry, RECIPIENT_ANY_CHAIN } from "./recipient.js";
+import { aliasForCaip2, caip2Of, isEvmNetwork, L1_CAIP2 } from "../evm/networks.js";
 import type {
   AnomalyInputs,
   PolicyBudgetState,
@@ -186,7 +190,14 @@ export class PolicyEngine {
         const canonical = normalizeRecipient(ctx.chain, ctx.recipient);
         if (canonical === undefined) {
           reasons.push({ code: "RECIPIENT_NOT_ALLOWED", message: `Probed recipient for ${rcptHost} is not a valid address for chain '${ctx.chain}' — allowlist mode fails closed` });
-        } else if (!effective.some((entry) => normalizeRecipient(ctx.chain, entry) === canonical)) {
+        } else if (!effective.some((entry) => {
+          // Issue #32 (R6): chain-scoped entries — an entry can satisfy the
+          // gate only for the chain its qualifier names ("*": any chain; bare
+          // legacy form: base). An unusable or out-of-scope entry never
+          // matches; comparison stays on the normalized address part.
+          const address = recipientEntryAddress(ctx.chain, entry);
+          return address !== undefined && normalizeRecipient(ctx.chain, address) === canonical;
+        })) {
           reasons.push({ code: "RECIPIENT_NOT_ALLOWED", message: `Recipient ${canonical} is not in the allowlist for ${rcptHost} (allowlist mode)` });
         }
       }
@@ -199,8 +210,13 @@ export class PolicyEngine {
         if (!ctx.recipient || ctx.recipient.trim() === "") {
           reasons.push({ code: "RECIPIENT_NOT_ALLOWED", message: `No recipient was probed for ${rcptHost} — change-detect cannot compare it against the recorded baseline and fails closed` });
         } else {
+          // Issue #32 (R6): the recorded baseline is chain-scoped like any
+          // allowlist entry — an out-of-scope or unparseable baseline is
+          // unusable, so it denies (fail-closed, exactly like a baseline that
+          // cannot be normalized).
           const probed = normalizeRecipient(ctx.chain, ctx.recipient);
-          const base = normalizeRecipient(ctx.chain, baseline);
+          const baselineAddress = recipientEntryAddress(ctx.chain, baseline);
+          const base = baselineAddress !== undefined ? normalizeRecipient(ctx.chain, baselineAddress) : undefined;
           if (probed === undefined || base === undefined || probed !== base) {
             reasons.push({ code: "RECIPIENT_NOT_ALLOWED", message: `Probed recipient ${probed ?? `(not a valid address for chain '${ctx.chain}')`} differs from the recorded baseline for ${rcptHost} (change-detect mode)` });
           }
@@ -279,4 +295,22 @@ function isSpendableAmount(amount: number): boolean {
 
 function finiteOrZero(value: number | undefined): number {
   return value !== undefined && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+/** Issue #32 (R6): resolve the address part of a chain-scoped recipient
+ * entry for the evaluated chain, or undefined when the entry is unusable for
+ * it (unrecognised qualifier, or a base-scoped bare/legacy form evaluated on
+ * a non-base EVM chain). The wildcard "*" scopes to every chain; a concrete
+ * alias scopes to exactly that alias; the BARE legacy form means base —
+ * pre-#32 the only EVM chain in the vocabulary — so on NON-EVM chains bare
+ * entries keep their pre-#32 meaning (the address form governs there), and
+ * on eip155:8453 (base itself) a bare entry still matches base. */
+function recipientEntryAddress(chain: string, entry: string): string | undefined {
+  const parsed = parseRecipientEntry(entry);
+  if (parsed === undefined) return undefined;
+  const inScope =
+    parsed.chain === RECIPIENT_ANY_CHAIN ||
+    parsed.chain === chain ||
+    (parsed.chain === "base" && (!isEvmNetwork(chain) || aliasForCaip2(chain) === "base"));
+  return inScope ? parsed.address : undefined;
 }

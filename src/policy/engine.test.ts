@@ -552,6 +552,105 @@ describe('rule 4.5: change-detect mode', () => {
   });
 });
 
+describe('rule 4.5: chain-scoped recipient entries (issue #32, R6)', () => {
+  // ctx() defaults to chain 'base' / token 'USDC'; polygon chains need the
+  // alias opted into networks.allowed (the default facilitator list already
+  // settles eip155:137 / eip155:42161).
+  const MULTI_EVM = ['base', 'polygon', 'arbitrum'];
+
+  it('normalizeRecipient drives the gate on the new aliases: polygon/arbitrum canonicalise like base', () => {
+    const engine = new PolicyEngine({ config: rcptCfg(rcpt({ allowed: ['polygon:' + EVM_A] }), { networks: { allowed: MULTI_EVM } }), configErrors: [] });
+    const ok = engine.evaluate(ctx({ chain: 'polygon', recipient: EVM_A }));
+    assert.equal(ok.decision, 'ALLOW');
+  });
+
+  it('a bare 0x entry means base: allowed on base, DENIED on polygon (the issue acceptance criterion)', () => {
+    const engine = new PolicyEngine({ config: rcptCfg(rcpt({ allowed: [EVM_A] }), { networks: { allowed: MULTI_EVM } }), configErrors: [] });
+    const onBase = engine.evaluate(ctx({ chain: 'base', recipient: EVM_A }));
+    assert.equal(onBase.decision, 'ALLOW');
+    const onPolygon = engine.evaluate(ctx({ chain: 'polygon', recipient: EVM_A }));
+    assert.equal(onPolygon.decision, 'DENY', 'a bare Base approval must never widen onto Polygon');
+    assert.deepEqual(codes(onPolygon), ['RECIPIENT_NOT_ALLOWED']);
+  });
+
+  it('polygon:0x is allowed on polygon and denied on base; arbitrum:0x likewise', () => {
+    const engine = new PolicyEngine({
+      config: rcptCfg(rcpt({ allowed: [`polygon:${EVM_A}`, `arbitrum:${EVM_B}`] }), { networks: { allowed: MULTI_EVM } }),
+      configErrors: [],
+    });
+    assert.equal(engine.evaluate(ctx({ chain: 'polygon', recipient: EVM_A })).decision, 'ALLOW');
+    assert.equal(engine.evaluate(ctx({ chain: 'arbitrum', recipient: EVM_B })).decision, 'ALLOW');
+    const wrongChain = engine.evaluate(ctx({ chain: 'base', recipient: EVM_A }));
+    assert.equal(wrongChain.decision, 'DENY', 'the polygon-scoped entry must not satisfy base');
+    assert.deepEqual(codes(wrongChain), ['RECIPIENT_NOT_ALLOWED']);
+    const crossEvm = engine.evaluate(ctx({ chain: 'polygon', recipient: EVM_B }));
+    assert.equal(crossEvm.decision, 'DENY', 'the arbitrum-scoped entry must not satisfy polygon');
+  });
+
+  it('*:0x (any chain) is allowed on base, polygon and arbitrum alike', () => {
+    const engine = new PolicyEngine({ config: rcptCfg(rcpt({ allowed: [`*:${EVM_A}`] }), { networks: { allowed: MULTI_EVM } }), configErrors: [] });
+    for (const chain of MULTI_EVM) {
+      const result = engine.evaluate(ctx({ chain, recipient: EVM_A }));
+      assert.equal(result.decision, 'ALLOW', `*:${EVM_A} must satisfy ${chain}`);
+    }
+  });
+
+  it('an entry with an unrecognised chain qualifier is unusable — it never matches on any chain', () => {
+    const engine = new PolicyEngine({
+      config: rcptCfg(rcpt({ allowed: [`optimism:${EVM_A}`, `eip155:137:${EVM_B}`] }), { networks: { allowed: [...MULTI_EVM, 'eip155:10'] } }),
+      configErrors: [],
+    });
+    for (const [chain, recipient] of [['base', EVM_A], ['polygon', EVM_A], ['base', EVM_B], ['polygon', EVM_B]] as const) {
+      const result = engine.evaluate(ctx({ chain, recipient }));
+      assert.equal(result.decision, 'DENY', `unusable entry must never match (${chain} / ${recipient})`);
+      assert.deepEqual(codes(result), ['RECIPIENT_NOT_ALLOWED']);
+    }
+  });
+
+  it('the chain scope applies to perService lists exactly like the global list', () => {
+    const engine = new PolicyEngine({
+      config: rcptCfg(rcpt({ allowed: [EVM_A], perService: { 'example.com': [`polygon:${EVM_A}`] } }), { networks: { allowed: MULTI_EVM } }),
+      configErrors: [],
+    });
+    assert.equal(engine.evaluate(ctx({ chain: 'polygon', recipient: EVM_A })).decision, 'ALLOW');
+    const onBase = engine.evaluate(ctx({ chain: 'base', recipient: EVM_A }));
+    assert.equal(onBase.decision, 'DENY', 'on example.com the per-service polygon-scoped list REPLACES the global bare entry');
+  });
+
+  it('change-detect baselines are chain-scoped the same way', () => {
+    // polygon-scoped baseline: matches a polygon probed recipient, denies base.
+    const engine = new PolicyEngine({
+      config: rcptCfg({ mode: 'change-detect', allowed: [], perService: {}, known: { 'example.com': `polygon:${EVM_A}` } }, { networks: { allowed: MULTI_EVM } }),
+      configErrors: [],
+    });
+    const match = engine.evaluate(ctx({ chain: 'polygon', recipient: EVM_A }));
+    assert.equal(match.decision, 'ALLOW');
+    assert.deepEqual(match.reasons, []);
+    const outOfScope = engine.evaluate(ctx({ chain: 'base', recipient: EVM_A }));
+    assert.equal(outOfScope.decision, 'DENY', 'a polygon-scoped baseline is unusable on base — fail closed');
+    assert.deepEqual(codes(outOfScope), ['RECIPIENT_NOT_ALLOWED']);
+    // Wildcard baseline accepts on either chain; a bare baseline (base-scoped)
+    // DENIES on polygon — proven with the same host keyed separately.
+    const wild = new PolicyEngine({
+      config: rcptCfg({ mode: 'change-detect', allowed: [], perService: {}, known: { 'wild.example': `*:${EVM_A}`, 'legacy.example': EVM_A } }, { networks: { allowed: MULTI_EVM } }),
+      configErrors: [],
+    });
+    assert.equal(wild.evaluate(ctx({ service: 'wild.example', chain: 'polygon', recipient: EVM_A })).decision, 'ALLOW');
+    assert.equal(wild.evaluate(ctx({ service: 'wild.example', chain: 'base', recipient: EVM_A })).decision, 'ALLOW');
+    const legacyOnPolygon = wild.evaluate(ctx({ service: 'legacy.example', chain: 'polygon', recipient: EVM_A }));
+    assert.equal(legacyOnPolygon.decision, 'DENY', 'a bare baseline never widens onto polygon');
+    assert.equal(wild.evaluate(ctx({ service: 'legacy.example', chain: 'base', recipient: EVM_A })).decision, 'ALLOW');
+  });
+
+  it('bare non-EVM entries keep their pre-#32 meaning (solana/casper assertions untouched by the scoping)', () => {
+    const sol = new PolicyEngine({ config: rcptCfg(rcpt({ allowed: [SOL_A] })), configErrors: [] });
+    assert.equal(sol.evaluate(ctx({ chain: 'solana', recipient: SOL_A })).decision, 'ALLOW', 'a bare Solana entry still governs solana');
+    const casper = new PolicyEngine({ config: rcptCfg(rcpt({ allowed: [EVM_A] })), configErrors: [] });
+    const cross = casper.evaluate(ctx({ chain: 'polygon', recipient: EVM_A }));
+    assert.equal(cross.decision, 'DENY', 'a bare entry must not follow onto polygon even when it would normalise there');
+  });
+});
+
 describe('rule 4.5: ordering and aggregation', () => {
   it('the recipient reason accumulates between TOKEN_NOT_ALLOWED and UNKNOWN_SERVICE (fixed rule order)', () => {
     const engine = new PolicyEngine({
