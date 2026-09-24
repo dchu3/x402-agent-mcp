@@ -40,6 +40,7 @@
 import { readFileSync } from "fs";
 import { PolicyEngine } from "./engine.js";
 import { DEFAULT_ANOMALY_CONFIG } from "./anomaly.js";
+import { DEFAULT_FACILITATOR_NETWORKS } from "../evm/networks.js";
 import { loadDirectory } from "../directory.js";
 import type {
   AnomalyConfig,
@@ -87,6 +88,14 @@ export function defaultPolicyConfig(errors: string[] = []): PolicyConfig {
     },
     networks: { allowed: ["base", "solana", "casper"] },
     tokens: { allowed: ["USDC", "wCSPR"] },
+    // Issue #32 (R2): the compat default for networks.allowed intentionally
+    // stays [base, solana, casper] — Polygon/Arbitrum are OPT-IN via config,
+    // never silently payable by default (money-path widenings ship opt-in, the
+    // #30 precedent). The facilitator settle-list DOES default to all three
+    // EVM ids: it is a fail-closed gate consulted only for chains that already
+    // passed networks.allowed, so it widens nothing by itself. Fresh copies —
+    // DEFAULT_POLICY_CONFIG must stay pristine.
+    evm: { facilitatorNetworks: [...DEFAULT_FACILITATOR_NETWORKS] },
     // Issue #26 compat default: change-detect with NO baselines — the rule is
     // active only for a host with a recorded baseline, so with an empty `known`
     // map the recipient gate never fires and today's decisions are unchanged
@@ -121,6 +130,9 @@ function failClosedConfig(errors: string[]): PolicyConfig {
     },
     networks: { allowed: [] },
     tokens: { allowed: [] },
+    // Fail-closed state: an empty settle-list — nothing is payable in this
+    // state anyway (the engine short-circuits on configErrors first).
+    evm: { facilitatorNetworks: [] },
     // Fail-closed state: allowlist mode with an empty effective list denies
     // every recipient — consistent with this state's "nothing is payable"
     // content (the engine additionally short-circuits on configErrors).
@@ -245,17 +257,37 @@ function anomalyPolicy(v: unknown, path: string, errors: string[]): void {
   }
 }
 
+function evmPolicy(v: unknown, path: string, errors: string[]): void {
+  if (!isPlainObject(v)) {
+    errors.push(`${path} must be an object with a "facilitatorNetworks" array of CAIP-2 ids (issue #32)`);
+    return;
+  }
+  for (const key of Object.keys(v)) {
+    if (key !== "facilitatorNetworks") errors.push(`${path}.${key} is not a recognised policy key (typo protection)`);
+  }
+  if (v.facilitatorNetworks !== undefined) {
+    const list = stringArray(v.facilitatorNetworks, `${path}.facilitatorNetworks`, errors);
+    if (list !== undefined) {
+      for (const entry of list) {
+        if (!/^eip155:\d+$/.test(entry)) {
+          errors.push(`${path}.facilitatorNetworks entries must be CAIP-2 evm ids (eip155:<chainId>) — got '${entry}'`);
+        }
+      }
+    }
+  }
+}
+
 /** Strict validation of a parsed config document against the schema. Only
  * `payments` is required (safety-critical — the issue's fail-closed rule);
- * services/networks/tokens/recipients/anomaly are optional and merge over the
- * defaults. Unknown keys are errors everywhere (typo protection: a misspelled
- * cap must never be silently ignored). */
+ * services/networks/tokens/recipients/anomaly/evm are optional and merge over
+ * the defaults. Unknown keys are errors everywhere (typo protection: a
+ * misspelled cap must never be silently ignored). */
 function validateDocument(doc: unknown, errors: string[]): void {
   if (!isPlainObject(doc)) {
     errors.push("policy config must be a JSON object");
     return;
   }
-  const knownTop = new Set(["payments", "services", "networks", "tokens", "recipients", "anomaly"]);
+  const knownTop = new Set(["payments", "services", "networks", "tokens", "recipients", "anomaly", "evm"]);
   for (const key of Object.keys(doc)) {
     if (!knownTop.has(key)) errors.push(`policy config key "${key}" is not recognised (typo protection)`);
   }
@@ -322,6 +354,13 @@ function validateDocument(doc: unknown, errors: string[]): void {
   if (doc.anomaly !== undefined) {
     anomalyPolicy(doc.anomaly, "anomaly", errors);
   }
+
+  // evm — optional; strict shape (issue #32): only facilitatorNetworks, each
+  // entry a CAIP-2 eip155:<chainId> id. A partial block merges over the
+  // defaults in applyFileConfig (the anomaly precedent).
+  if (doc.evm !== undefined) {
+    evmPolicy(doc.evm, "evm", errors);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -380,6 +419,7 @@ function applyFileConfig(config: PolicyConfig, errors: string[]): void {
       known?: Record<string, string>;
     };
     anomaly?: Partial<AnomalyConfig>;
+    evm?: { facilitatorNetworks?: string[] };
   };
 
   // payments is fully specified (required) — replace wholesale.
@@ -432,6 +472,13 @@ function applyFileConfig(config: PolicyConfig, errors: string[]): void {
     if (!(config.anomaly.warnZ >= 0) || !(config.anomaly.warnZ < config.anomaly.denyZ)) {
       errors.push(`anomaly.warnZ must satisfy 0 <= anomaly.warnZ < anomaly.denyZ (got warnZ ${config.anomaly.warnZ}, denyZ ${config.anomaly.denyZ} after merging over the defaults)`);
     }
+  }
+
+  // Issue #32: merge the evm block over the default ONLY when present, fresh
+  // array copy — never aliasing DEFAULT_POLICY_CONFIG (same convention as
+  // recipients/anomaly above).
+  if (d.evm?.facilitatorNetworks) {
+    config.evm = { facilitatorNetworks: [...d.evm.facilitatorNetworks] };
   }
 }
 
@@ -487,6 +534,14 @@ function applyEnvOverrides(config: PolicyConfig, errors: string[]): void {
   if (tokens !== undefined && tokens.trim() !== "") {
     const list = parseListOverride(tokens, "X402_POLICY_TOKENS", errors);
     if (list) config.tokens = { allowed: list };
+  }
+
+  // Issue #32: the facilitator settle-list has an env override. Malformed
+  // values fail closed via parseListOverride (error ⇒ CONFIG_INVALID state).
+  const facilitator = process.env.X402_EVM_FACILITATOR_NETWORKS;
+  if (facilitator !== undefined && facilitator.trim() !== "") {
+    const list = parseListOverride(facilitator, "X402_EVM_FACILITATOR_NETWORKS", errors);
+    if (list) config.evm = { facilitatorNetworks: list };
   }
 
   // NOTE (issue #30): the `anomaly` block has deliberately NO X402_POLICY_*

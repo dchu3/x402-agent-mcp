@@ -100,13 +100,25 @@ export interface AnomalyInputs {
  * deny (PRICE_ANOMALY is deliberately not a DENY_CODES member — conflict C). */
 export type AnomalyBand = "none" | "seed" | "approval" | "deny";
 
+/** EVM settlement policy (issue #32). The shared pure CAIP-2 vocabulary
+ * lives in src/evm/networks.ts. `facilitatorNetworks` is the fail-closed
+ * settle-allowlist consulted by rule 3 ONLY after a chain passed
+ * networks.allowed: an EVM chain the configured facilitator does not settle
+ * is denied (CHAIN_NOT_ALLOWED), and the Ethereum L1 is denied ALWAYS. *
+ * Keeping this list separate from networks.allowed is deliberate: widening
+ * the alias vocabulary never implies the facilitator can settle the chain. */
+export interface EvmPolicyConfig {
+  /** CAIP-2 ids (eip155:<chainId>) the configured facilitator settles. */
+  facilitatorNetworks: string[];
+}
+
 /** Policy configuration model (issue Phase 2, JSON per the ratified decision —
  * loaded/validated in src/policy/config.ts; this is the shape the engine uses).
  * Service keys mirror the issue's config example (lowercase trust levels); the
  * engine maps TrustLevel → key case-insensitively. `recipients` is REQUIRED so
  * every construction site (including test fixtures) must state a recipient
  * policy — fail-closed at compile time (issue #26). `anomaly` is REQUIRED for
- * the same reason (issue #30). */
+ * the same reason (issue #30), and `evm` likewise (issue #32). */
 export interface PolicyConfig {
   payments: { enabled: boolean; maxPerRequest: number; maxDaily: number };
   services: {
@@ -120,6 +132,7 @@ export interface PolicyConfig {
   tokens: { allowed: string[] };
   recipients: RecipientPolicy;
   anomaly: AnomalyConfig;
+  evm: EvmPolicyConfig;
 }
 
 /** The request a payment decision is made about. `trustLevel` is supplied by

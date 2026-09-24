@@ -10,7 +10,12 @@
 // stability review; reasons accumulate in this order, not first-only):
 //   1. SERVICE_BLOCKED          — trust level BLOCKED (or level configured deny)
 //   2. PAYMENTS_DISABLED        — global payments kill switch
-//   3. CHAIN_NOT_ALLOWED        — network allowlist
+//   3. CHAIN_NOT_ALLOWED        — network allowlist (issue #32: ONE reason,
+//      three fail-closed sub-checks in fixed precedence): (1) the Ethereum
+//      L1 is hard-denied ALWAYS, even when listed in networks.allowed;
+//      (2) networks.allowed membership (unchanged shape/message); (3) an EVM
+//      chain that passed membership is denied when the configured facilitator
+//      does not settle its CAIP-2 id (evm.facilitatorNetworks).
 //   4. TOKEN_NOT_ALLOWED        — token allowlist
 //   4.5 RECIPIENT_NOT_ALLOWED   — recipient gate (issue #26): allowlist mode is
 //      ACTIVE always (fail-closed on an empty effective list and on a
@@ -36,6 +41,7 @@
 
 import { evaluatePriceAnomaly } from "./anomaly.js";
 import { normalizeRecipient } from "./recipient.js";
+import { caip2Of, isEvmNetwork, L1_CAIP2 } from "../evm/networks.js";
 import type {
   AnomalyInputs,
   PolicyBudgetState,
@@ -134,9 +140,26 @@ export class PolicyEngine {
       reasons.push({ code: "PAYMENTS_DISABLED", message: "Payments are disabled by policy (payments.enabled = false)" });
     }
 
-    // Rule 3: network allowlist.
-    if (!cfg.networks.allowed.includes(ctx.chain)) {
+    // Rule 3: network allowlist (issue #32). At most ONE CHAIN_NOT_ALLOWED
+    // reason, emitted by the first of three fail-closed sub-checks in fixed
+    // precedence — this keeps every existing reason-count assertion intact
+    // and the L1/facilitator denials route through the existing code (no new
+    // ReasonCode, fact 6).
+    const chainCaip2 = caip2Of(ctx.chain);
+    if (chainCaip2 === L1_CAIP2) {
+      // (1) Ethereum L1 hard deny — refused ALWAYS, even when an operator
+      // lists 'ethereum' or 'eip155:1' in networks.allowed (the issue: L1
+      // settlement is out of scope for this agent, unconditionally).
+      reasons.push({ code: "CHAIN_NOT_ALLOWED", message: `Chain '${ctx.chain}' (${L1_CAIP2}) is the Ethereum L1 and is always refused, even when listed in the allowed networks` });
+    } else if (!cfg.networks.allowed.includes(ctx.chain)) {
+      // (2) membership — unchanged shape/message.
       reasons.push({ code: "CHAIN_NOT_ALLOWED", message: `Chain '${ctx.chain}' is not in the allowed networks [${cfg.networks.allowed.join(", ")}]` });
+    } else if (isEvmNetwork(ctx.chain) && (chainCaip2 === undefined || !cfg.evm.facilitatorNetworks.includes(chainCaip2))) {
+      // (3) facilitator settle-gate — an EVM chain the operator allowed is
+      // still refused when the configured facilitator cannot settle its
+      // CAIP-2 id. Fail closed: isEvmNetwork ⇒ caip2Of is defined, so the
+      // undefined branch below is belt-and-braces, never a guess.
+      reasons.push({ code: "CHAIN_NOT_ALLOWED", message: `Chain '${ctx.chain}' is not settled by the configured facilitator networks [${cfg.evm.facilitatorNetworks.join(", ")}]` });
     }
 
     // Rule 4: token allowlist.
