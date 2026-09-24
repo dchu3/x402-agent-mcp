@@ -11,6 +11,7 @@ import {
   isEvmNetwork,
   caip2Of,
   aliasForCaip2,
+  normalizeCaip2Evm,
   isUsdChain,
 } from './networks.js';
 
@@ -81,6 +82,57 @@ it('alias ↔ CAIP-2 round-trip for every known alias', () => {
     assert.equal(aliasForCaip2(EVM_CAIP2[alias]), alias);
     assert.equal(aliasForCaip2(alias), alias, 'an alias passed as input stays the alias');
   }
+});
+
+// Issue #32 review follow-up — canonical numeric form for eip155 CAIP-2 ids.
+// The x402 SDK parses 'eip155:01' as chainId 1, so a padded spelling slipping
+// past a literal string comparison would sign for the Ethereum L1 while the
+// L1 hard deny only matches the literal 'eip155:1'. Every eip155:<digits>
+// form must therefore compare canonically.
+
+it('normalizeCaip2Evm: padded eip155 digits collapse onto the canonical id', () => {
+  assert.equal(normalizeCaip2Evm('eip155:01'), 'eip155:1');
+  assert.equal(normalizeCaip2Evm('eip155:001'), 'eip155:1');
+  assert.equal(normalizeCaip2Evm('eip155:1'), 'eip155:1');
+  assert.equal(normalizeCaip2Evm('eip155:08453'), 'eip155:8453');
+});
+
+it('normalizeCaip2Evm: canonical chains round-trip identically', () => {
+  for (const n of ['eip155:8453', 'eip155:137', 'eip155:42161', 'eip155:84532', 'eip155:10']) {
+    assert.equal(normalizeCaip2Evm(n), n, `${n} is already canonical and must be unchanged`);
+  }
+});
+
+it('normalizeCaip2Evm: non-EVM and malformed forms pass through UNCHANGED', () => {
+  for (const n of [
+    'solana',
+    'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp',
+    'casper:casper',
+    'casper:casper-test',
+    'base',
+    'ethereum',
+    'eip155',
+    'eip155:',
+    'eip155:1:2',
+    'not-eip155:8453',
+    '',
+  ]) {
+    assert.equal(normalizeCaip2Evm(n), n, `${n} must pass through untouched`);
+  }
+});
+
+it('caip2Of normalises padded EVM ids (the SDK-registration boundary)', () => {
+  assert.equal(caip2Of('eip155:01'), 'eip155:1', 'padded L1 spellings register as the canonical eip155:1');
+  assert.equal(caip2Of('eip155:001'), 'eip155:1');
+  assert.equal(caip2Of('eip155:08453'), 'eip155:8453');
+  // Canonical unknown ids keep their identity — never aliased (unchanged).
+  assert.equal(caip2Of('eip155:10'), 'eip155:10');
+});
+
+it('aliasForCaip2 resolves padded spellings of KNOWN chains; canonical unknown ids stay verbatim', () => {
+  assert.equal(aliasForCaip2('eip155:01'), 'ethereum');
+  assert.equal(aliasForCaip2('eip155:08453'), 'base');
+  assert.equal(aliasForCaip2('eip155:10'), 'eip155:10', 'unknown canonical ids keep their real identity (unchanged)');
 });
 
 it('isUsdChain: solana ∪ EVM — Casper and unknown strings excluded', () => {

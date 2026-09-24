@@ -16,6 +16,12 @@ it('known EVM CAIP-2 ids resolve to their aliases', () => {
   assert.equal(parseChainFromNetwork('eip155:1'), 'ethereum');
 });
 
+it('padded eip155 spellings resolve through the same vocabulary (numeric canonicalization, review follow-up)', () => {
+  assert.equal(parseChainFromNetwork('eip155:08453'), 'base');
+  assert.equal(parseChainFromNetwork('eip155:01'), 'ethereum', 'a padded L1 id resolves to ethereum — policy hard-denies it');
+  assert.equal(parseChainFromNetwork('eip155:010'), 'eip155:10', 'unknown padded ids keep their canonical identity');
+});
+
 it('an unknown eip155:* network returns VERBATIM — never "base" (the #32 bug fix)', () => {
   assert.equal(parseChainFromNetwork('eip155:10'), 'eip155:10', 'Optimism keeps its real identity; policy denies it');
   assert.equal(parseChainFromNetwork('eip155:56'), 'eip155:56');

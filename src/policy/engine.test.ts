@@ -358,6 +358,51 @@ describe('rule 3: multi-EVM network allowlist (issue #32)', () => {
     assert.equal(engine.evaluate(ctx({ chain: 'casper', token: 'wCSPR' })).decision, 'ALLOW');
   });
 
+  // Issue #32 review follow-up — canonical eip155 numeric normalization: the
+  // x402 SDK parses 'eip155:01' as chainId 1, so padded spellings must compare
+  // canonically everywhere rule 3 compares a raw string.
+  it('the L1 hard deny is airtight: a padded eip155:01 in BOTH lists is still refused (dev-loop reproduction)', () => {
+    const sloppy = cfg({
+      networks: { allowed: ['base', 'eip155:01'] },
+      evm: { facilitatorNetworks: ['eip155:01'] },
+    });
+    const engine = new PolicyEngine({ config: sloppy, configErrors: [] });
+    for (const chain of ['eip155:01', 'eip155:001']) {
+      const result = engine.evaluate(ctx({ chain }));
+      assert.equal(result.decision, 'DENY', `padded L1 form ${chain} must be refused`);
+      assert.deepEqual(codes(result), ['CHAIN_NOT_ALLOWED'], 'exactly ONE chain reason (single-code contract)');
+      assert.match(result.reasons[0].message, /always refused/, 'the L1 hard deny fires — never a membership allowance');
+    }
+    // The canonical L1 form stays refused under the same sloppy config.
+    assert.equal(engine.evaluate(ctx({ chain: 'eip155:1' })).decision, 'DENY');
+  });
+
+  it("padded and canonical spellings are the same chain for membership — both directions", () => {
+    // Canonical allowlist + facilitator entries match a padded probed chain.
+    const canonicalList = new PolicyEngine({
+      config: cfg({ networks: { allowed: ['base', 'eip155:8453'] }, evm: { facilitatorNetworks: ['eip155:8453'] } }),
+      configErrors: [],
+    });
+    assert.equal(canonicalList.evaluate(ctx({ chain: 'eip155:08453' })).decision, 'ALLOW');
+    // Padded allowlist + facilitator entries match a canonical probed chain.
+    const paddedList = new PolicyEngine({
+      config: cfg({ networks: { allowed: ['base', 'eip155:08453'] }, evm: { facilitatorNetworks: ['eip155:08453'] } }),
+      configErrors: [],
+    });
+    assert.equal(paddedList.evaluate(ctx({ chain: 'eip155:8453' })).decision, 'ALLOW');
+  });
+
+  it('numeric canonicalization stays surgical: distinct ids never merge, alias↔CAIP-2 stays literal', () => {
+    const engine = new PolicyEngine({
+      config: cfg({ networks: { allowed: ['base', 'eip155:8453'] }, evm: { facilitatorNetworks: ['eip155:8453'] } }),
+      configErrors: [],
+    });
+    // A different chain id is NOT the same chain, padded or not.
+    assert.equal(engine.evaluate(ctx({ chain: 'eip155:84531' })).decision, 'DENY');
+    // Aliases still compare literally to CAIP-2 spellings (pre-#32 behaviour).
+    assert.equal(engine.evaluate(ctx({ chain: 'eip155:137' })).decision, 'DENY');
+  });
+
   it('at most one CHAIN_NOT_ALLOWED reason even when several sub-checks could fire', () => {
     const engine = new PolicyEngine({
       config: cfg({ networks: { allowed: ['base', 'ethereum'] }, evm: { facilitatorNetworks: [] } }),

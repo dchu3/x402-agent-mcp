@@ -45,7 +45,7 @@
 
 import { evaluatePriceAnomaly } from "./anomaly.js";
 import { normalizeRecipient, parseRecipientEntry, RECIPIENT_ANY_CHAIN } from "./recipient.js";
-import { aliasForCaip2, caip2Of, isEvmNetwork, L1_CAIP2 } from "../evm/networks.js";
+import { aliasForCaip2, caip2Of, isEvmNetwork, L1_CAIP2, normalizeCaip2Evm } from "../evm/networks.js";
 import type {
   AnomalyInputs,
   PolicyBudgetState,
@@ -149,16 +149,25 @@ export class PolicyEngine {
     // precedence — this keeps every existing reason-count assertion intact
     // and the L1/facilitator denials route through the existing code (no new
     // ReasonCode, fact 6).
+    // Issue #32 review follow-up: the x402 SDK parses 'eip155:01' as chainId
+    // 1, so EVERY eip155:<digits> comparison below runs on the canonical
+    // numeric form (normalizeCaip2Evm) — both sides — and the padded L1
+    // spellings hit the hard deny instead of aliasing past it. Aliases and
+    // non-EVM ids pass through normalizeCaip2Evm unchanged, so pre-#32
+    // comparisons keep their exact shape.
     const chainCaip2 = caip2Of(ctx.chain);
     if (chainCaip2 === L1_CAIP2) {
       // (1) Ethereum L1 hard deny — refused ALWAYS, even when an operator
-      // lists 'ethereum' or 'eip155:1' in networks.allowed (the issue: L1
-      // settlement is out of scope for this agent, unconditionally).
+      // lists 'ethereum' or 'eip155:1' (or a padded spelling) in
+      // networks.allowed (the issue: L1 settlement is out of scope for this
+      // agent, unconditionally). caip2Of already yields the canonical form,
+      // so 'eip155:01' compares equal to L1_CAIP2.
       reasons.push({ code: "CHAIN_NOT_ALLOWED", message: `Chain '${ctx.chain}' (${L1_CAIP2}) is the Ethereum L1 and is always refused, even when listed in the allowed networks` });
-    } else if (!cfg.networks.allowed.includes(ctx.chain)) {
-      // (2) membership — unchanged shape/message.
+    } else if (!cfg.networks.allowed.some((n) => normalizeCaip2Evm(n) === normalizeCaip2Evm(ctx.chain))) {
+      // (2) membership — canonical on both sides so allowlist entries and the
+      // probed chain compare numerically; unchanged shape/message.
       reasons.push({ code: "CHAIN_NOT_ALLOWED", message: `Chain '${ctx.chain}' is not in the allowed networks [${cfg.networks.allowed.join(", ")}]` });
-    } else if (isEvmNetwork(ctx.chain) && (chainCaip2 === undefined || !cfg.evm.facilitatorNetworks.includes(chainCaip2))) {
+    } else if (isEvmNetwork(ctx.chain) && (chainCaip2 === undefined || !cfg.evm.facilitatorNetworks.some((n) => normalizeCaip2Evm(n) === chainCaip2))) {
       // (3) facilitator settle-gate — an EVM chain the operator allowed is
       // still refused when the configured facilitator cannot settle its
       // CAIP-2 id. Fail closed: isEvmNetwork ⇒ caip2Of is defined, so the
