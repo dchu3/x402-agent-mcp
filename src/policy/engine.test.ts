@@ -25,6 +25,9 @@ function cfg(overrides: Partial<PolicyConfig> = {}): PolicyConfig {
     // enabling it is an operator opt-in (conflict B), so existing decisions
     // are unchanged.
     anomaly: { enabled: false, window: 20, warnZ: 2.0, denyZ: 3.0, minSamples: 5, seedFromDirectory: true, defaultTolerance: 2.0 },
+    // Issue #32: the facilitator settle-list (fail-closed rule-3 gate for
+    // EVM chains that passed networks.allowed).
+    evm: { facilitatorNetworks: ['eip155:8453', 'eip155:137', 'eip155:42161'] },
     ...overrides,
   };
 }
@@ -268,6 +271,150 @@ it('is deterministic: same input three times → identical output', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Issue #32 — rule 3 extended: THREE fail-closed sub-checks in fixed
+// precedence (L1 hard deny → networks.allowed membership → facilitator
+// settle-gate), each emitting the SINGLE CHAIN_NOT_ALLOWED code so existing
+// reason-count assertions stay intact. No new ReasonCode (fact 6).
+// ---------------------------------------------------------------------------
+
+describe('rule 3: multi-EVM network allowlist (issue #32)', () => {
+  it('the Ethereum L1 is hard-denied ALWAYS — even when listed in networks.allowed (alias or CAIP-2 literal)', () => {
+    const sloppy = cfg({ networks: { allowed: ['base', 'ethereum', 'eip155:1'] } });
+    const engine = new PolicyEngine({ config: sloppy, configErrors: [] });
+    for (const chain of ['ethereum', 'eip155:1']) {
+      const result = engine.evaluate(ctx({ chain }));
+      assert.equal(result.decision, 'DENY', `chain ${chain} must be refused despite the sloppy allowlist`);
+      assert.deepEqual(codes(result), ['CHAIN_NOT_ALLOWED'], 'exactly ONE chain reason (single-code contract)');
+      assert.match(result.reasons[0].message, /always refused/, 'the L1 hard-deny message explains the unconditional refusal');
+    }
+  });
+
+  it('membership still fires unchanged for chains outside the allowlist', () => {
+    const engine = new PolicyEngine({ config: cfg({ networks: { allowed: ['base'] } }), configErrors: [] });
+    const result = engine.evaluate(ctx({ chain: 'polygon' }));
+    assert.equal(result.decision, 'DENY');
+    assert.deepEqual(codes(result), ['CHAIN_NOT_ALLOWED']);
+    assert.match(result.reasons[0].message, /not in the allowed networks \[base\]/, 'the membership message keeps its pre-#32 shape');
+  });
+
+  it('facilitator gate: an allowed EVM chain the facilitator does not settle is denied (naming the facilitator list)', () => {
+    const engine = new PolicyEngine({
+      config: cfg({ networks: { allowed: ['base', 'polygon'] }, evm: { facilitatorNetworks: ['eip155:8453'] } }),
+      configErrors: [],
+    });
+    const result = engine.evaluate(ctx({ chain: 'polygon' }));
+    assert.equal(result.decision, 'DENY');
+    assert.deepEqual(codes(result), ['CHAIN_NOT_ALLOWED'], 'exactly ONE chain reason — the facilitator gate emits the existing code');
+    assert.match(result.reasons[0].message, /facilitator networks \[eip155:8453\]/);
+    // Base is still fine — it is in both lists.
+    const ok = engine.evaluate(ctx({ chain: 'base' }));
+    assert.equal(ok.decision, 'ALLOW');
+    assert.deepEqual(ok.reasons, []);
+  });
+
+  it('polygon/arbitrum ALLOW only when BOTH networks.allowed and the facilitator list admit them', () => {
+    // Default facilitator list (all three EVM ids) + opted-in aliases ⇒ ALLOW.
+    const optedIn = new PolicyEngine({
+      config: cfg({ networks: { allowed: ['base', 'solana', 'casper', 'polygon', 'arbitrum'] } }),
+      configErrors: [],
+    });
+    assert.equal(optedIn.evaluate(ctx({ chain: 'polygon' })).decision, 'ALLOW');
+    assert.equal(optedIn.evaluate(ctx({ chain: 'arbitrum' })).decision, 'ALLOW');
+    // Default facilitator list + compat allowlist (no polygon/arbitrum) ⇒ DENY by membership.
+    const compat = new PolicyEngine({ config: cfg(), configErrors: [] });
+    for (const chain of ['polygon', 'arbitrum']) {
+      const denied = compat.evaluate(ctx({ chain }));
+      assert.equal(denied.decision, 'DENY');
+      assert.deepEqual(codes(denied), ['CHAIN_NOT_ALLOWED']);
+    }
+  });
+
+  it('unknown EVM networks deny with the default facilitator list — verbatim CAIP-2, never aliased to base', () => {
+    // eip155:10 (Optimism) under the compat allowlist: membership deny.
+    const compat = new PolicyEngine({ config: cfg(), configErrors: [] });
+    const membership = compat.evaluate(ctx({ chain: 'eip155:10' }));
+    assert.equal(membership.decision, 'DENY');
+    assert.deepEqual(codes(membership), ['CHAIN_NOT_ALLOWED']);
+    // …and even when the operator allowlists the verbatim CAIP-2, the default
+    // facilitator list does not settle it: the facilitator gate fires.
+    const allowlisted = new PolicyEngine({
+      config: cfg({ networks: { allowed: ['base', 'eip155:10'] } }),
+      configErrors: [],
+    });
+    const gated = allowlisted.evaluate(ctx({ chain: 'eip155:10' }));
+    assert.equal(gated.decision, 'DENY');
+    assert.deepEqual(codes(gated), ['CHAIN_NOT_ALLOWED']);
+    assert.match(gated.reasons[0].message, /facilitator networks/);
+    // A non-EVM unrecognised chain ('optimism' is not in the vocabulary):
+    // membership deny under the compat allowlist.
+    const other = compat.evaluate(ctx({ chain: 'optimism' }));
+    assert.equal(other.decision, 'DENY');
+    assert.deepEqual(codes(other), ['CHAIN_NOT_ALLOWED']);
+  });
+
+  it('non-EVM chains skip the facilitator gate (solana/casper unaffected)', () => {
+    const engine = new PolicyEngine({ config: cfg(), configErrors: [] });
+    assert.equal(engine.evaluate(ctx({ chain: 'solana' })).decision, 'ALLOW');
+    assert.equal(engine.evaluate(ctx({ chain: 'casper', token: 'wCSPR' })).decision, 'ALLOW');
+  });
+
+  // Issue #32 review follow-up — canonical eip155 numeric normalization: the
+  // x402 SDK parses 'eip155:01' as chainId 1, so padded spellings must compare
+  // canonically everywhere rule 3 compares a raw string.
+  it('the L1 hard deny is airtight: a padded eip155:01 in BOTH lists is still refused (dev-loop reproduction)', () => {
+    const sloppy = cfg({
+      networks: { allowed: ['base', 'eip155:01'] },
+      evm: { facilitatorNetworks: ['eip155:01'] },
+    });
+    const engine = new PolicyEngine({ config: sloppy, configErrors: [] });
+    for (const chain of ['eip155:01', 'eip155:001']) {
+      const result = engine.evaluate(ctx({ chain }));
+      assert.equal(result.decision, 'DENY', `padded L1 form ${chain} must be refused`);
+      assert.deepEqual(codes(result), ['CHAIN_NOT_ALLOWED'], 'exactly ONE chain reason (single-code contract)');
+      assert.match(result.reasons[0].message, /always refused/, 'the L1 hard deny fires — never a membership allowance');
+    }
+    // The canonical L1 form stays refused under the same sloppy config.
+    assert.equal(engine.evaluate(ctx({ chain: 'eip155:1' })).decision, 'DENY');
+  });
+
+  it("padded and canonical spellings are the same chain for membership — both directions", () => {
+    // Canonical allowlist + facilitator entries match a padded probed chain.
+    const canonicalList = new PolicyEngine({
+      config: cfg({ networks: { allowed: ['base', 'eip155:8453'] }, evm: { facilitatorNetworks: ['eip155:8453'] } }),
+      configErrors: [],
+    });
+    assert.equal(canonicalList.evaluate(ctx({ chain: 'eip155:08453' })).decision, 'ALLOW');
+    // Padded allowlist + facilitator entries match a canonical probed chain.
+    const paddedList = new PolicyEngine({
+      config: cfg({ networks: { allowed: ['base', 'eip155:08453'] }, evm: { facilitatorNetworks: ['eip155:08453'] } }),
+      configErrors: [],
+    });
+    assert.equal(paddedList.evaluate(ctx({ chain: 'eip155:8453' })).decision, 'ALLOW');
+  });
+
+  it('numeric canonicalization stays surgical: distinct ids never merge, alias↔CAIP-2 stays literal', () => {
+    const engine = new PolicyEngine({
+      config: cfg({ networks: { allowed: ['base', 'eip155:8453'] }, evm: { facilitatorNetworks: ['eip155:8453'] } }),
+      configErrors: [],
+    });
+    // A different chain id is NOT the same chain, padded or not.
+    assert.equal(engine.evaluate(ctx({ chain: 'eip155:84531' })).decision, 'DENY');
+    // Aliases still compare literally to CAIP-2 spellings (pre-#32 behaviour).
+    assert.equal(engine.evaluate(ctx({ chain: 'eip155:137' })).decision, 'DENY');
+  });
+
+  it('at most one CHAIN_NOT_ALLOWED reason even when several sub-checks could fire', () => {
+    const engine = new PolicyEngine({
+      config: cfg({ networks: { allowed: ['base', 'ethereum'] }, evm: { facilitatorNetworks: [] } }),
+      configErrors: [],
+    });
+    const result = engine.evaluate(ctx({ chain: 'ethereum' })); // L1 listed AND facilitator list empty
+    assert.equal(result.decision, 'DENY');
+    assert.deepEqual(codes(result), ['CHAIN_NOT_ALLOWED'], 'L1 hard deny short-circuits — never a second chain reason');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Issue #26 — rule 4.5: the recipient gate (RECIPIENT_NOT_ALLOWED). The gate
 // sits between rule 4 (TOKEN_NOT_ALLOWED) and rule 5 (UNKNOWN_SERVICE) in the
 // fixed rule order. Two modes:
@@ -447,6 +594,105 @@ describe('rule 4.5: change-detect mode', () => {
       assert.equal(result.decision, 'DENY', `unusable baseline must deny even ${String(recipient)}`);
       assert.deepEqual(codes(result), ['RECIPIENT_NOT_ALLOWED']);
     }
+  });
+});
+
+describe('rule 4.5: chain-scoped recipient entries (issue #32, R6)', () => {
+  // ctx() defaults to chain 'base' / token 'USDC'; polygon chains need the
+  // alias opted into networks.allowed (the default facilitator list already
+  // settles eip155:137 / eip155:42161).
+  const MULTI_EVM = ['base', 'polygon', 'arbitrum'];
+
+  it('normalizeRecipient drives the gate on the new aliases: polygon/arbitrum canonicalise like base', () => {
+    const engine = new PolicyEngine({ config: rcptCfg(rcpt({ allowed: ['polygon:' + EVM_A] }), { networks: { allowed: MULTI_EVM } }), configErrors: [] });
+    const ok = engine.evaluate(ctx({ chain: 'polygon', recipient: EVM_A }));
+    assert.equal(ok.decision, 'ALLOW');
+  });
+
+  it('a bare 0x entry means base: allowed on base, DENIED on polygon (the issue acceptance criterion)', () => {
+    const engine = new PolicyEngine({ config: rcptCfg(rcpt({ allowed: [EVM_A] }), { networks: { allowed: MULTI_EVM } }), configErrors: [] });
+    const onBase = engine.evaluate(ctx({ chain: 'base', recipient: EVM_A }));
+    assert.equal(onBase.decision, 'ALLOW');
+    const onPolygon = engine.evaluate(ctx({ chain: 'polygon', recipient: EVM_A }));
+    assert.equal(onPolygon.decision, 'DENY', 'a bare Base approval must never widen onto Polygon');
+    assert.deepEqual(codes(onPolygon), ['RECIPIENT_NOT_ALLOWED']);
+  });
+
+  it('polygon:0x is allowed on polygon and denied on base; arbitrum:0x likewise', () => {
+    const engine = new PolicyEngine({
+      config: rcptCfg(rcpt({ allowed: [`polygon:${EVM_A}`, `arbitrum:${EVM_B}`] }), { networks: { allowed: MULTI_EVM } }),
+      configErrors: [],
+    });
+    assert.equal(engine.evaluate(ctx({ chain: 'polygon', recipient: EVM_A })).decision, 'ALLOW');
+    assert.equal(engine.evaluate(ctx({ chain: 'arbitrum', recipient: EVM_B })).decision, 'ALLOW');
+    const wrongChain = engine.evaluate(ctx({ chain: 'base', recipient: EVM_A }));
+    assert.equal(wrongChain.decision, 'DENY', 'the polygon-scoped entry must not satisfy base');
+    assert.deepEqual(codes(wrongChain), ['RECIPIENT_NOT_ALLOWED']);
+    const crossEvm = engine.evaluate(ctx({ chain: 'polygon', recipient: EVM_B }));
+    assert.equal(crossEvm.decision, 'DENY', 'the arbitrum-scoped entry must not satisfy polygon');
+  });
+
+  it('*:0x (any chain) is allowed on base, polygon and arbitrum alike', () => {
+    const engine = new PolicyEngine({ config: rcptCfg(rcpt({ allowed: [`*:${EVM_A}`] }), { networks: { allowed: MULTI_EVM } }), configErrors: [] });
+    for (const chain of MULTI_EVM) {
+      const result = engine.evaluate(ctx({ chain, recipient: EVM_A }));
+      assert.equal(result.decision, 'ALLOW', `*:${EVM_A} must satisfy ${chain}`);
+    }
+  });
+
+  it('an entry with an unrecognised chain qualifier is unusable — it never matches on any chain', () => {
+    const engine = new PolicyEngine({
+      config: rcptCfg(rcpt({ allowed: [`optimism:${EVM_A}`, `eip155:137:${EVM_B}`] }), { networks: { allowed: [...MULTI_EVM, 'eip155:10'] } }),
+      configErrors: [],
+    });
+    for (const [chain, recipient] of [['base', EVM_A], ['polygon', EVM_A], ['base', EVM_B], ['polygon', EVM_B]] as const) {
+      const result = engine.evaluate(ctx({ chain, recipient }));
+      assert.equal(result.decision, 'DENY', `unusable entry must never match (${chain} / ${recipient})`);
+      assert.deepEqual(codes(result), ['RECIPIENT_NOT_ALLOWED']);
+    }
+  });
+
+  it('the chain scope applies to perService lists exactly like the global list', () => {
+    const engine = new PolicyEngine({
+      config: rcptCfg(rcpt({ allowed: [EVM_A], perService: { 'example.com': [`polygon:${EVM_A}`] } }), { networks: { allowed: MULTI_EVM } }),
+      configErrors: [],
+    });
+    assert.equal(engine.evaluate(ctx({ chain: 'polygon', recipient: EVM_A })).decision, 'ALLOW');
+    const onBase = engine.evaluate(ctx({ chain: 'base', recipient: EVM_A }));
+    assert.equal(onBase.decision, 'DENY', 'on example.com the per-service polygon-scoped list REPLACES the global bare entry');
+  });
+
+  it('change-detect baselines are chain-scoped the same way', () => {
+    // polygon-scoped baseline: matches a polygon probed recipient, denies base.
+    const engine = new PolicyEngine({
+      config: rcptCfg({ mode: 'change-detect', allowed: [], perService: {}, known: { 'example.com': `polygon:${EVM_A}` } }, { networks: { allowed: MULTI_EVM } }),
+      configErrors: [],
+    });
+    const match = engine.evaluate(ctx({ chain: 'polygon', recipient: EVM_A }));
+    assert.equal(match.decision, 'ALLOW');
+    assert.deepEqual(match.reasons, []);
+    const outOfScope = engine.evaluate(ctx({ chain: 'base', recipient: EVM_A }));
+    assert.equal(outOfScope.decision, 'DENY', 'a polygon-scoped baseline is unusable on base — fail closed');
+    assert.deepEqual(codes(outOfScope), ['RECIPIENT_NOT_ALLOWED']);
+    // Wildcard baseline accepts on either chain; a bare baseline (base-scoped)
+    // DENIES on polygon — proven with the same host keyed separately.
+    const wild = new PolicyEngine({
+      config: rcptCfg({ mode: 'change-detect', allowed: [], perService: {}, known: { 'wild.example': `*:${EVM_A}`, 'legacy.example': EVM_A } }, { networks: { allowed: MULTI_EVM } }),
+      configErrors: [],
+    });
+    assert.equal(wild.evaluate(ctx({ service: 'wild.example', chain: 'polygon', recipient: EVM_A })).decision, 'ALLOW');
+    assert.equal(wild.evaluate(ctx({ service: 'wild.example', chain: 'base', recipient: EVM_A })).decision, 'ALLOW');
+    const legacyOnPolygon = wild.evaluate(ctx({ service: 'legacy.example', chain: 'polygon', recipient: EVM_A }));
+    assert.equal(legacyOnPolygon.decision, 'DENY', 'a bare baseline never widens onto polygon');
+    assert.equal(wild.evaluate(ctx({ service: 'legacy.example', chain: 'base', recipient: EVM_A })).decision, 'ALLOW');
+  });
+
+  it('bare non-EVM entries keep their pre-#32 meaning (solana/casper assertions untouched by the scoping)', () => {
+    const sol = new PolicyEngine({ config: rcptCfg(rcpt({ allowed: [SOL_A] })), configErrors: [] });
+    assert.equal(sol.evaluate(ctx({ chain: 'solana', recipient: SOL_A })).decision, 'ALLOW', 'a bare Solana entry still governs solana');
+    const casper = new PolicyEngine({ config: rcptCfg(rcpt({ allowed: [EVM_A] })), configErrors: [] });
+    const cross = casper.evaluate(ctx({ chain: 'polygon', recipient: EVM_A }));
+    assert.equal(cross.decision, 'DENY', 'a bare entry must not follow onto polygon even when it would normalise there');
   });
 });
 

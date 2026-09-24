@@ -26,7 +26,16 @@
     "allowed": [
       "solana",
       "base",
+      "polygon",
+      "arbitrum",
       "casper"
+    ]
+  },
+  "evm": {
+    "facilitatorNetworks": [
+      "eip155:8453",
+      "eip155:137",
+      "eip155:42161"
     ]
   },
   "tokens": {

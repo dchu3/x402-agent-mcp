@@ -10,13 +10,22 @@
 // stability review; reasons accumulate in this order, not first-only):
 //   1. SERVICE_BLOCKED          — trust level BLOCKED (or level configured deny)
 //   2. PAYMENTS_DISABLED        — global payments kill switch
-//   3. CHAIN_NOT_ALLOWED        — network allowlist
+//   3. CHAIN_NOT_ALLOWED        — network allowlist (issue #32: ONE reason,
+//      three fail-closed sub-checks in fixed precedence): (1) the Ethereum
+//      L1 is hard-denied ALWAYS, even when listed in networks.allowed;
+//      (2) networks.allowed membership (unchanged shape/message); (3) an EVM
+//      chain that passed membership is denied when the configured facilitator
+//      does not settle its CAIP-2 id (evm.facilitatorNetworks).
 //   4. TOKEN_NOT_ALLOWED        — token allowlist
 //   4.5 RECIPIENT_NOT_ALLOWED   — recipient gate (issue #26): allowlist mode is
 //      ACTIVE always (fail-closed on an empty effective list and on a
 //      missing/unusable probed recipient); change-detect mode is ACTIVE only
 //      for a host with a recorded baseline (denies only when the probed
 //      recipient differs from it). Comparison is on normalized recipients.
+//      Entries are chain-scoped (issue #32, R6): "<alias>:<address>" matches
+//      only that chain, "*:<address>" any chain, and a BARE address is the
+//      legacy unqualified form scoped to base (never widens onto a new EVM
+//      chain); an unrecognised qualifier makes the entry unusable.
 //   4.6 PRICE_ANOMALY           — price anomaly gate (issue #30): z-score (or
 //      fallback multiplier) of the payment amount against the per-service
 //      settled-amount baseline. Middle band ⇒ APPROVAL_REQUIRED, high band ⇒
@@ -35,7 +44,8 @@
 // (reaching the cap exactly is allowed).
 
 import { evaluatePriceAnomaly } from "./anomaly.js";
-import { normalizeRecipient } from "./recipient.js";
+import { normalizeRecipient, parseRecipientEntry, RECIPIENT_ANY_CHAIN } from "./recipient.js";
+import { aliasForCaip2, caip2Of, isEvmNetwork, L1_CAIP2, normalizeCaip2Evm } from "../evm/networks.js";
 import type {
   AnomalyInputs,
   PolicyBudgetState,
@@ -134,9 +144,35 @@ export class PolicyEngine {
       reasons.push({ code: "PAYMENTS_DISABLED", message: "Payments are disabled by policy (payments.enabled = false)" });
     }
 
-    // Rule 3: network allowlist.
-    if (!cfg.networks.allowed.includes(ctx.chain)) {
+    // Rule 3: network allowlist (issue #32). At most ONE CHAIN_NOT_ALLOWED
+    // reason, emitted by the first of three fail-closed sub-checks in fixed
+    // precedence — this keeps every existing reason-count assertion intact
+    // and the L1/facilitator denials route through the existing code (no new
+    // ReasonCode, fact 6).
+    // Issue #32 review follow-up: the x402 SDK parses 'eip155:01' as chainId
+    // 1, so EVERY eip155:<digits> comparison below runs on the canonical
+    // numeric form (normalizeCaip2Evm) — both sides — and the padded L1
+    // spellings hit the hard deny instead of aliasing past it. Aliases and
+    // non-EVM ids pass through normalizeCaip2Evm unchanged, so pre-#32
+    // comparisons keep their exact shape.
+    const chainCaip2 = caip2Of(ctx.chain);
+    if (chainCaip2 === L1_CAIP2) {
+      // (1) Ethereum L1 hard deny — refused ALWAYS, even when an operator
+      // lists 'ethereum' or 'eip155:1' (or a padded spelling) in
+      // networks.allowed (the issue: L1 settlement is out of scope for this
+      // agent, unconditionally). caip2Of already yields the canonical form,
+      // so 'eip155:01' compares equal to L1_CAIP2.
+      reasons.push({ code: "CHAIN_NOT_ALLOWED", message: `Chain '${ctx.chain}' (${L1_CAIP2}) is the Ethereum L1 and is always refused, even when listed in the allowed networks` });
+    } else if (!cfg.networks.allowed.some((n) => normalizeCaip2Evm(n) === normalizeCaip2Evm(ctx.chain))) {
+      // (2) membership — canonical on both sides so allowlist entries and the
+      // probed chain compare numerically; unchanged shape/message.
       reasons.push({ code: "CHAIN_NOT_ALLOWED", message: `Chain '${ctx.chain}' is not in the allowed networks [${cfg.networks.allowed.join(", ")}]` });
+    } else if (isEvmNetwork(ctx.chain) && (chainCaip2 === undefined || !cfg.evm.facilitatorNetworks.some((n) => normalizeCaip2Evm(n) === chainCaip2))) {
+      // (3) facilitator settle-gate — an EVM chain the operator allowed is
+      // still refused when the configured facilitator cannot settle its
+      // CAIP-2 id. Fail closed: isEvmNetwork ⇒ caip2Of is defined, so the
+      // undefined branch below is belt-and-braces, never a guess.
+      reasons.push({ code: "CHAIN_NOT_ALLOWED", message: `Chain '${ctx.chain}' is not settled by the configured facilitator networks [${cfg.evm.facilitatorNetworks.join(", ")}]` });
     }
 
     // Rule 4: token allowlist.
@@ -163,7 +199,14 @@ export class PolicyEngine {
         const canonical = normalizeRecipient(ctx.chain, ctx.recipient);
         if (canonical === undefined) {
           reasons.push({ code: "RECIPIENT_NOT_ALLOWED", message: `Probed recipient for ${rcptHost} is not a valid address for chain '${ctx.chain}' — allowlist mode fails closed` });
-        } else if (!effective.some((entry) => normalizeRecipient(ctx.chain, entry) === canonical)) {
+        } else if (!effective.some((entry) => {
+          // Issue #32 (R6): chain-scoped entries — an entry can satisfy the
+          // gate only for the chain its qualifier names ("*": any chain; bare
+          // legacy form: base). An unusable or out-of-scope entry never
+          // matches; comparison stays on the normalized address part.
+          const address = recipientEntryAddress(ctx.chain, entry);
+          return address !== undefined && normalizeRecipient(ctx.chain, address) === canonical;
+        })) {
           reasons.push({ code: "RECIPIENT_NOT_ALLOWED", message: `Recipient ${canonical} is not in the allowlist for ${rcptHost} (allowlist mode)` });
         }
       }
@@ -176,8 +219,13 @@ export class PolicyEngine {
         if (!ctx.recipient || ctx.recipient.trim() === "") {
           reasons.push({ code: "RECIPIENT_NOT_ALLOWED", message: `No recipient was probed for ${rcptHost} — change-detect cannot compare it against the recorded baseline and fails closed` });
         } else {
+          // Issue #32 (R6): the recorded baseline is chain-scoped like any
+          // allowlist entry — an out-of-scope or unparseable baseline is
+          // unusable, so it denies (fail-closed, exactly like a baseline that
+          // cannot be normalized).
           const probed = normalizeRecipient(ctx.chain, ctx.recipient);
-          const base = normalizeRecipient(ctx.chain, baseline);
+          const baselineAddress = recipientEntryAddress(ctx.chain, baseline);
+          const base = baselineAddress !== undefined ? normalizeRecipient(ctx.chain, baselineAddress) : undefined;
           if (probed === undefined || base === undefined || probed !== base) {
             reasons.push({ code: "RECIPIENT_NOT_ALLOWED", message: `Probed recipient ${probed ?? `(not a valid address for chain '${ctx.chain}')`} differs from the recorded baseline for ${rcptHost} (change-detect mode)` });
           }
@@ -256,4 +304,22 @@ function isSpendableAmount(amount: number): boolean {
 
 function finiteOrZero(value: number | undefined): number {
   return value !== undefined && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+/** Issue #32 (R6): resolve the address part of a chain-scoped recipient
+ * entry for the evaluated chain, or undefined when the entry is unusable for
+ * it (unrecognised qualifier, or a base-scoped bare/legacy form evaluated on
+ * a non-base EVM chain). The wildcard "*" scopes to every chain; a concrete
+ * alias scopes to exactly that alias; the BARE legacy form means base —
+ * pre-#32 the only EVM chain in the vocabulary — so on NON-EVM chains bare
+ * entries keep their pre-#32 meaning (the address form governs there), and
+ * on eip155:8453 (base itself) a bare entry still matches base. */
+function recipientEntryAddress(chain: string, entry: string): string | undefined {
+  const parsed = parseRecipientEntry(entry);
+  if (parsed === undefined) return undefined;
+  const inScope =
+    parsed.chain === RECIPIENT_ANY_CHAIN ||
+    parsed.chain === chain ||
+    (parsed.chain === "base" && (!isEvmNetwork(chain) || aliasForCaip2(chain) === "base"));
+  return inScope ? parsed.address : undefined;
 }

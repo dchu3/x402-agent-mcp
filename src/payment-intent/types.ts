@@ -16,7 +16,10 @@ export interface PaymentIntent {
   serviceId: string;
   /** The exact request URL. */
   serviceUrl: string;
-  /** Policy vocabulary chain: 'base' | 'solana' | 'casper'. */
+  /** Policy vocabulary chain: 'base' | 'polygon' | 'arbitrum' | 'solana' |
+   * 'casper' (issue #32), plus auto-detected verbatim CAIP-2 strings such as
+   * 'eip155:10' (they reach the intent only after policy ALLOWs them — the
+   * exact-CAIP-2 comparator in manager.ts binds them regardless). */
   chain: string;
   /** CAIP-2 network as the offer declares it (matched against the SDK selection). */
   network: string;

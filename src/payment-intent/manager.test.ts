@@ -277,3 +277,44 @@ it('comparator: Casper networks normalise via toCasperCaip2; everything else sta
   assert.equal(m.match, false);
   assert.ok(!m.match && m.field === 'network');
 });
+
+// ---------------------------------------------------------------------------
+// Issue #32 — exact-CAIP-2 binding across the new EVM chains. No logic
+// change: sameNetwork compares non-Casper networks as exact strings, and the
+// tests below pin that Base ≠ Polygon ≠ Arbitrum in BOTH directions — an
+// intent minted for one chain can never satisfy a requirement on another.
+// ---------------------------------------------------------------------------
+
+it('comparator: a Base intent never matches a Polygon/Arbitrum requirement (exact CAIP-2, issue #32)', () => {
+  const intent = created(offer({ chain: 'base', network: 'eip155:8453' }));
+  for (const network of ['eip155:137', 'eip155:42161', 'eip155:1', 'eip155:10']) {
+    const m = matchesRequirements(intent, req({ network }));
+    assert.equal(m.match, false, `a base intent must not satisfy ${network}`);
+    assert.ok(!m.match && m.field === 'network');
+  }
+});
+
+it('comparator: a Polygon intent never matches a Base requirement (and vice versa proven above)', () => {
+  const polygon = created(offer({ chain: 'polygon', network: 'eip155:137' }));
+  for (const network of ['eip155:8453', 'eip155:42161', 'eip155:1']) {
+    const m = matchesRequirements(polygon, req({ network }));
+    assert.equal(m.match, false, `a polygon intent must not satisfy ${network}`);
+    assert.ok(!m.match && m.field === 'network');
+  }
+  // Positive control: the same CAIP-2 matches exactly.
+  assert.deepEqual(matchesRequirements(polygon, req({ network: 'eip155:137' })), { match: true });
+  // An Arbitrum intent likewise matches only its own CAIP-2.
+  const arbitrum = created(offer({ chain: 'arbitrum', network: 'eip155:42161' }));
+  assert.deepEqual(matchesRequirements(arbitrum, req({ network: 'eip155:42161' })), { match: true });
+  const cross = matchesRequirements(arbitrum, req({ network: 'eip155:137' }));
+  assert.equal(cross.match, false);
+  assert.ok(!cross.match && cross.field === 'network');
+});
+
+it('comparator: a verbatim unrecognised CAIP-2 (auto-detected, policy-opted-in) binds exactly too — never aliased to base', () => {
+  const optimism = created(offer({ chain: 'eip155:10', network: 'eip155:10' }));
+  assert.deepEqual(matchesRequirements(optimism, req({ network: 'eip155:10' })), { match: true });
+  const m = matchesRequirements(optimism, req({ network: 'eip155:8453' }));
+  assert.equal(m.match, false);
+  assert.ok(!m.match && m.field === 'network');
+});

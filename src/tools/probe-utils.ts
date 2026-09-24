@@ -1,4 +1,5 @@
 import { CASPER_CHAIN, isCasperNetwork } from "../casper/networks.js";
+import { aliasForCaip2 } from "../evm/networks.js";
 
 /** Fetch a URL and return its parsed JSON body, or null on any failure
  * (network error, non-2xx, or body that is not valid JSON — e.g. an HTML
@@ -34,10 +35,16 @@ export function isX402Manifest(data: any): boolean {
   return false;
 }
 
-/** Map an x402 network identifier to a human chain name. */
+/** Map an x402 network identifier to a human chain name. Issue #32: EVM
+ * ids resolve through the shared CAIP-2 vocabulary (src/evm/networks.ts) —
+ * eip155:137 ⇒ "polygon", eip155:42161 ⇒ "arbitrum", eip155:1 ⇒ "ethereum",
+ * and an UNKNOWN eip155:* id returns VERBATIM (never "base" — that substring
+ * collapse was the #32 bug). Solana/Casper checks and the raw-string fallback
+ * are unchanged. */
 export function parseChainFromNetwork(network: string): string {
   if (network.includes("solana") || network.includes("5eykt4")) return "solana";
-  if (network.includes("eip155") || network.includes("8453")) return "base";
+  const evmAlias = aliasForCaip2(network);
+  if (evmAlias !== "") return evmAlias;
   if (isCasperNetwork(network)) return CASPER_CHAIN;
   return network;
 }

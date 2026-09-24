@@ -9,7 +9,9 @@ import { privateKeyToAccount } from "viem/accounts";
 import { fetchCasper, boundedText } from "./casper-fetch.js";
 import { casperBudget } from "../casper/budget.js";
 import { selectCasperAccept, assertPayableCasperAccept, casperAmountMotes } from "../casper/accepts.js";
-import { CASPER_CHAIN, isCasperNetwork, toCasperCaip2 } from "../casper/networks.js";
+import { CASPER_CHAIN, toCasperCaip2 } from "../casper/networks.js";
+import { caip2Of, isEvmNetwork, isUsdChain } from "../evm/networks.js";
+import { parseChainFromNetwork } from "./probe-utils.js";
 import { checkSpendingLimit, logPayment, getDailySpent, getMaxPerCall, getMaxDailySpend } from "../payment-utils.js";
 import { getPolicyEngine, buildPolicyContext } from "../policy/config.js";
 import { getPerServiceSpent, recordServicePayment } from "../policy/budget-store.js";
@@ -98,12 +100,12 @@ function intentAbortReasons(message: string): Array<{ code: string; message: str
 export function registerFetchTool(server: McpServer): void {
   server.tool(
     "x402_fetch",
-    "Fetch any x402-paid endpoint — handles 402 payment challenge automatically on Base, Solana or Casper. The agent never sees wallets or payment details. Just provide a URL and optional body.",
+    "Fetch any x402-paid endpoint — handles 402 payment challenge automatically on Base, Polygon, Arbitrum, Solana or Casper. The agent never sees wallets or payment details. Just provide a URL and optional body.",
     {
       url: z.string().describe("Full URL of the x402 endpoint (e.g. https://svm402.com/analyze)"),
       method: z.string().optional().describe("HTTP method: GET or POST (default: GET)"),
       body: z.string().optional().describe("JSON body for POST requests (as string)"),
-      chain: z.string().optional().describe("Force chain: 'solana', 'base' or 'casper'. Auto-detected if omitted."),
+      chain: z.enum(["base", "solana", "casper", "polygon", "arbitrum"]).optional().describe("Force chain: 'base', 'polygon', 'arbitrum', 'solana' or 'casper'. Auto-detected if omitted."),
     },
     async (args) => {
       const url = args.url;
@@ -133,17 +135,19 @@ export function registerFetchTool(server: McpServer): void {
       let casperIntent: PaymentIntent | null = null;
       let casperBlockedCode: IntentRejectCode | undefined;
 
-      // Forced-chain fix (#25): a forced base/solana chain must still OBSERVE
-      // the offer so the payment intent can bind it — via the same single
-      // free 402 probe the auto-detect path performs (a 402 response, no
-      // payment; no second network call is added). For forced base/solana the
-      // probe only observes: it never replaces the caller's chain and never
-      // refuses the HTTP request — a probe that yields no offer leaves
-      // probedOffer undefined and the guarded paid fetch below decides at
-      // signing time (blocking hook), preserving the pre-#25 pass-through for
-      // endpoints that do not actually charge. Forced Casper semantics and
-      // auto-detect behaviour are unchanged.
-      const forcedChain = useChain === "solana" || useChain === "base";
+      // Forced-chain fix (#25): a forced USD chain (solana or any EVM alias —
+      // issue #32 adds polygon/arbitrum, so a forced Polygon call must
+      // probe-and-observe exactly like forced Base) must still OBSERVE the
+      // offer so the payment intent can bind it — via the same single free
+      // 402 probe the auto-detect path performs (a 402 response, no payment;
+      // no second network call is added). For forced USD chains the probe
+      // only observes: it never replaces the caller's chain and never refuses
+      // the HTTP request — a probe that yields no offer leaves probedOffer
+      // undefined and the guarded paid fetch below decides at signing time
+      // (blocking hook), preserving the pre-#25 pass-through for endpoints
+      // that do not actually charge. Forced Casper semantics and auto-detect
+      // behaviour are unchanged.
+      const forcedChain = isUsdChain(useChain);
 
       if (!useChain || useChain === CASPER_CHAIN || forcedChain) {
         try {
@@ -195,25 +199,28 @@ export function registerFetchTool(server: McpServer): void {
 
             if (useChain === CASPER_CHAIN || forcedChain) {
               // Forced Casper still probes and validates a real offer below;
-              // forced base/solana keep the caller's chain — the probe only
+              // forced USD chains keep the caller's chain — the probe only
               // observed the offer above (never re-detects, never refutes it).
-            } else if (network.includes("solana") || network.includes("5eykt4")) {
-              useChain = "solana";
-            } else if (network.includes("eip155") || network.includes("8453")) {
-              useChain = "base";
-            } else if (isCasperNetwork(network)) {
-              useChain = CASPER_CHAIN;
             } else {
-              return {
-                content: [{
-                  type: "text" as const,
-                  text: JSON.stringify({
-                    error: "Could not auto-detect chain from 402 response",
-                    payment_info: JSON.stringify(paymentInfo).slice(0, 1000),
-                    hint: "Specify chain parameter: 'solana', 'base' or 'casper'",
-                  }),
-                }],
-              };
+              // Issue #32: chain detection resolves the offer's REAL CAIP-2 id
+              // through the shared vocabulary (parseChainFromNetwork →
+              // src/evm/networks.ts) — never the pre-#32 substring collapse
+              // that mapped every eip155:* onto base.
+              const detected = parseChainFromNetwork(network);
+              if (detected !== "" && (isUsdChain(detected) || detected === CASPER_CHAIN)) {
+                useChain = detected;
+              } else {
+                return {
+                  content: [{
+                    type: "text" as const,
+                    text: JSON.stringify({
+                      error: "Could not auto-detect chain from 402 response",
+                      payment_info: JSON.stringify(paymentInfo).slice(0, 1000),
+                      hint: "Specify chain parameter: 'solana', 'base', 'polygon', 'arbitrum' or 'casper'",
+                    }),
+                  }],
+                };
+              }
             }
 
             // Casper settles in wCSPR motes (9 decimals), not 6-decimal USDC.
@@ -277,7 +284,7 @@ export function registerFetchTool(server: McpServer): void {
             }
           }
         } catch (err: any) {
-          // A forced base/solana probe failure must not refuse a request the
+          // A forced USD-chain probe failure must not refuse a request the
           // pre-#25 forced flow never probed: no offer is bound, and any
           // actual charge below still aborts at the signing boundary (the
           // blocking hook), exactly as amendment 1 specifies.
@@ -301,11 +308,14 @@ export function registerFetchTool(server: McpServer): void {
           }],
         };
       }
-      if (useChain === "base" && !evmKey) {
+      // Issue #32: ANY EVM chain needs the EVM key (aliases and verbatim
+      // eip155:* ids alike) — base-sepolia / eip155:10 reach the same check;
+      // policy then denies whatever the allowlists do not admit.
+      if (isEvmNetwork(useChain) && !evmKey) {
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify({ error: "EVM_PRIVATE_KEY or BASE_PRIVATE_KEY not set. Cannot pay on Base." }),
+            text: JSON.stringify({ error: `EVM_PRIVATE_KEY or BASE_PRIVATE_KEY not set. Cannot pay on ${useChain}.` }),
           }],
         };
       }
@@ -341,8 +351,27 @@ export function registerFetchTool(server: McpServer): void {
         } else {
           const account = privateKeyToAccount(evmKey! as `0x${string}`);
           const evmSigner = toClientEvmSigner(account as any);
-          const scheme = new ExactEvmScheme(evmSigner, { rpcUrl: baseRpc });
-          client.register("eip155:8453" as `${string}:${string}`, scheme);
+          // Issue #32 (R5): per-chain RPC options — BASE_RPC_URL is scoped to
+          // chain 8453 ONLY (the EvmSchemeOptions by-chain-id form). Polygon /
+          // Arbitrum get NO RPC entry ⇒ no extension-enrichment backfill ⇒
+          // fail-closed toward the local EIP-3009 signing path, which needs no
+          // RPC (a per-chain RPC matrix is explicitly out of scope in #32).
+          const scheme = new ExactEvmScheme(evmSigner, { 8453: { rpcUrl: baseRpc } });
+          // Issue #32 (R4): register the CAIP-2 of the chain policy approved.
+          // useChain is auto-detected FROM the offer (auto-detect path) or
+          // caller-forced (forced path), so caip2Of(useChain) IS the offer's
+          // own CAIP-2 on every non-contradictory path and intent.network and
+          // the SDK requirements selection stay the same string. When a forced
+          // chain CONTRADICTS the offered network, registering useChain's
+          // CAIP-2 (never the offer's) is what keeps that case aborting before
+          // any signature — SDK "no network/scheme registered" for the
+          // unregistered requirement, or the intent hook's
+          // OFFER_MISMATCH:network for drift between probe and paid leg. A
+          // useChain without a CAIP-2 falls back to the offer's network; an
+          // undetermined registration matches nothing at selection time (fail
+          // closed, never a default chain).
+          const registerNetwork = caip2Of(useChain) ?? caip2Of(probedOffer?.network ?? "");
+          client.register(registerNetwork as `${string}:${string}`, scheme);
         }
 
         // Step 3.5: POLICY GATE (issue #19) — the outer gate every payment

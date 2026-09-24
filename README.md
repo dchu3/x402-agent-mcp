@@ -1,6 +1,6 @@
 # x402-agent-mcp
 
-**Universal x402 MCP for AI agents — discover and pay for any x402 endpoint on Base, Solana or Casper.**
+**Universal x402 MCP for AI agents — discover and pay for any x402 endpoint on Base, Polygon, Arbitrum, Solana or Casper.**
 
 Agents discover services, pay per call, and consume data — all autonomously. No API keys, no subscriptions, no signup. Just a wallet.
 
@@ -27,7 +27,7 @@ The agent never sees wallets, private keys, or x402 protocol details. Just searc
 | `x402_discover_urls` | Free | Batch discover multiple x402 services in parallel |
 | `x402_crawl_directory` | Free | Crawl x402scan.com to discover new x402 services and auto-add to directory |
 | `x402_check_payment` | Free | Evaluate a prospective payment against policy — ALLOW / DENY / APPROVAL_REQUIRED with reason codes. **Never pays.** |
-| `x402_fetch` | Endpoint price | Fetch any x402 endpoint — handles 402 payment on Base, Solana or Casper |
+| `x402_fetch` | Endpoint price | Fetch any x402 endpoint — handles 402 payment on Base, Polygon, Arbitrum, Solana or Casper |
 
 ## Multi-Chain Support
 
@@ -35,9 +35,11 @@ The agent never sees wallets, private keys, or x402 protocol details. Just searc
 |-------|---------|---------|
 | Solana | `SOLANA_PRIVATE_KEY` | USDC via @x402/svm |
 | Base | `EVM_PRIVATE_KEY` or `BASE_PRIVATE_KEY` | USDC via @x402/evm |
+| Polygon | `EVM_PRIVATE_KEY` or `BASE_PRIVATE_KEY` | USDC via @x402/evm |
+| Arbitrum | `EVM_PRIVATE_KEY` or `BASE_PRIVATE_KEY` | USDC via @x402/evm |
 | Casper | `CASPER_PRIVATE_KEY` | wCSPR via @make-software/casper-x402 |
 
-Chain is auto-detected from the 402 response. Override with `chain` parameter.
+Chain is auto-detected from the 402 response's real CAIP-2 network id (`eip155:8453` ⇒ base, `eip155:137` ⇒ polygon, `eip155:42161` ⇒ arbitrum — an unrecognised `eip155:*` id keeps its verbatim identity and is denied by the default policy, never collapsed onto base). Override with the `chain` parameter (`base`/`polygon`/`arbitrum`/`solana`/`casper`). All EVM chains share the one `EVM_PRIVATE_KEY`; the Ethereum L1 (`eip155:1`) is always refused (see rule 3). `BASE_RPC_URL` applies to Base only — EVM payments on Polygon/Arbitrum sign locally (EIP-3009) with no RPC dependency. Policy note: Polygon and Arbitrum are **opt-in** — add them to `networks.allowed` (and keep the facilitator settle-list `evm.facilitatorNetworks` covering their CAIP-2 ids) to make them payable; the default policy pays Base only among EVM chains.
 
 ### Casper
 
@@ -146,7 +148,7 @@ Decisions are exactly `ALLOW`, `DENY`, `APPROVAL_REQUIRED`. Every non-ALLOW resu
 | `REQUEST_LIMIT_EXCEEDED` | Amount above the per-request cap (level override or global); also fails closed on non-finite/negative amounts |
 | `DAILY_LIMIT_EXCEEDED` | Today's global spend + amount would exceed the daily cap |
 | `SERVICE_LIMIT_EXCEEDED` | Today's spend for this service would exceed its per-service daily cap |
-| `CHAIN_NOT_ALLOWED` | Chain not in the network allowlist |
+| `CHAIN_NOT_ALLOWED` | Chain not in the `networks.allowed` allowlist; or the Ethereum L1 (`ethereum` / `eip155:1`), which is always refused even when listed; or an allowed EVM chain the configured facilitator does not settle (`evm.facilitatorNetworks`) — one reason per evaluation, in that precedence (issue #32) |
 | `TOKEN_NOT_ALLOWED` | Token not in the token allowlist |
 | `SERVICE_BLOCKED` | Host is BLOCKED, or its trust level is configured to deny |
 | `UNKNOWN_SERVICE` | Host is not in the directory while `services.unknown` is configured to deny |
@@ -190,6 +192,7 @@ JSON via `POLICY_CONFIG_PATH` (no new dependencies), with `X402_POLICY_*` env ov
   },
   "networks": { "allowed": ["base", "solana", "casper"] },
   "tokens":   { "allowed": ["USDC", "wCSPR"] },
+  "evm":      { "facilitatorNetworks": ["eip155:8453", "eip155:137", "eip155:42161"] },
   "recipients": { "mode": "change-detect", "allowed": [], "perService": {}, "known": {} },
   "anomaly": { "enabled": false, "window": 20, "warnZ": 2.0, "denyZ": 3.0, "minSamples": 5, "seedFromDirectory": true, "defaultTolerance": 2.0 }
 }
@@ -207,7 +210,7 @@ The example above **is** the behavior-compat default: non-directory hosts are pa
 }
 ```
 
-**Recipients (issue #26).** The `recipients` block gates *who* may be paid — rule 4.5 emits `RECIPIENT_NOT_ALLOWED`. Comparison happens on the **normalized (canonical)** recipient, chain-aware: EVM `0x…` addresses are compared case-insensitively against their EIP-55-valid spelling (a wrong-checksum spelling is not repaired — it is unusable), Solana wallets as the canonical 32-byte base58 re-encoding, Casper payTo as `00` + 64 hex with an optional `account-hash-` prefix stripped. Formatting can therefore never bypass or break the gate. Two modes:
+**Recipients (issue #26).** The `recipients` block gates *who* may be paid — rule 4.5 emits `RECIPIENT_NOT_ALLOWED`. Comparison happens on the **normalized (canonical)** recipient, chain-aware: EVM `0x…` addresses are compared case-insensitively against their EIP-55-valid spelling (a wrong-checksum spelling is not repaired — it is unusable) on **every** EVM chain in the vocabulary (`base`, `polygon`, `arbitrum`, `base-sepolia`, any `eip155:*` id — issue #32), Solana wallets as the canonical 32-byte base58 re-encoding, Casper payTo as `00` + 64 hex with an optional `account-hash-` prefix stripped. Formatting can therefore never bypass or break the gate. Entries are **chain-scoped** (issue #32): `"polygon:0x…"` matches only on polygon, `"*:0x…"` on any chain, and a **bare** entry (no qualifier) is the legacy unqualified form scoped to **base** — pre-#32 the only EVM chain in the vocabulary, so an existing bare Base approval keeps exactly its old meaning and can never silently authorise the same `0x…` address on Polygon. An entry with an unrecognised qualifier is unusable (fail closed). Two modes:
 
 - **`allowlist` — active always, fail-closed.** A payment is refused unless the probed recipient normalizes to an entry on the *effective* allowlist for the host: `recipients.perService[host]` **replaces** the global `recipients.allowed` list when present (keys are lowercase hostnames). An **empty effective list denies every recipient**, and a missing or unusable probed recipient is denied too — membership can never be proven.
 - **`change-detect` — active only for a host with a recorded baseline.** `recipients.known` maps a lowercase hostname to its expected recipient (e.g. `"known": { "merchant.example": "00ab…" }`); the payment is refused when the probed recipient differs from the baseline. With no baseline for the host nothing fires — nothing to compare. This is the compat default (empty `known` ⇒ inactive).
@@ -279,6 +282,7 @@ Env overrides (each fails closed on a malformed value — never silently ignored
 | `X402_POLICY_MAX_DAILY` | global daily cap |
 | `X402_POLICY_NETWORKS` | comma-separated network allowlist |
 | `X402_POLICY_TOKENS` | comma-separated token allowlist |
+| `X402_EVM_FACILITATOR_NETWORKS` | comma-separated CAIP-2 ids the facilitator settles (issue #32) |
 | `X402_POLICY_SERVICE_<LEVEL>` | `allow` / `deny` / `approval` for `unknown\|discovered\|verified\|trusted\|blocked` |
 | `X402_POLICY_SERVICE_<LEVEL>_MAX_PER_REQUEST` / `_MAX_DAILY` | per-level caps |
 | `POLICY_TRUSTED_HOSTS` / `POLICY_BLOCKED_HOSTS` | comma-separated hostnames for the `TRUSTED` / `BLOCKED` trust levels |
@@ -289,7 +293,7 @@ Env overrides (each fails closed on a malformed value — never silently ignored
 
 1. **`APPROVAL_REQUIRED` is a refusal in Phase 1.** This MCP runs over stdio and has no human-approval channel; returning a decision the agent could treat as "pending" would be worse than refusing. The engine returns `APPROVAL_REQUIRED` with that reason code preserved, and `x402_fetch` refuses to pay — the issue's fail-closed principle applied to the approval gap.
 
-2. **The default policy reproduces pre-policy behavior exactly** (the explicit backwards-compatibility decision the issue demands — made explicit here rather than silently weakening the safety model): payments enabled, caps from `MAX_PAYMENT_PER_CALL` (default $0.50) / `MAX_DAILY_SPEND` (default $10.00), networks `[base, solana, casper]`, tokens `[USDC, wCSPR]`, every directory service payable at the global caps, `services.unknown: allow` — because today **any** host is payable at the global caps (directory membership plays no role in the pre-policy gate) — and the recipient gate inactive (`recipients` defaults to `change-detect` with no baselines). The unchanged test suite is the proof of that compatibility. Tightening — e.g. `services.unknown: "deny"` so non-directory hosts are refused, or a recipient `allowlist` — is opt-in via config. The zero-behavior-change claim is test-locked: the full pre-existing suite passes unchanged under the default policy, and the fetch integration tests assert both the refusal path and the untouched default path.
+2. **The default policy reproduces pre-policy behavior exactly** (the explicit backwards-compatibility decision the issue demands — made explicit here rather than silently weakening the safety model): payments enabled, caps from `MAX_PAYMENT_PER_CALL` (default $0.50) / `MAX_DAILY_SPEND` (default $10.00), networks `[base, solana, casper]`, tokens `[USDC, wCSPR]`, every directory service payable at the global caps, `services.unknown: allow` — because today **any** host is payable at the global caps (directory membership plays no role in the pre-policy gate) — and the recipient gate inactive (`recipients` defaults to `change-detect` with no baselines). **Polygon and Arbitrum are deliberately NOT in the compat default allowlist** (issue #32): widening the set of payable chains is a money-path change and ships opt-in only — add `"polygon", "arbitrum"` to `networks.allowed` to enable them (the default facilitator settle-list `evm.facilitatorNetworks` already covers their CAIP-2 ids; it is a fail-closed gate consulted only for chains that passed `networks.allowed`, never an authorisation source). The unchanged test suite is the proof of that compatibility. Tightening — e.g. `services.unknown: "deny"` so non-directory hosts are refused, or a recipient `allowlist` — is opt-in via config. The zero-behavior-change claim is test-locked: the full pre-existing suite passes unchanged under the default policy, and the fetch integration tests assert both the refusal path and the untouched default path.
 
 ### Inspecting a payment without paying
 
@@ -319,7 +323,7 @@ Deliberately **not** in Phase 1 (future extensions, tracked separately in issue 
 
 ## Payment Intent Boundary (issue #25)
 
-Between the policy decision and the wallet there is a second, internal authorisation boundary. The layers have distinct jobs — **policy engine: "is this permitted?"; payment intent: "exactly what was authorised"; executor: "how it is executed"** on Base, Solana or Casper. After the policy gate returns `ALLOW`, `x402_fetch` binds the evaluated offer (service, URL, chain, CAIP-2 network, token, asset, integer atomic amount, recipient, scheme) into a short-lived, immutable **payment intent**, and the payment layer can only sign through an intent-validating executor:
+Between the policy decision and the wallet there is a second, internal authorisation boundary. The layers have distinct jobs — **policy engine: "is this permitted?"; payment intent: "exactly what was authorised"; executor: "how it is executed"** on Base, Polygon, Arbitrum, Solana or Casper. After the policy gate returns `ALLOW`, `x402_fetch` binds the evaluated offer (service, URL, chain, CAIP-2 network, token, asset, integer atomic amount, recipient, scheme) into a short-lived, immutable **payment intent**, and the payment layer can only sign through an intent-validating executor:
 
 ```
 LLM input (URL/method/body — no payment parameters)

@@ -942,3 +942,191 @@ it('price anomaly: the compat default keeps the flow untouched — the spike pay
   // opt-in rehydrates the history — but reads stay gated on enabled.
   assert.deepEqual(store.getBaseline(host)!.samples, [0.05]);
 });
+
+// ---------------------------------------------------------------------------
+// Issue #32 — multi-EVM CAIP-2 in x402_fetch: the offer's real CAIP-2 id
+// decides the chain (never the eip155-substring collapse), the client
+// registers exactly that CAIP-2, RPC options are per-chain (BASE_RPC_URL is
+// scoped to 8453 only), and policy denies Polygon/Arbitrum by default
+// (opt-in, R2). Fail-closed contract: a denied or undetermined chain never
+// produces a signature.
+// ---------------------------------------------------------------------------
+
+const POLYGON_CAIP2 = 'eip155:137';
+const ARBITRUM_CAIP2 = 'eip155:42161';
+// Well-known public protocol identifiers (same convention as BASE_USDC_ADDRESS
+// above): the native USDC contracts on Polygon / Arbitrum — asset ids, not secrets.
+const POLYGON_USDC_ADDRESS = '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359';
+const ARBITRUM_USDC_ADDRESS = '0xaf88d065e77c8cC2239327C5EDb3A432268e5831';
+const POLYGON_PAYTO = '0x3333333333333333333333333333333333333333';
+
+/** v2 challenge the EVM scheme signs fully locally (EIP-3009 signTypedData) —
+ * extra.name/version are the EIP-712 domain parameters; parameterised by
+ * network/asset so the SAME shape serves base, polygon or arbitrum. */
+function chargeableEvmChallenge(requestUrl: string, network: string, asset: string) {
+  const payload = JSON.stringify({
+    x402Version: 2,
+    resource: { url: requestUrl, description: '', mimeType: 'text/plain' },
+    accepts: [{ scheme: 'exact', network, asset, amount: '10000', payTo: POLYGON_PAYTO, maxTimeoutSeconds: 60, extra: { name: 'USD Coin', version: '2' } }],
+  });
+  return new Response('Payment Required', { status: 402, headers: { 'payment-required': b64url(payload) } });
+}
+
+function signatureHeaderNetwork(input: unknown, init: unknown): string | null {
+  const headers = new Headers(input instanceof Request ? input.headers : (init as any)?.headers);
+  const sig = headers.get('payment-signature');
+  if (!sig) return null;
+  try {
+    const decoded = JSON.parse(Buffer.from(sig, 'base64').toString('utf-8'));
+    return decoded?.accepted?.network ?? null;
+  } catch {
+    return null;
+  }
+}
+
+it('multi-EVM: a eip155:137 challenge probes as chain polygon and the default policy refuses it BEFORE any payment attempt', async () => {
+  process.env.EVM_PRIVATE_KEY = `0x${'11'.repeat(32)}`;
+  const url = 'https://polygon-default-deny-test.invalid/api';
+  const before = ledgerLines();
+  let calls = 0;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    calls++;
+    assert.equal(noSignatureHeader(input, init), false, 'no signature may ever be created for a denied chain');
+    return chargeableEvmChallenge(url, POLYGON_CAIP2, POLYGON_USDC_ADDRESS);
+  }) as any;
+  const result = await handler()({ url });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(calls, 1, 'only the 402 probe may run — no payment attempt for a refused chain');
+  assert.equal(parsed.chain, 'polygon', 'the real CAIP-2 id decides the chain — never the old base collapse');
+  assert.equal(parsed.policy_decision, 'DENY');
+  assert.ok(parsed.reasons.some((r: any) => r.code === 'CHAIN_NOT_ALLOWED'), 'polygon is opt-in (R2): the compat allowlist refuses it');
+  assert.match(parsed.reasons.find((r: any) => r.code === 'CHAIN_NOT_ALLOWED').message, /not in the allowed networks/);
+  assert.deepEqual(ledgerLines(), before, 'a policy DENY must not write to the payment ledger');
+});
+
+it('multi-EVM: opted-in polygon pays end-to-end — the registered scheme is eip155:137 exactly (no eip155:8453 registration)', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  process.env.EVM_PRIVATE_KEY = `0x${'11'.repeat(32)}`;
+  process.env.POLICY_CONFIG_PATH = policyConfigFile({
+    payments: { enabled: true, maxPerRequest: 0.5, maxDaily: 10 },
+    networks: { allowed: ['base', 'solana', 'casper', 'polygon', 'arbitrum'] },
+  });
+  const url = 'https://polygon-happy-test.invalid/api';
+  let probes = 0, paidAttempts = 0, signedRetries = 0;
+  const signedNetworks: Array<string | null> = [];
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    const urlStr = input instanceof Request ? input.url : String(input);
+    assert.equal(urlStr, url, 'the EVM path must make no other network calls (eip155:137 gets NO RPC options)');
+    if (noSignatureHeader(input, init)) {
+      signedRetries++;
+      signedNetworks.push(signatureHeaderNetwork(input, init));
+      return new Response('{"result":"ok"}', { status: 200, headers: { 'PAYMENT-RESPONSE': receiptB64 } });
+    }
+    if (probes === 0) { probes++; return chargeableEvmChallenge(url, POLYGON_CAIP2, POLYGON_USDC_ADDRESS); }
+    paidAttempts++;
+    // The paid leg's ONLY accept is eip155:137 — a client that registered
+    // eip155:8453 could never select it (SDK "no network/scheme registered"),
+    // so reaching the signed retry proves the offer's own CAIP-2 was registered.
+    return chargeableEvmChallenge(url, POLYGON_CAIP2, POLYGON_USDC_ADDRESS);
+  }) as any;
+  const before = ledgerLines();
+  const result = await handler()({ url });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(probes, 1, 'auto-detect ran the single free probe');
+  assert.equal(paidAttempts, 1);
+  assert.equal(signedRetries, 1, 'the payment was signed on polygon and retried');
+  assert.deepEqual(signedNetworks, [POLYGON_CAIP2], 'the SIGNED payload binds eip155:137 — not base');
+  assert.equal(parsed.status, 200);
+  assert.equal(parsed.paid, true);
+  assert.equal(parsed.chain, 'polygon');
+  assert.equal(parsed.cost_usdc, 0.01);
+  const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
+  assert.equal(entries.find((e: any) => e.url === url)?.chain, 'polygon', 'the ledger records the real chain');
+  assert.equal(entries.find((e: any) => e.url === url)?.status, 'success');
+});
+
+it('multi-EVM: forced chain polygon still probes-and-observes the offer (the #25 amendment-1 semantics cover the new aliases)', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  process.env.EVM_PRIVATE_KEY = `0x${'11'.repeat(32)}`;
+  process.env.POLICY_CONFIG_PATH = policyConfigFile({
+    payments: { enabled: true, maxPerRequest: 0.5, maxDaily: 10 },
+    networks: { allowed: ['base', 'solana', 'casper', 'polygon'] },
+  });
+  const url = 'https://polygon-forced-happy-test.invalid/api';
+  let probes = 0, paidAttempts = 0, signedRetries = 0;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    const urlStr = input instanceof Request ? input.url : String(input);
+    assert.equal(urlStr, url, 'no other endpoint call may happen');
+    if (noSignatureHeader(input, init)) {
+      signedRetries++;
+      assert.equal(signatureHeaderNetwork(input, init), POLYGON_CAIP2, 'the signed payload binds the offer the probe observed');
+      return new Response('{"result":"ok"}', { status: 200 });
+    }
+    if (probes === 0) { probes++; return chargeableEvmChallenge(url, POLYGON_CAIP2, POLYGON_USDC_ADDRESS); }
+    paidAttempts++;
+    return chargeableEvmChallenge(url, POLYGON_CAIP2, POLYGON_USDC_ADDRESS);
+  }) as any;
+  const result = await handler()({ url, chain: 'polygon' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(probes, 1, 'a forced polygon chain must still run the single free probe');
+  assert.equal(paidAttempts, 1);
+  assert.equal(signedRetries, 1, 'the payment was signed and completed — the new aliases enjoy the same forced-chain semantics');
+  assert.equal(parsed.status, 200);
+  assert.equal(parsed.paid, true);
+  assert.equal(parsed.chain, 'polygon');
+});
+
+it('multi-EVM: a forced chain contradicting the offered network aborts BEFORE any signature (SDK no-registered-network, never a swap)', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  process.env.EVM_PRIVATE_KEY = `0x${'11'.repeat(32)}`;
+  process.env.POLICY_CONFIG_PATH = policyConfigFile({
+    payments: { enabled: true, maxPerRequest: 0.5, maxDaily: 10 },
+    networks: { allowed: ['base', 'solana', 'casper', 'polygon'] },
+  });
+  const url = 'https://polygon-forced-contradict-test.invalid/api';
+  let probes = 0, paidAttempts = 0, signedRetries = 0;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    assert.equal(noSignatureHeader(input, init), false, 'no signature may ever exist for the contradicting (arbitrum) offer — it is not allowlisted');
+    if (probes === 0) { probes++; return chargeableEvmChallenge(url, ARBITRUM_CAIP2, ARBITRUM_USDC_ADDRESS); }
+    paidAttempts++;
+    return chargeableEvmChallenge(url, ARBITRUM_CAIP2, ARBITRUM_USDC_ADDRESS);
+  }) as any;
+  const before = ledgerLines();
+  // Forced polygon (allowlisted), but the probe observes an ARBITRUM offer
+  // (not allowlisted): the client registers the APPROVED chain's CAIP-2
+  // (eip155:137), the SDK cannot select the arbitrum requirement, and the
+  // intent the probe bound (network eip155:42161) is never signed.
+  const result = await handler()({ url, chain: 'polygon' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(probes, 1, 'the probe still observes the offer');
+  assert.equal(paidAttempts, 1, 'the HTTP request itself is never refused (amendment 1) — the refusal lands before signing');
+  assert.equal(signedRetries, 0, 'no signature for the contradicting chain');
+  assert.match(parsed.error, /x402 payment failed/, 'the SDK refuses to select an unregistered network');
+  const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
+  assert.ok(!entries.some((e: any) => e.url === url && e.status === 'success'), 'no ledger success for the contradicted offer');
+});
+
+it('multi-EVM drift: the probe binds base but the paid leg serves a polygon-only challenge — aborted before any signature', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  process.env.EVM_PRIVATE_KEY = `0x${'11'.repeat(32)}`;
+  const url = 'https://multi-evm-drift-test.invalid/api';
+  let calls = 0;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    calls++;
+    assert.equal(noSignatureHeader(input, init), false, 'a signature must never exist for the drifted offer');
+    if (calls === 1) return chargeableEvmChallenge(url, BASE_CAIP2, BASE_USDC_ADDRESS); // probe binds eip155:8453
+    return chargeableEvmChallenge(url, POLYGON_CAIP2, POLYGON_USDC_ADDRESS); // paid leg: eip155:137 only — no registered scheme matches
+  }) as any;
+  const before = ledgerLines();
+  const result = await handler()({ url });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(calls, 2, 'probe + one paid attempt — the abort precedes any signed retry');
+  assert.match(parsed.error, /x402 payment failed/, 'the SDK refuses to select an unregistered network');
+  const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
+  assert.ok(!entries.some((e: any) => e.url === url && e.status === 'success'), 'no ledger success for the drifted offer');
+  assert.equal(entries.find((e: any) => e.url === url)?.status, 'failed', 'the aborted attempt is audited like any other failure');
+});

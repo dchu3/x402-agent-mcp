@@ -483,3 +483,108 @@ it('DEFAULT_POLICY_CONFIG is the documented compat default and is not mutated by
   loadPolicyConfig();
   assert.equal(JSON.stringify(DEFAULT_POLICY_CONFIG), snapshot, 'loadPolicyConfig must never mutate the default template');
 });
+// ---------------------------------------------------------------------------
+// Issue #32 — the top-level `evm` block (facilitator settle-list, rule 3's
+// fail-closed gate) and the L1 always-deny. Strict validation like every
+// other block: unknown keys anywhere are errors, and facilitatorNetworks
+// entries must be CAIP-2 eip155:<chainId> ids. The compat default covers the
+// three EVM mainnet ids; networks.allowed itself is NOT widened (R2 —
+// Polygon/Arbitrum payability stays opt-in).
+// ---------------------------------------------------------------------------
+
+const DEFAULT_FACILITATOR_NETWORKS = ['eip155:8453', 'eip155:137', 'eip155:42161'];
+
+it('the default evm.facilitatorNetworks is the three EVM mainnet CAIP-2 ids (base, polygon, arbitrum)', () => {
+  const state = loadPolicyConfig();
+  assert.deepEqual(state.configErrors, []);
+  assert.deepEqual(state.config.evm.facilitatorNetworks, DEFAULT_FACILITATOR_NETWORKS);
+  assert.deepEqual(DEFAULT_POLICY_CONFIG.evm, { facilitatorNetworks: DEFAULT_FACILITATOR_NETWORKS });
+  // R2: the compat default network allowlist is NOT widened.
+  assert.deepEqual(state.config.networks.allowed, ['base', 'solana', 'casper']);
+});
+
+it('a file with a valid evm block loads clean and replaces the default settle-list', () => {
+  process.env.POLICY_CONFIG_PATH = configFile('evm-valid.json', validFileJson({
+    evm: { facilitatorNetworks: ['eip155:8453'] },
+  }));
+  const state = loadPolicyConfig();
+  assert.deepEqual(state.configErrors, []);
+  assert.deepEqual(state.config.evm.facilitatorNetworks, ['eip155:8453']);
+  assert.deepEqual(DEFAULT_POLICY_CONFIG.evm.facilitatorNetworks, DEFAULT_FACILITATOR_NETWORKS, 'the default template stays pristine');
+});
+
+it('malformed evm blocks fail closed (CONFIG_INVALID): non-object, non-CAIP-2 entries, unknown keys', () => {
+  for (const bad of [
+    'yes',                                                     // not an object at all
+    { facilitatorNetworks: 'eip155:8453' },                    // not an array
+    { facilitatorNetworks: ['base'] },                         // not a CAIP-2 eip155 id
+    { facilitatorNetworks: ['eip155:8453', ''] },              // empty-string entry
+    { facilitatorNetworks: ['eip155:8453:2'] },                // malformed CAIP-2
+    { facilitatorNetworks: [42] },                             // non-string entry
+    { facilitatorNetworks: ['eip155:8453'], networks: [] },    // unknown key (typo protection)
+  ]) {
+    process.env.POLICY_CONFIG_PATH = configFile('evm-bad.json', validFileJson({ evm: bad }));
+    const result = getPolicyEngine().evaluate(discoveredCtx);
+    assert.equal(result.decision, 'DENY', `evm block ${JSON.stringify(bad)} must fail closed`);
+    assert.ok(result.reasons.some((r) => r.code === 'CONFIG_INVALID'));
+  }
+});
+
+it('a file WITHOUT an evm block keeps the default facilitator settle-list', () => {
+  process.env.POLICY_CONFIG_PATH = configFile('no-evm.json', validFileJson());
+  const state = loadPolicyConfig();
+  assert.deepEqual(state.configErrors, []);
+  assert.deepEqual(state.config.evm.facilitatorNetworks, DEFAULT_FACILITATOR_NETWORKS);
+});
+
+it('X402_EVM_FACILITATOR_NETWORKS overrides the settle-list; malformed values fail closed', () => {
+  process.env.X402_EVM_FACILITATOR_NETWORKS = 'eip155:8453, eip155:137';
+  const state = loadPolicyConfig();
+  assert.deepEqual(state.configErrors, []);
+  assert.deepEqual(state.config.evm.facilitatorNetworks, ['eip155:8453', 'eip155:137']);
+
+  process.env = { ...baseEnv };
+  process.env.X402_EVM_FACILITATOR_NETWORKS = 'eip155:8453,,eip155:137'; // empty entry — malformed
+  const result = getPolicyEngine().evaluate(discoveredCtx);
+  assert.equal(result.decision, 'DENY');
+  assert.ok(result.reasons.some((r) => r.code === 'CONFIG_INVALID' && r.message.includes('X402_EVM_FACILITATOR_NETWORKS')));
+});
+
+it('a sloppy allowlist still cannot pay the Ethereum L1 — rule 3 hard-denies it (file-loaded config)', () => {
+  process.env.POLICY_CONFIG_PATH = configFile('l1-sloppy.json', validFileJson({
+    networks: { allowed: ['base', 'solana', 'casper', 'ethereum', 'eip155:1'] },
+  }));
+  const engine = getPolicyEngine();
+  for (const chain of ['ethereum', 'eip155:1']) {
+    const result = engine.evaluate({ ...discoveredCtx, chain });
+    assert.equal(result.decision, 'DENY', `chain ${chain} must be refused despite being listed`);
+    assert.deepEqual(result.reasons.map((r) => r.code), ['CHAIN_NOT_ALLOWED']);
+  }
+});
+
+it('the facilitator gate denies an allowed-but-unsettled EVM chain through the real loader', () => {
+  process.env.POLICY_CONFIG_PATH = configFile('evm-gate.json', validFileJson({
+    networks: { allowed: ['base', 'polygon'] },
+    evm: { facilitatorNetworks: ['eip155:8453'] },
+  }));
+  const engine = getPolicyEngine();
+  const result = engine.evaluate({ ...discoveredCtx, chain: 'polygon' });
+  assert.equal(result.decision, 'DENY');
+  assert.deepEqual(result.reasons.map((r) => r.code), ['CHAIN_NOT_ALLOWED']);
+  // …and ALLOWs once both lists admit the alias.
+  process.env.POLICY_CONFIG_PATH = configFile('evm-open.json', validFileJson({
+    networks: { allowed: ['base', 'polygon', 'arbitrum'] },
+  }));
+  const open = getPolicyEngine();
+  assert.equal(open.evaluate({ ...discoveredCtx, chain: 'polygon' }).decision, 'ALLOW');
+  assert.equal(open.evaluate({ ...discoveredCtx, chain: 'arbitrum' }).decision, 'ALLOW');
+});
+
+it('loading an evm-bearing file never mutates DEFAULT_POLICY_CONFIG', () => {
+  const snapshot = JSON.stringify(DEFAULT_POLICY_CONFIG);
+  process.env.POLICY_CONFIG_PATH = configFile('evm-snapshot.json', validFileJson({
+    evm: { facilitatorNetworks: ['eip155:8453'] },
+  }));
+  loadPolicyConfig();
+  assert.equal(JSON.stringify(DEFAULT_POLICY_CONFIG), snapshot, 'loadPolicyConfig must never mutate the default template (evm included)');
+});

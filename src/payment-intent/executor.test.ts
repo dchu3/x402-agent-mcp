@@ -283,3 +283,34 @@ it('the blocking hook always aborts with INTENT_UNAUTHORISED:<code>, regardless 
   assert.deepEqual(await hook(matchingCtx as any), { abort: true, reason: 'INTENT_UNAUTHORISED:AMOUNT_UNBINDABLE' });
   assert.deepEqual(await hook(undefined as any), { abort: true, reason: 'INTENT_UNAUTHORISED:AMOUNT_UNBINDABLE' });
 });
+
+// ---------------------------------------------------------------------------
+// Issue #32 — the enforcement hook across the new EVM chains: drift between
+// the authorised intent's CAIP-2 and the SDK-selected requirement aborts
+// BEFORE signing, in both directions.
+// ---------------------------------------------------------------------------
+
+it('the enforcement hook aborts when a Base intent faces a Polygon/Arbitrum requirement (network drift, issue #32)', async () => {
+  for (const network of ['eip155:137', 'eip155:42161']) {
+    _resetRegistryForTests();
+    const intent = makeIntent(); // base, eip155:8453
+    const hook = intentEnforcement({ intent, manager: intentManager, executorLabel: 'x402_fetch' });
+    const res = await hook(ctx({ network }));
+    assert.deepEqual(res, { abort: true, reason: 'INTENT_OFFER_MISMATCH:network' }, `${network} must abort a base intent`);
+    const still = intentManager.validate(intent);
+    assert.ok(still.valid === true, 'a network drift must not consume the intent');
+  }
+});
+
+it('a Polygon intent passes through on an exact eip155:137 requirement and aborts on Base', async () => {
+  _resetRegistryForTests();
+  const intent = makeIntent({ chain: 'polygon', network: 'eip155:137' });
+  const hook = intentEnforcement({ intent, manager: intentManager, executorLabel: 'x402_fetch' });
+  const drifted = await hook(ctx({ network: 'eip155:8453' }));
+  assert.deepEqual(drifted, { abort: true, reason: 'INTENT_OFFER_MISMATCH:network' });
+  const ok = await hook(ctx({ network: 'eip155:137' }));
+  assert.equal(ok, undefined, 'exact CAIP-2 match ⇒ no abort');
+  const after = intentManager.validate(intent);
+  assert.equal(after.valid, false, 'the pass-through consumed the intent exactly once');
+  assert.ok(after.valid === false && after.code === 'ALREADY_USED');
+});

@@ -58,12 +58,35 @@ Two modes:
 Recipients are compared after chain-aware normalization, so formatting can
 never bypass or break the gate:
 
-  base / eip155:*  — EVM address, EIP-55-checked; compared lowercase. A
-                     wrong-checksum spelling is NOT repaired (unusable).
+  base / polygon / arbitrum / base-sepolia / eip155:*
+                   — EVM address, EIP-55-checked; compared lowercase on EVERY
+                     EVM chain (issue #32). A wrong-checksum spelling is NOT
+                     repaired (unusable).
   solana           — 32-byte base58 wallet; compared as the canonical
                      re-encoding. 'SoLWallet' is not a real wallet.
   casper           — '00' + 64 hex (optional 'account-hash-' prefix is
                      stripped); compared lowercase.
+
+Entries are CHAIN-SCOPED (issue #32). The grammar is '<chain>:<address>',
+where <chain> is an EVM alias (base / base-sepolia / polygon / arbitrum /
+ethereum) or '*':
+
+  'polygon:0x…'    — matches ONLY on polygon (denied for the same address on
+                     base).
+  '*:0x…'          — matches on any chain.
+  '0x…' (BARE)     — legacy unqualified form, scoped to BASE. Pre-#32 base
+                     was the only EVM chain, so an existing bare Base approval
+                     keeps exactly its old meaning — including for bare Solana
+                     wallets / Casper hashes, where the address form still
+                     governs — and never silently authorises the same 0x…
+                     address on Polygon or Arbitrum. To pay one address on
+                     several EVM chains, list it per chain (or use '*:').
+  'foo:0x…'        — an unrecognised qualifier makes the entry UNUSABLE: it
+                     never matches anything (fail closed, no guessing).
+
+The same scoping applies to 'perService' lists and to 'known' change-detect
+baselines: a 'polygon:0x…' baseline is active only for polygon payments to
+that host.
 
 This block is FILE-ONLY: there is deliberately no X402_POLICY_* env override
 for it (a per-host map does not fit a flat env var). Unknown keys inside the
@@ -164,3 +187,38 @@ x402_check_payment note: with the gate ENABLED, omitting 'amount' means
 checking a $0 payment — which rule 4.6 hard-denies on USD chains — so pass
 the real amount from the 402 challenge when the gate is on. With the compat
 default (disabled), today's behavior is unchanged.
+
+---------------------------------------------------------------------------
+Multi-EVM chains (issue #32) — 'networks.allowed' + 'evm.facilitatorNetworks'
+---------------------------------------------------------------------------
+
+This example's allowlist includes the three EVM chain aliases — 'base',
+'polygon', 'arbitrum' — alongside 'solana' and 'casper'. Chain detection
+resolves the 402 offer's REAL CAIP-2 network id (eip155:8453 => base,
+eip155:137 => polygon, eip155:42161 => arbitrum); an UNRECOGNISED eip155:*
+id (e.g. eip155:10, Optimism) is never collapsed onto base — it keeps its
+verbatim identity and rule 3 denies it unless you deliberately allowlist AND
+facilitator-enable it.
+
+Rule 3 (CHAIN_NOT_ALLOWED) applies three fail-closed checks, one reason max:
+  1. The Ethereum L1 — 'ethereum' or 'eip155:1' — is refused ALWAYS, even if
+     you add it to networks.allowed here.
+  2. Membership: the chain must be in networks.allowed (this file) — that is
+     the OPT-IN. The compat default omits polygon/arbitrum; this example adds
+     them.
+  3. Facilitator settle-gate: an allowed EVM chain is still refused when its
+     CAIP-2 id is not in 'evm.facilitatorNetworks' — the chains your
+     configured facilitator actually settles. The default (and this example)
+     is ["eip155:8453", "eip155:137", "eip155:42161"]; override with the
+     X402_EVM_FACILITATOR_NETWORKS env var (comma-separated). Every entry
+     must be a CAIP-2 id of the form eip155:<chainId> — anything else fails
+     closed (CONFIG_INVALID).
+
+Per-chain RPC note: BASE_RPC_URL applies to Base (eip155:8453) only. EVM
+payments on Polygon/Arbitrum sign locally (EIP-3009 / EIP-712) and need no
+RPC endpoint — there is deliberately no per-chain RPC matrix (out of scope
+for #32).
+
+Recipient allowlists are chain-scoped on the new chains — see the recipient
+section above: a bare '0x…' entry authorises that address on BASE only; use
+'polygon:0x…' / '*:0x…' for the other EVM chains.
