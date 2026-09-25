@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { describe, it } from 'node:test';
-import { isStale, entryOrigin, pinnedEntryFor, urlOnAllowlist, livenessVerdict } from './liveness.js';
+import { isStale, entryOrigin, pinnedEntryFor, urlOnAllowlist, livenessVerdict, pathMatches } from './liveness.js';
 import type { LivenessConfig } from './types.js';
 import type { LivenessDirectoryRow } from './liveness.js';
 
@@ -103,6 +103,67 @@ describe('urlOnAllowlist — origin + optional path membership', () => {
 
   it('an unparseable target URL is pinned by nothing (fail closed)', () => {
     assert.equal(urlOnAllowlist('not a url', [{ origin: 'https://svc.example' }]), false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #36 — trailing-* path wildcards in the allowlist. Exact literals keep
+// exact equality; a single trailing `*` is a prefix wildcard. The predicate is
+// unit-tested directly and through urlOnAllowlist; the exact-membership
+// assertions above stay untouched and green.
+// ---------------------------------------------------------------------------
+
+describe('pathMatches — exact literals + one trailing-* prefix wildcard (#36)', () => {
+  it('exact literals keep exact equality (no prefix semantics)', () => {
+    assert.equal(pathMatches('/api', '/api'), true);
+    assert.equal(pathMatches('/api', '/api/'), false, 'trailing slash differs');
+    assert.equal(pathMatches('/api', '/apix'), false);
+    assert.equal(pathMatches('/api', '/other'), false);
+  });
+
+  it('"/price/*" matches every parametrized instance under the prefix', () => {
+    assert.equal(pathMatches('/price/*', '/price/x'), true);
+    assert.equal(pathMatches('/price/*', '/price/DezXAZ2zLbtbrqTvwsWZX2VyZLt4PQWE89Lz35Nn1f3e'), true, 'a real address-shaped pathname matches');
+    assert.equal(pathMatches('/price/*', '/price/x/y'), true, 'deeper segments under the prefix match too');
+  });
+
+  it('"/price/*" does NOT match the bare prefix or the bare collection route', () => {
+    assert.equal(pathMatches('/price/*', '/price'), false);
+    assert.equal(pathMatches('/price/*', '/price/'), false, 'prefix + "/" is the collection route, not a parametrized instance');
+    assert.equal(pathMatches('/price/*', '/pricex/y'), false);
+  });
+
+  it('"/*" matches every path under the origin; interior stars are NOT wildcards', () => {
+    assert.equal(pathMatches('/*', '/anything'), true);
+    assert.equal(pathMatches('/*', '/a/deeper/path'), true);
+    assert.equal(pathMatches('/a/*/b', '/a/x/b'), false, 'an interior * is not a wildcard — exact equality applies (the validator rejects the form)');
+    assert.equal(pathMatches('/a/*/b', '/a/*/b'), true);
+  });
+});
+
+describe('urlOnAllowlist with a wildcard pin (#36) — parametrized routes admitted, still fail-closed', () => {
+  const pinned = [{ origin: 'https://svc.example', paths: ['/price/*'] }];
+
+  it('a configured wildcard admits matching parametrized paths on the pinned origin', () => {
+    assert.equal(urlOnAllowlist('https://svc.example/price/x402-probe', pinned), true);
+    assert.equal(urlOnAllowlist('https://svc.example/price/DezXAZ1234', pinned), true);
+  });
+
+  it('the wildcard admits nothing else: bare prefix, prefix+"/", unlisted paths stay denied', () => {
+    assert.equal(urlOnAllowlist('https://svc.example/price', pinned), false);
+    assert.equal(urlOnAllowlist('https://svc.example/price/', pinned), false, 'trailing slash differs — the collection route is not pinned');
+    assert.equal(urlOnAllowlist('https://svc.example/other', pinned), false);
+  });
+
+  it('query strings never affect wildcard pathname membership; origin and literal pins unchanged', () => {
+    assert.equal(urlOnAllowlist('https://svc.example/price/abc?x=1', pinned), true, 'query strings ignored');
+    assert.equal(urlOnAllowlist('https://other.example/price/abc', pinned), false, 'origin mismatch is still denied');
+    assert.equal(
+      urlOnAllowlist('https://svc.example/price/abc', [{ origin: 'https://svc.example', paths: ['/api'] }]),
+      false,
+      'a literal paths pin does not widen to prefix semantics',
+    );
+    assert.equal(urlOnAllowlist('https://svc.example/price/abc', [{ origin: 'https://svc.example' }]), true, 'a paths-less pin still admits every path');
   });
 });
 

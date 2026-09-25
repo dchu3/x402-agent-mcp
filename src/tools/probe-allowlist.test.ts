@@ -421,9 +421,12 @@ it('an unreachable openapi.json does not break the walk — root free ⇒ no_402
 
 it('configured paths stay exhaustive (mirror of the :152-182 contract, in a new case): first live wins early, NO discovery', async () => {
   writeDirectory([seedEntry('Cfg', 'https://cfg.example', { source: 'seed' })]);
+  // Issue #36: a configured "{param}" path is now a validation error (W2), so
+  // this mirror of the exhaustive-configured-paths contract uses the supported
+  // wildcard form — the substitution contract it pins is unchanged.
   process.env.POLICY_CONFIG_PATH = policyFile({
     payments: { enabled: true, maxPerRequest: 0.5, maxDaily: 10 },
-    liveness: { allowlist: [{ base_url: 'https://cfg.example', paths: ['/price/{address}', '/v2'] }] },
+    liveness: { allowlist: [{ base_url: 'https://cfg.example', paths: ['/price/*', '/v2'] }] },
   });
   const seen: string[] = [];
   globalThis.fetch = (async (input: unknown) => {
@@ -440,7 +443,7 @@ it('configured paths stay exhaustive (mirror of the :152-182 contract, in a new 
   assert.deepEqual(seen, ['https://cfg.example/price/x402-probe'],
     'exactly the configured paths are probed — no openapi fetch, no advertised paths, early exit skips /v2');
   const policyOnDisk = readFileSync(process.env.POLICY_CONFIG_PATH!, 'utf8');
-  assert.ok(policyOnDisk.includes('/price/{address}'), 'the configured path string is never mutated (P3)');
+  assert.ok(policyOnDisk.includes('/price/*'), 'the configured path string is never mutated (P3)');
   ledgerUntouched();
 });
 
