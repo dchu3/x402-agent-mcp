@@ -677,6 +677,81 @@ it('malformed liveness blocks fail closed (CONFIG_INVALID) — every validation 
   }
 });
 
+// ---------------------------------------------------------------------------
+// Issue #36 — trailing-* path wildcards in the liveness allowlist. A single
+// trailing "*" is the ONE supported wildcard (the "/prefix/*" form); a "*"
+// anywhere else and the directory's "{param}" templated syntax are REJECTED
+// loudly (fail closed) instead of silently pinning nothing.
+// ---------------------------------------------------------------------------
+
+it('a trailing-* wildcard paths entry validates clean — the operator config shape that exposed #36', () => {
+  // The LIVE operator shape: svm402.com advertises /price/{address}; the
+  // operator reached for paths: ["/price/*"] and got a silently broken pin.
+  process.env.POLICY_CONFIG_PATH = configFile('liveness-wildcard.json', validFileJson({
+    liveness: { allowlist: [{ base_url: 'https://svm402.com', paths: ['/price/*'] }] },
+  }));
+  const state = loadPolicyConfig();
+  assert.deepEqual(state.configErrors, [], 'the live operator config shape must load with config_valid: true');
+  assert.deepEqual(state.config.liveness, {
+    require_fresh_402: true,
+    max_age_seconds: 3600,
+    allowlist: [{ base_url: 'https://svm402.com', paths: ['/price/*'] }],
+  });
+
+  // A literal path keeps validating clean, alongside a wildcard.
+  process.env.POLICY_CONFIG_PATH = configFile('liveness-mixed-paths.json', validFileJson({
+    liveness: { allowlist: [{ base_url: 'https://svc.example', paths: ['/api', '/price/*'] }] },
+  }));
+  assert.deepEqual(loadPolicyConfig().configErrors, [], 'literal + wildcard entries coexist clean');
+});
+
+it('unsupported paths forms are rejected loudly, naming the supported wildcard form (#36 W1/W2)', () => {
+  for (const bad of ['/a/*/b', '/a*b', '/*/']) {
+    process.env.POLICY_CONFIG_PATH = configFile('liveness-star.json', validFileJson({
+      liveness: { allowlist: [{ base_url: 'https://svc.example', paths: [bad] }] },
+    }));
+    const state = loadPolicyConfig();
+    assert.ok(
+      state.configErrors.some((e) => e.includes('only a single trailing "*" suffix wildcard is supported (e.g. "/price/*")')),
+      `interior * ${bad} must be rejected naming the wildcard form — got ${JSON.stringify(state.configErrors)}`,
+    );
+  }
+  // The directory's {param} route vocabulary is NOT config syntax (W2).
+  process.env.POLICY_CONFIG_PATH = configFile('liveness-templated.json', validFileJson({
+    liveness: { allowlist: [{ base_url: 'https://svc.example', paths: ['/price/{address}'] }] },
+  }));
+  const templated = loadPolicyConfig();
+  assert.ok(
+    templated.configErrors.some((e) => e.includes('templated path segments ("{...}") are not config syntax — use the "/prefix/*" wildcard form')),
+    `{param} must be rejected pointing at the wildcard form — got ${JSON.stringify(templated.configErrors)}`,
+  );
+});
+
+it('a config mixing a wildcard with an invalid paths variant lands fail-closed: CONFIG_INVALID, strict-mode empty pin set (#36)', () => {
+  process.env.POLICY_CONFIG_PATH = configFile('liveness-mixed.json', validFileJson({
+    liveness: {
+      require_fresh_402: true,
+      allowlist: [
+        { base_url: 'https://svm402.com', paths: ['/price/*'] },
+        { base_url: 'https://bad.example', paths: ['/a/*/b'] },
+      ],
+    },
+  }));
+  const state = loadPolicyConfig();
+  assert.ok(state.configErrors.length > 0, 'the invalid variant must surface as a config error');
+  assert.ok(
+    state.configErrors.some((e) => e.includes('only a single trailing "*" suffix wildcard is supported (e.g. "/price/*")')),
+    `the wildcard-form rejection must be reported — got ${JSON.stringify(state.configErrors)}`,
+  );
+  const result = getPolicyEngine().evaluate(discoveredCtx);
+  assert.equal(result.decision, 'DENY', 'config errors fail closed — every request is refused');
+  assert.ok(result.reasons.some((r) => r.code === 'CONFIG_INVALID'));
+  // The fail-closed state is STRICT MODE: an explicit EMPTY allowlist — the
+  // wildcard entry never half-applies (the engine short-circuits on
+  // configErrors first).
+  assert.deepEqual(state.config.liveness, { require_fresh_402: true, max_age_seconds: 3600, allowlist: [] });
+});
+
 it('loading a liveness-bearing file never mutates DEFAULT_POLICY_CONFIG', () => {
   const snapshot = JSON.stringify(DEFAULT_POLICY_CONFIG);
   process.env.POLICY_CONFIG_PATH = configFile('liveness-snapshot.json', validFileJson({

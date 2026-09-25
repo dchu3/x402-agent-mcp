@@ -316,6 +316,22 @@ function livenessPolicy(v: unknown, path: string, errors: string[]): void {
         if (item.paths !== undefined) {
           if (!Array.isArray(item.paths) || !item.paths.every((p: unknown) => typeof p === "string" && p.startsWith("/"))) {
             errors.push(`${ipath}.paths must be an array of path strings, each starting with "/"`);
+          } else {
+            // Issue #36 (W1/W2): the wildcard must be exactly one trailing
+            // `*` character (the "/prefix/*" suffix wildcard); a `*` anywhere
+            // else has no meaning here and would silently pin nothing, and
+            // the directory's "{param}" route syntax is NOT config syntax
+            // (copying "/price/{address}" from directory metadata must not be
+            // silently accepted as a literal). Reject both loudly — the
+            // fail-closed typo-protection class this issue closes.
+            for (const p of item.paths as string[]) {
+              if (p.includes("*") && !(p.endsWith("*") && !p.slice(0, -1).includes("*"))) {
+                errors.push(`${ipath}.paths entry '${p}' is not supported: only a single trailing "*" suffix wildcard is supported (e.g. "/price/*")`);
+              }
+              if (p.includes("{") || p.includes("}")) {
+                errors.push(`${ipath}.paths entry '${p}' is not supported: templated path segments ("{...}") are not config syntax — use the "/prefix/*" wildcard form`);
+              }
+            }
           }
         }
       }

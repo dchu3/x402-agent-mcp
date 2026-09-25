@@ -89,8 +89,29 @@ export function pinnedEntryFor(cfg: LivenessConfig, entries: LivenessDirectoryRo
   return rows;
 }
 
+/** Does ONE configured allowlist path pattern match a request pathname
+ * (issue #36)? Exact literals keep exact string equality — no prefix
+ * semantics. A pattern ending in a single trailing `*` is a PREFIX wildcard:
+ * the prefix is everything before the `*`, and it matches any pathname under
+ * that prefix with a NON-EMPTY remainder — so `/price/*` matches
+ * `/price/DezX…` but never the bare prefix `/price` or the bare collection
+ * route `/price/` (neither is a parametrized instance). A `*` anywhere other
+ * than the final character is NOT a wildcard — the config validator rejects
+ * those forms loudly; here they simply compare literally. Pure: no URL
+ * parsing, same input ⇒ same output. */
+export function pathMatches(pattern: string, pathname: string): boolean {
+  if (pattern.endsWith("*") && !pattern.slice(0, -1).includes("*")) {
+    const prefix = pattern.slice(0, -1);
+    return pathname.startsWith(prefix) && pathname.length > prefix.length;
+  }
+  return pattern === pathname;
+}
+
 /** Is a target URL pinned by the pin set? Origin match; when the pinning row
- * carries `paths`, the URL's pathname must be listed verbatim (L2). An
+ * carries `paths`, the URL's pathname must match one of the configured
+ * patterns (L2): exact string equality for literals, or the trailing-`*`
+ * prefix wildcard (`/price/*` matches `/price/<any-address>` — issue #36);
+ * query strings never participate (only the pathname is compared). An
  * unparseable URL is pinned by nothing (fail closed). */
 export function urlOnAllowlist(url: string, pinned: PinnedRow[]): boolean {
   let origin: string;
@@ -105,7 +126,7 @@ export function urlOnAllowlist(url: string, pinned: PinnedRow[]): boolean {
   for (const row of pinned) {
     if (row.origin !== origin) continue;
     if (row.paths === undefined) return true;
-    if (row.paths.includes(pathname)) return true;
+    if (row.paths.some((p) => pathMatches(p, pathname))) return true;
   }
   return false;
 }

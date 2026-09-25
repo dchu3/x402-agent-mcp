@@ -421,9 +421,12 @@ it('an unreachable openapi.json does not break the walk — root free ⇒ no_402
 
 it('configured paths stay exhaustive (mirror of the :152-182 contract, in a new case): first live wins early, NO discovery', async () => {
   writeDirectory([seedEntry('Cfg', 'https://cfg.example', { source: 'seed' })]);
+  // Issue #36: a configured "{param}" path is now a validation error (W2), so
+  // this mirror of the exhaustive-configured-paths contract uses the supported
+  // wildcard form — the substitution contract it pins is unchanged.
   process.env.POLICY_CONFIG_PATH = policyFile({
     payments: { enabled: true, maxPerRequest: 0.5, maxDaily: 10 },
-    liveness: { allowlist: [{ base_url: 'https://cfg.example', paths: ['/price/{address}', '/v2'] }] },
+    liveness: { allowlist: [{ base_url: 'https://cfg.example', paths: ['/price/*', '/v2'] }] },
   });
   const seen: string[] = [];
   globalThis.fetch = (async (input: unknown) => {
@@ -440,7 +443,7 @@ it('configured paths stay exhaustive (mirror of the :152-182 contract, in a new 
   assert.deepEqual(seen, ['https://cfg.example/price/x402-probe'],
     'exactly the configured paths are probed — no openapi fetch, no advertised paths, early exit skips /v2');
   const policyOnDisk = readFileSync(process.env.POLICY_CONFIG_PATH!, 'utf8');
-  assert.ok(policyOnDisk.includes('/price/{address}'), 'the configured path string is never mutated (P3)');
+  assert.ok(policyOnDisk.includes('/price/*'), 'the configured path string is never mutated (P3)');
   ledgerUntouched();
 });
 
@@ -462,5 +465,67 @@ it('configured paths that all answer free ⇒ no_402 and zero discovery — open
   assert.equal(parsed.results[0].status, 'no_402');
   assert.deepEqual(seen, ['https://cfgfree.example/a', 'https://cfgfree.example/b'],
     'configured paths are the ONLY URLs probed — exhaustive, no discovery (fact 7)');
+  ledgerUntouched();
+});
+
+// ---------------------------------------------------------------------------
+// Issue #36 — a configured trailing-* wildcard entry probes a SUBSTITUTED
+// representative (the x402-probe token), never the literal wildcard URL. The
+// gate side (pathMatches) admits the real parametrized routes; the record
+// must be truthful about the exact URL the probe fetched. All network is the
+// mocked globalThis.fetch — any unexpected target (including the literal
+// `.../price/*`) throws, so these cases PROVE the literal is never requested.
+// ---------------------------------------------------------------------------
+
+it('issue #36: a configured wildcard entry probes the SUBSTITUTED representative — the literal wildcard URL is never requested', async () => {
+  writeDirectory([seedEntry('Wild', 'https://pinned.example', { source: 'seed' })]);
+  process.env.POLICY_CONFIG_PATH = policyFile({
+    payments: { enabled: true, maxPerRequest: 0.5, maxDaily: 10 },
+    liveness: { allowlist: [{ base_url: 'https://pinned.example', paths: ['/price/*'] }] },
+  });
+  const seen: string[] = [];
+  globalThis.fetch = (async (input: unknown) => {
+    const url = input instanceof Request ? input.url : String(input);
+    seen.push(url);
+    if (url === 'https://pinned.example/price/x402-probe') return challenge402(); // 402 ONLY for the substituted path
+    throw new Error(`unexpected probe target ${url}`);
+  }) as any;
+  const result = await handler()({});
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.mode, 'explicit');
+  assert.equal(parsed.results[0].status, 'live_402', 'the substituted representative answers 402');
+  assert.equal(parsed.results[0].probe_url, 'https://pinned.example/price/x402-probe', 'the record carries the SUBSTITUTED URL');
+  assert.deepEqual(seen, ['https://pinned.example/price/x402-probe'],
+    'exactly one candidate: the literal https://pinned.example/price/* is never requested (it would throw above) and no discovery runs');
+  const dirAfter = readDirectory();
+  const wild = dirAfter.endpoints.find((e: any) => e.name === 'Wild');
+  assert.equal(wild.liveness.status, 'live_402');
+  assert.equal(wild.liveness.probe_url, 'https://pinned.example/price/x402-probe');
+  assert.ok(Array.isArray(wild.liveness.accepts), 'the accepts snapshot comes from the substituted 402');
+  ledgerUntouched();
+});
+
+it('issue #36: a wildcard entry whose placeholder answers free records no_402 — truthful, never live_402 by literal tolerance', async () => {
+  writeDirectory([seedEntry('WildFree', 'https://wildfree.example', { source: 'seed' })]);
+  process.env.POLICY_CONFIG_PATH = policyFile({
+    payments: { enabled: true, maxPerRequest: 0.5, maxDaily: 10 },
+    liveness: { allowlist: [{ base_url: 'https://wildfree.example', paths: ['/price/*'] }] },
+  });
+  const seen: string[] = [];
+  globalThis.fetch = (async (input: unknown) => {
+    const url = input instanceof Request ? input.url : String(input);
+    seen.push(url);
+    if (url === 'https://wildfree.example/price/x402-probe') return new Response('free', { status: 200 });
+    throw new Error(`unexpected probe target ${url}`);
+  }) as any;
+  const result = await handler()({});
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.results[0].status, 'no_402', 'a free placeholder is a truthful no_402');
+  assert.equal(parsed.results[0].probe_url, 'https://wildfree.example/price/x402-probe');
+  assert.deepEqual(seen, ['https://wildfree.example/price/x402-probe'], 'exactly one candidate — the substituted representative');
+  const dirAfter = readDirectory();
+  const row = dirAfter.endpoints.find((e: any) => e.name === 'WildFree');
+  assert.equal(row.liveness.status, 'no_402');
+  assert.equal(row.liveness.accepts, undefined, 'no_402 never invents an accepts snapshot');
   ledgerUntouched();
 });
