@@ -28,6 +28,11 @@ function cfg(overrides: Partial<PolicyConfig> = {}): PolicyConfig {
     // Issue #32: the facilitator settle-list (fail-closed rule-3 gate for
     // EVM chains that passed networks.allowed).
     evm: { facilitatorNetworks: ['eip155:8453', 'eip155:137', 'eip155:42161'] },
+    // Issue #34 REQUIRED member: the liveness gate with its fail-closed
+    // defaults (require_fresh_402 on, 1h max age, allowlist ABSENT = seed
+    // mode). No fixture below supplies ctx.endpointLiveness, so rule 4.7 is
+    // inert for every pre-#34 test by construction (L1/L3).
+    liveness: { require_fresh_402: true, max_age_seconds: 3600 },
     ...overrides,
   };
 }
@@ -847,5 +852,86 @@ describe('rule 4.6: price anomaly gate', () => {
     const result = engine.evaluate(ctx({ token: 'wCSPR', trustLevel: 'UNKNOWN', amount: 0.3 }), {}, { baseline: Z_BASELINE });
     assert.equal(result.decision, 'DENY');
     assert.deepEqual(codes(result), ['TOKEN_NOT_ALLOWED', 'PRICE_ANOMALY', 'UNKNOWN_SERVICE']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #34 — rule 4.7: the endpoint liveness gate (ENDPOINT_NOT_LIVE). Sits
+// after rule 4.6 and before rule 5 (fixed rule order). The verdict is
+// CALLER-SUPPLIED on the context (L1): the pure core never reads the
+// directory, and a context without a verdict behaves exactly as before #34.
+// ENDPOINT_NOT_LIVE IS a DENY_CODES member — a liveness refusal has no
+// approval band (L7).
+// ---------------------------------------------------------------------------
+
+describe('rule 4.7: endpoint liveness gate (issue #34)', () => {
+  const notLive = (overrides: Partial<NonNullable<PolicyContext['endpointLiveness']>> = {}): NonNullable<PolicyContext['endpointLiveness']> => ({
+    ok: false,
+    status: 'never_probed',
+    stale: true,
+    on_allowlist: false,
+    reason: 'Endpoint example.com is not pinned — catalog membership is not proof of liveness',
+    ...overrides,
+  });
+
+  it('fires ENDPOINT_NOT_LIVE (alone) only when the supplied verdict is ok:false', () => {
+    const engine = new PolicyEngine({ config: cfg(), configErrors: [] });
+    const denied = engine.evaluate(ctx({ endpointLiveness: notLive() }));
+    assert.equal(denied.decision, 'DENY');
+    assert.deepEqual(codes(denied), ['ENDPOINT_NOT_LIVE'], 'exactly ONE liveness reason per evaluation');
+    assert.equal(denied.reasons[0].message, notLive().reason, 'the engine emits the verdict reason VERBATIM');
+  });
+
+  it('is inert when no verdict is supplied (the pre-#34 caller compat proof)', () => {
+    const engine = new PolicyEngine({ config: cfg(), configErrors: [] });
+    const result = engine.evaluate(ctx());
+    assert.equal(result.decision, 'ALLOW');
+    assert.deepEqual(result.reasons, []);
+  });
+
+  it('is inert when liveness.require_fresh_402 is false — even with a failing verdict', () => {
+    const engine = new PolicyEngine({ config: cfg({ liveness: { require_fresh_402: false, max_age_seconds: 3600 } }), configErrors: [] });
+    const result = engine.evaluate(ctx({ endpointLiveness: notLive() }));
+    assert.equal(result.decision, 'ALLOW', 'the require_fresh_402 off-switch swallows the verdict (L3)');
+    assert.deepEqual(result.reasons, []);
+  });
+
+  it("an ok verdict never fires (fresh live probe on a pinned row)", () => {
+    const engine = new PolicyEngine({ config: cfg(), configErrors: [] });
+    const result = engine.evaluate(ctx({ endpointLiveness: { ok: true, status: 'live_402', stale: false, on_allowlist: true } }));
+    assert.equal(result.decision, 'ALLOW');
+    assert.deepEqual(result.reasons, []);
+  });
+
+  it('a missing reason text gets a fail-closed fallback message', () => {
+    const engine = new PolicyEngine({ config: cfg(), configErrors: [] });
+    const result = engine.evaluate(ctx({ endpointLiveness: { ok: false, status: 'error', stale: true, on_allowlist: true } }));
+    assert.equal(result.decision, 'DENY');
+    assert.deepEqual(codes(result), ['ENDPOINT_NOT_LIVE']);
+    assert.match(result.reasons[0].message, /liveness gate/);
+  });
+
+  it('rule 4.7 accumulates between rule 4.6 and rule 5 in the fixed rule order', () => {
+    const engine = new PolicyEngine({ config: cfg({ tokens: { allowed: ['USDC'] } }), configErrors: [] });
+    const result = engine.evaluate(ctx({ token: 'wCSPR', trustLevel: 'UNKNOWN', endpointLiveness: notLive() }));
+    assert.equal(result.decision, 'DENY');
+    assert.deepEqual(codes(result), ['TOKEN_NOT_ALLOWED', 'ENDPOINT_NOT_LIVE', 'UNKNOWN_SERVICE']);
+  });
+
+  it('ENDPOINT_NOT_LIVE is a DENY code — it outranks an accumulated APPROVAL_REQUIRED', () => {
+    const engine = new PolicyEngine({
+      config: cfg({ services: { unknown: { action: 'deny' }, discovered: { action: 'approval' }, verified: { action: 'allow' }, trusted: { action: 'allow' }, blocked: { action: 'deny' } } }),
+      configErrors: [],
+    });
+    const result = engine.evaluate(ctx({ endpointLiveness: notLive() }));
+    assert.equal(result.decision, 'DENY', 'a liveness refusal has no approval band');
+    assert.deepEqual(codes(result), ['ENDPOINT_NOT_LIVE', 'APPROVAL_REQUIRED']);
+  });
+
+  it('fails closed under config errors regardless of the verdict (the short circuit stands first)', () => {
+    const engine = new PolicyEngine({ config: cfg(), configErrors: ['boom'] });
+    const result = engine.evaluate(ctx({ endpointLiveness: { ok: true, status: 'live_402', stale: false, on_allowlist: true } }));
+    assert.equal(result.decision, 'DENY');
+    assert.deepEqual(codes(result), ['CONFIG_INVALID', 'PAYMENTS_DISABLED']);
   });
 });

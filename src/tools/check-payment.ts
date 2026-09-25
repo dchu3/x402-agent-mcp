@@ -104,6 +104,11 @@ export function registerCheckPaymentTool(server: McpServer): void {
         chain,
         ...recipientEcho,
         trust_level: result.limits.trustLevel,
+        // Issue #34: echo the endpoint liveness verdict the gate saw (rule
+        // 4.7) — computed in buildPolicyContext from the directory row +
+        // liveness config — so an agent can inspect pin/probe state BEFORE
+        // calling x402_fetch. Read-only: this tool never probes and never pays.
+        ...(ctx.endpointLiveness !== undefined ? { endpoint_liveness: ctx.endpointLiveness } : {}),
         // Reasons carry their optional detail payload (issue #30) verbatim.
         reasons: result.reasons.map((r) => ({ code: r.code, message: r.message, ...(r.detail !== undefined ? { detail: r.detail } : {}) })),
         limits: result.limits,

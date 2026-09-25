@@ -112,13 +112,53 @@ export interface EvmPolicyConfig {
   facilitatorNetworks: string[];
 }
 
+/** Liveness probe classification (issue #34). Mirrors LivenessRecord.status
+ * on directory entries (src/directory.ts); "never_probed" exists only on the
+ * verdict side, for an entry that carries no record. */
+export type LivenessStatus = "live_402" | "no_402" | "error";
+
+/** Explicit liveness pin-set entry (issue #34, L2): directory rows whose
+ * ORIGIN (scheme://host[:port], trailing slash normalised) matches base_url
+ * are pinned; when `paths` is given, a target URL's pathname must be listed
+ * (and `paths` drives which URL the refresh probes). */
+export interface LivenessAllowlistEntry {
+  base_url: string;
+  paths?: string[];
+}
+
+/** The liveness gate block (issue #34, L8/L10). `require_fresh_402` defaults
+ * to true and `max_age_seconds` to 3600 — the fail-closed defaults, never
+ * softened. `allowlist` ABSENT is load-bearing and distinct from []: absent
+ * pins the directory's seed rows (L2); [] pins nothing and puts the gate in
+ * strict mode (L3). FILE-ONLY: there is deliberately no X402_POLICY_* env
+ * override for this block (the `recipients`/`anomaly` precedent). */
+export interface LivenessConfig {
+  require_fresh_402: boolean;
+  max_age_seconds: number;
+  allowlist?: LivenessAllowlistEntry[];
+}
+
+/** The caller-supplied liveness verdict (issue #34, L1): computed OUTSIDE the
+ * engine by buildPolicyContext (from the directory row, the config and the
+ * injected clock) and injected on the PolicyContext — the pure core never
+ * reads the directory itself. `reason` is the human-readable message the
+ * engine emits verbatim as the ENDPOINT_NOT_LIVE reason message (rule 4.7). */
+export interface EndpointLiveness {
+  ok: boolean;
+  status: LivenessStatus | "never_probed";
+  stale: boolean;
+  on_allowlist: boolean;
+  reason?: string;
+}
+
 /** Policy configuration model (issue Phase 2, JSON per the ratified decision —
  * loaded/validated in src/policy/config.ts; this is the shape the engine uses).
  * Service keys mirror the issue's config example (lowercase trust levels); the
  * engine maps TrustLevel → key case-insensitively. `recipients` is REQUIRED so
  * every construction site (including test fixtures) must state a recipient
  * policy — fail-closed at compile time (issue #26). `anomaly` is REQUIRED for
- * the same reason (issue #30), and `evm` likewise (issue #32). */
+ * the same reason (issue #30), `evm` likewise (issue #32), and `liveness`
+ * likewise (issue #34). */
 export interface PolicyConfig {
   payments: { enabled: boolean; maxPerRequest: number; maxDaily: number };
   services: {
@@ -133,6 +173,7 @@ export interface PolicyConfig {
   recipients: RecipientPolicy;
   anomaly: AnomalyConfig;
   evm: EvmPolicyConfig;
+  liveness: LivenessConfig;
 }
 
 /** The request a payment decision is made about. `trustLevel` is supplied by
@@ -150,6 +191,12 @@ export interface PolicyContext {
   recipient?: string;
   purpose?: string;
   agentContext?: string;
+  /** Issue #34 (L1): the caller-supplied liveness verdict for the target URL,
+   * computed by buildPolicyContext — never by the engine — from the directory
+   * row + liveness config + injected clock. Rule 4.7 fires only when
+   * liveness.require_fresh_402 is on and this verdict is present and not ok;
+   * an absent verdict leaves the gate inert (existing callers unchanged). */
+  endpointLiveness?: EndpointLiveness;
   trustLevel: TrustLevel;
 }
 
@@ -168,8 +215,10 @@ export interface PolicyBudgetState {
  * (allowlist / change-detect modes, see RecipientPolicy). PRICE_ANOMALY is
  * emitted by rule 4.6 (issue #30): the price anomaly gate — deliberately NOT a
  * DENY code (the band decides routing; see src/policy/engine.ts).
- * CONFIG_INVALID is the fail-closed marker for unusable policy configuration
- * (operator-ratified addition to the issue's list). */
+ * ENDPOINT_NOT_LIVE is emitted by rule 4.7 (issue #34): the fail-closed
+ * endpoint liveness gate — it IS a DENY code (a liveness refusal has no
+ * approval band). CONFIG_INVALID is the fail-closed marker for unusable policy
+ * configuration (operator-ratified addition to the issue's list). */
 export type ReasonCode =
   | "PAYMENTS_DISABLED"
   | "REQUEST_LIMIT_EXCEEDED"
@@ -182,6 +231,7 @@ export type ReasonCode =
   | "APPROVAL_REQUIRED"
   | "RECIPIENT_NOT_ALLOWED"
   | "PRICE_ANOMALY"
+  | "ENDPOINT_NOT_LIVE"
   | "CONFIG_INVALID";
 
 export interface PolicyReason {

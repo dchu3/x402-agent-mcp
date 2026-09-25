@@ -75,6 +75,54 @@ export async function fetchRootPaymentChallenge(url: string, timeoutMs: number =
   }
 }
 
+/** A discriminated liveness probe outcome (issue #34). Unlike
+ * fetchRootPaymentChallenge — which returns null for BOTH "answered without a
+ * 402" and "network error/timeout" and so cannot classify liveness — this
+ * separates the three cases the directory's liveness record must capture. */
+export interface LivenessProbeResult {
+  kind: "live_402" | "no_402" | "error";
+  /** The decoded payment challenge object — present only on live_402. */
+  challenge?: any;
+  /** Wall-clock duration of the probe attempt, measured around the fetch. */
+  latency_ms: number;
+  /** Diagnostic message — present only on error (timeout, DNS, refused, …). */
+  error?: string;
+}
+
+/** Probe a URL for a 402 PAYMENT-REQUIRED challenge and classify the outcome
+ * (issue #34, L6):
+ *   - status 402 with a decodable payment-required header ⇒ live_402 (with the
+ *     parsed challenge object)
+ *   - any other answered response, or a 402 whose header does not decode ⇒
+ *     no_402
+ *   - a thrown/aborted request (timeout, network failure) ⇒ error (never live)
+ * Redirects are never followed (redirect: "error"), only the response header
+ * is read, and nothing is ever paid or authenticated — one shared HTTP stack
+ * (this module), no second client. */
+export async function probePaymentChallenge(url: string, timeoutMs: number = 10000): Promise<LivenessProbeResult> {
+  const started = Date.now();
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    let resp: Response;
+    try {
+      resp = await fetch(url, { signal: controller.signal, redirect: "error" });
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (resp.status !== 402) {
+      return { kind: "no_402", latency_ms: Date.now() - started };
+    }
+    const challenge = decodePaymentRequiredHeader(resp.headers.get("payment-required"));
+    if (!challenge) {
+      return { kind: "no_402", latency_ms: Date.now() - started };
+    }
+    return { kind: "live_402", challenge, latency_ms: Date.now() - started };
+  } catch (err: any) {
+    return { kind: "error", latency_ms: Date.now() - started, error: String(err?.message ?? err).slice(0, 200) };
+  }
+}
+
 export interface ChallengeHit {
   challenge: any;
   /** "root" or the OpenAPI path that answered with 402 */

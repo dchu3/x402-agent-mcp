@@ -588,3 +588,131 @@ it('loading an evm-bearing file never mutates DEFAULT_POLICY_CONFIG', () => {
   loadPolicyConfig();
   assert.equal(JSON.stringify(DEFAULT_POLICY_CONFIG), snapshot, 'loadPolicyConfig must never mutate the default template (evm included)');
 });
+
+// ---------------------------------------------------------------------------
+// Issue #34 — the top-level `liveness` block (endpoint liveness gate, rule
+// 4.7, ENDPOINT_NOT_LIVE). Strict validation like every other block; unknown
+// keys anywhere are errors. The FAIL-CLOSED DEFAULT (L10) is
+// require_fresh_402 TRUE + max_age_seconds 3600 with the allowlist ABSENT
+// (seed-pinned mode, L2); per L3 that tightening is real for catalog rows and
+// INERT for non-catalog hosts. FILE-ONLY: no X402_POLICY_* override (the
+// recipients/anomaly precedent).
+// ---------------------------------------------------------------------------
+
+const DEFAULT_LIVENESS = { require_fresh_402: true, max_age_seconds: 3600 };
+
+it('the liveness default is gate-ON at 3600 s with the allowlist ABSENT (seed-pinned mode), and the fail-closed state pins nothing', () => {
+  const state = loadPolicyConfig();
+  assert.deepEqual(state.configErrors, []);
+  assert.deepEqual(state.config.liveness, DEFAULT_LIVENESS);
+  assert.equal('allowlist' in state.config.liveness, false, 'the default must not carry the allowlist key at all — absent ≠ [] (L2/L3)');
+  assert.deepEqual(DEFAULT_POLICY_CONFIG.liveness, DEFAULT_LIVENESS);
+  // The fail-closed state: explicit EMPTY allowlist ⇒ strict mode, pin set
+  // empty, nothing is live (the engine also short-circuits on configErrors).
+  process.env.X402_POLICY_PAYMENTS_ENABLED = 'bogus';
+  const failed = loadPolicyConfig();
+  assert.ok(failed.configErrors.length > 0);
+  assert.deepEqual(failed.config.liveness, { require_fresh_402: true, max_age_seconds: 3600, allowlist: [] });
+});
+
+it('a file WITHOUT a liveness block keeps the default (seed-pinned mode)', () => {
+  process.env.POLICY_CONFIG_PATH = configFile('no-liveness.json', validFileJson());
+  const state = loadPolicyConfig();
+  assert.deepEqual(state.configErrors, []);
+  assert.deepEqual(state.config.liveness, DEFAULT_LIVENESS);
+  assert.equal('allowlist' in state.config.liveness, false);
+});
+
+it('a partial liveness block merges over the defaults and preserves absent-vs-explicit allowlist exactly', () => {
+  // Partial numbers only: require_fresh_402 keeps its default; allowlist stays ABSENT.
+  process.env.POLICY_CONFIG_PATH = configFile('liveness-partial.json', validFileJson({ liveness: { max_age_seconds: 600 } }));
+  let state = loadPolicyConfig();
+  assert.deepEqual(state.configErrors, []);
+  assert.deepEqual(state.config.liveness, { require_fresh_402: true, max_age_seconds: 600 });
+  assert.equal('allowlist' in state.config.liveness, false, 'an omitted allowlist key stays omitted — seed mode');
+
+  // Explicit []: kept DISTINCT from absent (strict mode, pin set empty).
+  process.env.POLICY_CONFIG_PATH = configFile('liveness-empty.json', validFileJson({ liveness: { allowlist: [] } }));
+  state = loadPolicyConfig();
+  assert.deepEqual(state.configErrors, []);
+  assert.deepEqual(state.config.liveness, { require_fresh_402: true, max_age_seconds: 3600, allowlist: [] });
+
+  // A full block: exact carry, fresh copies.
+  process.env.POLICY_CONFIG_PATH = configFile('liveness-full.json', validFileJson({
+    liveness: { require_fresh_402: false, max_age_seconds: 60, allowlist: [{ base_url: 'https://svc.example', paths: ['/api'] }, { base_url: 'https://other.example' }] },
+  }));
+  state = loadPolicyConfig();
+  assert.deepEqual(state.configErrors, []);
+  assert.deepEqual(state.config.liveness, {
+    require_fresh_402: false,
+    max_age_seconds: 60,
+    allowlist: [{ base_url: 'https://svc.example', paths: ['/api'] }, { base_url: 'https://other.example' }],
+  });
+});
+
+it('malformed liveness blocks fail closed (CONFIG_INVALID) — every validation class', () => {
+  for (const bad of [
+    'yes',                                                       // not an object
+    { require_fresh_402: 'true' },                               // non-boolean
+    { max_age_seconds: 0 },                                      // not > 0
+    { max_age_seconds: -60 },                                    // negative
+    { max_age_seconds: Number.NaN },                             // non-finite
+    { max_age_seconds: '3600' },                                 // non-number
+    { allowlist: 'https://svc.example' },                        // not an array
+    { allowlist: ['https://svc.example'] },                      // entry not an object
+    { allowlist: [{}] },                                         // base_url missing
+    { allowlist: [{ base_url: '' }] },                           // empty base_url
+    { allowlist: [{ base_url: 'not-a-url' }] },                  // unparseable
+    { allowlist: [{ base_url: 'ftp://svc.example' }] },          // non-http(s) scheme
+    { allowlist: [{ base_url: 'https://svc.example', paths: '/api' }] }, // paths not an array
+    { allowlist: [{ base_url: 'https://svc.example', paths: ['api'] }] }, // path not starting with /
+    { allowlist: [{ base_url: 'https://svc.example', paths: [42] }] },   // non-string path
+    { allowlist: [{ base_url: 'https://svc.example', base_ul: 'x' }] },  // unknown key in an entry (typo protection)
+    { require_fresh_402: true, fresh_402: true },                // unknown key in the block (typo protection)
+  ]) {
+    process.env.POLICY_CONFIG_PATH = configFile('liveness-bad.json', validFileJson({ liveness: bad }));
+    const result = getPolicyEngine().evaluate(discoveredCtx);
+    assert.equal(result.decision, 'DENY', `liveness block ${JSON.stringify(bad)} must fail closed`);
+    assert.ok(result.reasons.some((r) => r.code === 'CONFIG_INVALID'), `liveness block ${JSON.stringify(bad)} must report CONFIG_INVALID`);
+  }
+});
+
+it('loading a liveness-bearing file never mutates DEFAULT_POLICY_CONFIG', () => {
+  const snapshot = JSON.stringify(DEFAULT_POLICY_CONFIG);
+  process.env.POLICY_CONFIG_PATH = configFile('liveness-snapshot.json', validFileJson({
+    liveness: { max_age_seconds: 120, allowlist: [{ base_url: 'https://svc.example', paths: ['/a'] }] },
+  }));
+  loadPolicyConfig();
+  assert.equal(JSON.stringify(DEFAULT_POLICY_CONFIG), snapshot, 'loadPolicyConfig must never mutate the default template (liveness included)');
+});
+
+it('buildPolicyContext supplies the liveness verdict (injected clock; directory I/O outside the engine)', async () => {
+  const { buildPolicyContext } = await import('./config.js');
+  const dir = tempDir();
+  process.env.X402_DIRECTORY_PATH = join(dir, 'endpoints.json');
+  writeFileSync(process.env.X402_DIRECTORY_PATH, JSON.stringify({
+    endpoints: [
+      { name: 'SeededLive', description: '', base_url: 'https://seeded-live.example', chain: 'base', category: 'ai', tags: [], endpoints: [], source: 'seed', liveness: { probed_at: '2026-09-25T11:30:00.000Z', status: 'live_402', latency_ms: 5, probe_url: 'https://seeded-live.example' } },
+      { name: 'SeededStale', description: '', base_url: 'https://seeded-stale.example', chain: 'base', category: 'ai', tags: [], endpoints: [], source: 'seed', liveness: { probed_at: '2026-09-25T10:00:00.000Z', status: 'live_402', latency_ms: 5, probe_url: 'https://seeded-stale.example' } },
+      { name: 'Unpinned', description: '', base_url: 'https://unpinned.example', chain: 'base', category: 'ai', tags: [], endpoints: [] },
+    ],
+    categories: [], last_updated: '2026-09-25',
+  }), 'utf8');
+  clearDirectoryCache();
+  const NOW = Date.parse('2026-09-25T12:00:00.000Z');
+
+  const fresh = buildPolicyContext('https://seeded-live.example/api', 'base', 'USDC', 0.1, { now: NOW });
+  assert.deepEqual(fresh.endpointLiveness, { ok: true, status: 'live_402', stale: false, on_allowlist: true }, 'a pinned row with a fresh live record passes');
+
+  const stale = buildPolicyContext('https://seeded-stale.example/api', 'base', 'USDC', 0.1, { now: NOW });
+  assert.equal(stale.endpointLiveness?.ok, false, 'a stale record fails closed');
+  assert.equal(stale.endpointLiveness?.stale, true);
+
+  const unpinned = buildPolicyContext('https://unpinned.example/api', 'base', 'USDC', 0.1, { now: NOW });
+  assert.equal(unpinned.endpointLiveness?.ok, false, 'an unpinned catalog row fails closed');
+  assert.equal(unpinned.endpointLiveness?.on_allowlist, false);
+
+  const stranger = buildPolicyContext('https://stranger.example/api', 'base', 'USDC', 0.1, { now: NOW });
+  assert.equal(stranger.endpointLiveness?.ok, true, 'a non-catalog host is INERT in seed mode (L3)');
+  assert.equal(stranger.endpointLiveness?.status, 'never_probed');
+});

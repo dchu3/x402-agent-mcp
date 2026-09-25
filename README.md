@@ -15,11 +15,12 @@ Agent: "I need news data"
 
 The agent never sees wallets, private keys, or x402 protocol details. Just search, discover, fetch.
 
-## Tools (9)
+## Tools (10)
 
 | Tool | Cost | Description |
 |------|------|-------------|
-| `x402_search` | Free | Search x402 endpoints by keyword, category, or chain |
+| `x402_search` | Free | Search x402 endpoints by keyword, category, or chain — **ranked live-first** by the recorded 402 liveness probes (issue #34; unpinned rows withheld unless `include_unverified: true`). Never performs network calls. |
+| `x402_probe_allowlist` | Free | Refresh the liveness probes for the pinned endpoint set (seed rows, or the `liveness.allowlist` origins) and record them atomically on the directory entries. Never pays, never follows redirects (issue #34). |
 | `x402_list_categories` | Free | List all endpoint categories with counts |
 | `x402_describe` | Free | Get detailed info for a specific service (paths, prices, schema) |
 | `x402_discover_url` | Free | Discover any x402 service by URL via well-known files + auto-add to directory |
@@ -156,8 +157,9 @@ Decisions are exactly `ALLOW`, `DENY`, `APPROVAL_REQUIRED`. Every non-ALLOW resu
 | `CONFIG_INVALID` | Policy configuration failed validation — the engine fails closed |
 | `RECIPIENT_NOT_ALLOWED` | Rule 4.5 recipient gate (issue #26): the probed recipient is not on the effective allowlist (allowlist mode — fail-closed on an empty effective list or a missing/unusable probed recipient), or differs from the recorded baseline (change-detect mode) |
 | `PRICE_ANOMALY` | Rule 4.6 price anomaly gate (issue #30): the amount is outside the tolerance of the per-service settled-amount baseline — a mild spike routes to `APPROVAL_REQUIRED`, a severe spike (or a non-positive amount on a USD chain) hard-**DENY**s. The reason carries a `detail` payload with the z-score (or fallback ratio) plus baseline stats |
+| `ENDPOINT_NOT_LIVE` | Rule 4.7 endpoint liveness gate (issue #34): the target is off the liveness pin set (catalog membership is not proof of liveness; an explicit `liveness.allowlist` also refuses every unlisted host), or its last recorded 402 probe is missing, stale (older than `liveness.max_age_seconds`), or not a live 402. Refresh with `x402_probe_allowlist` |
 
-Rules are evaluated in a fixed, documented order and reasons **accumulate** (all triggered codes are returned, not just the first): 1 `SERVICE_BLOCKED`, 2 `PAYMENTS_DISABLED`, 3 `CHAIN_NOT_ALLOWED`, 4 `TOKEN_NOT_ALLOWED`, 4.5 `RECIPIENT_NOT_ALLOWED` (issue #26), 4.6 `PRICE_ANOMALY` (issue #30), 5 `UNKNOWN_SERVICE`, 6 `REQUEST_LIMIT_EXCEEDED`, 7 `DAILY_LIMIT_EXCEEDED`, 8 `SERVICE_LIMIT_EXCEEDED`, 9 `APPROVAL_REQUIRED`. `DENY` outranks `APPROVAL_REQUIRED` outranks `ALLOW`. Cap boundaries match the inner payment guards exactly: `> cap` denies, reaching the cap exactly is allowed.
+Rules are evaluated in a fixed, documented order and reasons **accumulate** (all triggered codes are returned, not just the first): 1 `SERVICE_BLOCKED`, 2 `PAYMENTS_DISABLED`, 3 `CHAIN_NOT_ALLOWED`, 4 `TOKEN_NOT_ALLOWED`, 4.5 `RECIPIENT_NOT_ALLOWED` (issue #26), 4.6 `PRICE_ANOMALY` (issue #30), 4.7 `ENDPOINT_NOT_LIVE` (issue #34), 5 `UNKNOWN_SERVICE`, 6 `REQUEST_LIMIT_EXCEEDED`, 7 `DAILY_LIMIT_EXCEEDED`, 8 `SERVICE_LIMIT_EXCEEDED`, 9 `APPROVAL_REQUIRED`. `DENY` outranks `APPROVAL_REQUIRED` outranks `ALLOW`. Cap boundaries match the inner payment guards exactly: `> cap` denies, reaching the cap exactly is allowed.
 
 ### Trust levels
 
@@ -194,7 +196,8 @@ JSON via `POLICY_CONFIG_PATH` (no new dependencies), with `X402_POLICY_*` env ov
   "tokens":   { "allowed": ["USDC", "wCSPR"] },
   "evm":      { "facilitatorNetworks": ["eip155:8453", "eip155:137", "eip155:42161"] },
   "recipients": { "mode": "change-detect", "allowed": [], "perService": {}, "known": {} },
-  "anomaly": { "enabled": false, "window": 20, "warnZ": 2.0, "denyZ": 3.0, "minSamples": 5, "seedFromDirectory": true, "defaultTolerance": 2.0 }
+  "anomaly": { "enabled": false, "window": 20, "warnZ": 2.0, "denyZ": 3.0, "minSamples": 5, "seedFromDirectory": true, "defaultTolerance": 2.0 },
+  "liveness": { "require_fresh_402": true, "max_age_seconds": 3600 }
 }
 ```
 
@@ -293,7 +296,16 @@ Env overrides (each fails closed on a malformed value — never silently ignored
 
 1. **`APPROVAL_REQUIRED` is a refusal in Phase 1.** This MCP runs over stdio and has no human-approval channel; returning a decision the agent could treat as "pending" would be worse than refusing. The engine returns `APPROVAL_REQUIRED` with that reason code preserved, and `x402_fetch` refuses to pay — the issue's fail-closed principle applied to the approval gap.
 
-2. **The default policy reproduces pre-policy behavior exactly** (the explicit backwards-compatibility decision the issue demands — made explicit here rather than silently weakening the safety model): payments enabled, caps from `MAX_PAYMENT_PER_CALL` (default $0.50) / `MAX_DAILY_SPEND` (default $10.00), networks `[base, solana, casper]`, tokens `[USDC, wCSPR]`, every directory service payable at the global caps, `services.unknown: allow` — because today **any** host is payable at the global caps (directory membership plays no role in the pre-policy gate) — and the recipient gate inactive (`recipients` defaults to `change-detect` with no baselines). **Polygon and Arbitrum are deliberately NOT in the compat default allowlist** (issue #32): widening the set of payable chains is a money-path change and ships opt-in only — add `"polygon", "arbitrum"` to `networks.allowed` to enable them (the default facilitator settle-list `evm.facilitatorNetworks` already covers their CAIP-2 ids; it is a fail-closed gate consulted only for chains that passed `networks.allowed`, never an authorisation source). The unchanged test suite is the proof of that compatibility. Tightening — e.g. `services.unknown: "deny"` so non-directory hosts are refused, or a recipient `allowlist` — is opt-in via config. The zero-behavior-change claim is test-locked: the full pre-existing suite passes unchanged under the default policy, and the fetch integration tests assert both the refusal path and the untouched default path.
+2. **The default policy reproduces pre-policy behavior exactly** (the explicit backwards-compatibility decision the issue demands — made explicit here rather than silently weakening the safety model): payments enabled, caps from `MAX_PAYMENT_PER_CALL` (default $0.50) / `MAX_DAILY_SPEND` (default $10.00), networks `[base, solana, casper]`, tokens `[USDC, wCSPR]`, every directory service payable at the global caps, `services.unknown: allow` — because today **any** host is payable at the global caps (directory membership plays no role in the pre-policy gate) — and the recipient gate inactive (`recipients` defaults to `change-detect` with no baselines). **Polygon and Arbitrum are deliberately NOT in the compat default allowlist** (issue #32): widening the set of payable chains is a money-path change and ships opt-in only — add `"polygon", "arbitrum"` to `networks.allowed` to enable them (the default facilitator settle-list `evm.facilitatorNetworks` already covers their CAIP-2 ids; it is a fail-closed gate consulted only for chains that passed `networks.allowed`, never an authorisation source). **Issue #34 adds the ONE deliberate default tightening**: the endpoint liveness gate (`liveness.require_fresh_402: true`) refuses payments to DIRECTORY rows that are unpinned or lack a fresh live 402 probe — while hosts that are NOT directory rows stay governed by the pre-#34 rules exactly as today (allowlist omitted = seed-pinned mode, inert for non-catalog hosts), so the pre-#34 paid-flow tests stay green by construction. The unchanged test suite is the proof of that compatibility. Tightening — e.g. `services.unknown: "deny"` so non-directory hosts are refused, or a recipient `allowlist` — is opt-in via config. The zero-behavior-change claim is test-locked: the full pre-existing suite passes unchanged under the default policy, and the fetch integration tests assert both the refusal path and the untouched default path.
+
+### Endpoint liveness (issue #34)
+
+Discovery no longer treats directory membership as proof of liveness. Each directory entry carries its most recent liveness probe record (`liveness`: `{ probed_at, status: live_402|no_402|error, latency_ms, probe_url, accepts? }`), written ONLY by the operator-triggered refresh tool:
+
+- **`x402_probe_allowlist`** probes the pin set — with bounded concurrency (4), a 10 s per-probe timeout, no redirects, and never a payment — and records each result atomically onto its directory entry (the same `atomicWriteFileSync` path every directory write uses). Run it on your own schedule (e.g. cron, like the directory crawler); nothing probes in the background, and **`x402_search` performs zero network calls** (tripwire-tested).
+- **`x402_search` ranks live-first**: rows with a fresh `live_402` record sort ahead (newest probe first), then rows with stale / `no_402` / `error` records, then never-probed rows. Every row carries `live: boolean` and its `liveness` block; the summary adds `live_total`. Rows that are NOT on the pin set are withheld by default (`include_unverified: true` reveals them, always `live: false`).
+- **The pin set** (policy `liveness` block): when `liveness.allowlist` is **omitted** (the default), directory entries with `source: "seed"` are pinned — the operator-curated baseline. An explicit `allowlist: [{ base_url, paths? }]` pins the directory rows whose ORIGIN matches a configured `base_url` (a `paths` list additionally narrows the gate per-URL and drives which URLs the refresh probes); a configured `base_url` with no matching directory row pins **nothing** (records live on directory entries; this change never grows the catalog). `allowlist: []` pins nothing and turns the gate into **strict allowlist mode**: every unlisted host is refused, including non-directory hosts.
+- **Rule 4.7 (`ENDPOINT_NOT_LIVE`) fails closed at the payment gate**: with `require_fresh_402: true` (the default) a payment to a directory row is refused unless the row is pinned AND its probe record is a fresh `live_402` (not older than `max_age_seconds`, default 3600 s). The verdict is computed at context build and re-derived once more **inside the signing hook** (`INTENT_ENDPOINT_NOT_LIVE` abort before any signature), so a record that ages out between the gate and the signature can no longer be paid. Non-directory hosts are inert when the allowlist is omitted — `services.unknown`, recipient and cap rules govern them exactly as before. `x402_check_payment` echoes the verdict as `endpoint_liveness`. Set `require_fresh_402: false` to turn the gate off (search keeps its liveness metadata); the `liveness` block is **file-only** — no `X402_POLICY_*` env override, like `recipients`/`anomaly`.
 
 ### Inspecting a payment without paying
 
@@ -370,7 +382,7 @@ The boundary is internal to the server: no new MCP tool, no new tool argument, a
 
 Independent on-chain verification is roadmap work — it requires a chain client per network (Base, Solana, Casper) to confirm the settlement transaction. Until then, treat `receipt_verified: false` as the ground truth: if a payment's settlement matters to you, verify the `tx_hash` / receipt yourself on the relevant chain explorer.
 
-The other trust boundaries are explicit: the discovery fetcher refuses private/loopback/link-local addresses before any request and never follows redirects (see `x402_discover_url`), payment paths refuse redirects and size-bound all response bodies and payment headers, and the directory is written atomically with corrupt-file quarantine rather than silent overwrite.
+The other trust boundaries are explicit: the discovery fetcher refuses private/loopback/link-local addresses before any request and never follows redirects (see `x402_discover_url`), payment paths refuse redirects and size-bound all response bodies and payment headers, the directory is written atomically with corrupt-file quarantine rather than silent overwrite, and **directory membership is not treated as proof of liveness** (issue #34): `x402_search` ranks by the recorded 402 probes and the payment gate fails closed (`ENDPOINT_NOT_LIVE`) on endpoints off the liveness pin set or with a missing/stale/failed probe.
 
 ## Quick Start
 
@@ -449,7 +461,18 @@ hermes mcp test x402
 x402_search({ query: "news" })
 x402_search({ category: "social" })
 x402_search({ chain: "solana" })
+x402_search({ include_unverified: true })   // also show rows OFF the liveness pin set (always live: false)
 ```
+
+Results are ranked live-first: each row carries `live` and a `liveness` block (`status`, `probed_at`, `stale`), and the summary carries `live_total` (issue #34).
+
+### Refresh the liveness probes
+
+```
+x402_probe_allowlist({})   // probes the pin set (seed rows, or liveness.allowlist origins); never pays
+```
+
+Run it on your own schedule (cron), exactly like the directory crawler — search itself never probes.
 
 ### Discover a service by URL
 
@@ -510,7 +533,7 @@ cp endpoints.example.json endpoints.json
 # Then run x402_crawl_directory to populate
 ```
 
-Directory entries carry a `source` field for provenance: `"seed"` marks the operator-curated baseline, `"discovery"` marks entries added by `x402_crawl_directory`. This is the baseline for the trust-level classification planned in issue #19.
+Directory entries carry a `source` field for provenance: `"seed"` marks the operator-curated baseline, `"discovery"` marks entries added by `x402_crawl_directory`. This is the baseline for the trust-level classification planned in issue #19, and — since issue #34 — for the **liveness pin set**: with `liveness.allowlist` omitted (the default), only `"seed"` rows are pinned (ranked live-first in `x402_search` when freshly probed, and payable under rule 4.7); `"discovery"` rows are unverified until explicitly pinned. Entries also accumulate a `liveness` record written by `x402_probe_allowlist` (see *Endpoint liveness*).
 
 ## Automated Directory Refresh
 
