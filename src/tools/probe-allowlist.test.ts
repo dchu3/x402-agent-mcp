@@ -225,3 +225,242 @@ it('the accepts snapshot is capped at 8 entries and 200 chars per field', async 
   }
   ledgerUntouched();
 });
+
+// ---------------------------------------------------------------------------
+// Issue #38 — the probe must reach a PAYABLE PATH. Most x402 hosts serve a
+// free 200/404 landing page at root and challenge on an API path, so a
+// root-only probe recorded a permanent no_402 — and the fail-closed gate then
+// refused a demonstrably payable endpoint forever. These cases pin the
+// bounded candidate walk (advertised → root → openapi discovery), the caps,
+// and the configured-paths-exhaustive contract. All network is the mocked
+// globalThis.fetch — no live HTTP; the ledger is untouched in every case.
+// ---------------------------------------------------------------------------
+
+function openApiSpec(paths: Record<string, unknown>): Response {
+  return Response.json({ openapi: '3.0.0', paths });
+}
+
+it('issue #38 regression: root free/404 but the API path challenges ⇒ recorded live_402 at the paid path', async () => {
+  // The measured live shape (plan fact 2): root → 404; /openapi.json lists
+  // three FREE GET paths before the paid one; /weather/current → 402.
+  writeDirectory([seedEntry('Weather', 'https://weather.example', { source: 'seed' })]);
+  const seen: string[] = [];
+  globalThis.fetch = (async (input: unknown) => {
+    const url = input instanceof Request ? input.url : String(input);
+    seen.push(url);
+    if (url === 'https://weather.example') return new Response('not found', { status: 404 });
+    if (url === 'https://weather.example/openapi.json') {
+      return openApiSpec({
+        '/.well-known/x402': { get: {} },
+        '/health': { get: {} },
+        '/llms.txt': { get: {} },
+        '/weather/current': { get: {} },
+        '/weather/forecast': { get: {} },
+      });
+    }
+    if (url === 'https://weather.example/weather/current') return challenge402();
+    throw new Error(`unexpected probe target ${url}`);
+  }) as any;
+  const result = await handler()({});
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.probed, 1);
+  assert.equal(parsed.live_total, 1, 'a path-challenging service is now live — the #38 fix');
+  assert.equal(parsed.results[0].status, 'live_402');
+  assert.equal(parsed.results[0].probe_url, 'https://weather.example/weather/current', 'the record points at the payable PATH');
+  // Build-then-walk: the spec fetch happens first, then root (free), then the
+  // paid path wins with early exit — noise and the remaining discovery
+  // candidate are never fetched.
+  assert.deepEqual(seen, [
+    'https://weather.example/openapi.json',
+    'https://weather.example',
+    'https://weather.example/weather/current',
+  ]);
+  const dirAfter = readDirectory();
+  const weather = dirAfter.endpoints.find((e: any) => e.name === 'Weather');
+  assert.equal(weather.liveness.status, 'live_402');
+  assert.equal(weather.liveness.probe_url, 'https://weather.example/weather/current');
+  assert.ok(Array.isArray(weather.liveness.accepts), 'the accepts snapshot comes from the winning 402 challenge');
+  ledgerUntouched();
+});
+
+it('advertised GET paths are probed ahead of root and win — with placeholders substituted only in the request URL', async () => {
+  // Plan fact 5: svm402.com advertises /price/{address} — the clearly-marked
+  // placeholder probe is a valid representative.
+  writeDirectory([seedEntry('Svm', 'https://svm.example', {
+    source: 'seed',
+    endpoints: [{ path: '/price/{address}', method: 'GET', price_usdc: '0.01', description: '' }],
+  })]);
+  const seen: string[] = [];
+  globalThis.fetch = (async (input: unknown) => {
+    const url = input instanceof Request ? input.url : String(input);
+    seen.push(url);
+    if (url === 'https://svm.example/openapi.json') {
+      return openApiSpec({ '/also-paid': { get: {} } }); // must never be reached — the advertised path wins first
+    }
+    if (url === 'https://svm.example/price/x402-probe') return challenge402();
+    throw new Error(`unexpected probe target ${url}`);
+  }) as any;
+  const result = await handler()({});
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.results[0].status, 'live_402');
+  assert.equal(parsed.results[0].probe_url, 'https://svm.example/price/x402-probe', 'the substituted advertised path wins');
+  assert.deepEqual(seen, ['https://svm.example/openapi.json', 'https://svm.example/price/x402-probe'],
+    'early exit at the advertised path: root and discovery candidates are never fetched');
+  ledgerUntouched();
+});
+
+it('full precedence order: advertised (GET-only, POST skipped) → root → noise-filtered openapi discovery', async () => {
+  writeDirectory([seedEntry('Order', 'https://order.example', {
+    source: 'seed',
+    endpoints: [
+      { path: '/only-post', method: 'POST', price_usdc: '0.01', description: '' }, // never probed
+      { path: '/v1/quote', method: 'GET', price_usdc: '0.01', description: '' },
+    ],
+  })]);
+  const seen: string[] = [];
+  globalThis.fetch = (async (input: unknown) => {
+    const url = input instanceof Request ? input.url : String(input);
+    seen.push(url);
+    if (url === 'https://order.example/openapi.json') {
+      return openApiSpec({
+        '/.well-known/x402': { get: {} }, // noise — filtered BEFORE the cap, never probed
+        '/health': { get: {} },
+        '/llms.txt': { get: {} },
+        '/paid': { get: {} },
+      });
+    }
+    if (url === 'https://order.example/v1/quote') return new Response('free quote', { status: 200 });
+    if (url === 'https://order.example') return new Response('landing', { status: 200 });
+    if (url === 'https://order.example/paid') return challenge402();
+    throw new Error(`unexpected probe target ${url}`);
+  }) as any;
+  const result = await handler()({});
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.results[0].status, 'live_402');
+  assert.equal(parsed.results[0].probe_url, 'https://order.example/paid');
+  assert.deepEqual(seen, [
+    'https://order.example/openapi.json',
+    'https://order.example/v1/quote',
+    'https://order.example',
+    'https://order.example/paid',
+  ], 'advertised → root → discovery, in order; POST-only advertised path and noise never probed');
+  ledgerUntouched();
+});
+
+it('all-free ⇒ still no_402 (no false live) and the walk stays capped at 5 URLs (P4)', async () => {
+  writeDirectory([seedEntry('Free', 'https://free.example', {
+    source: 'seed',
+    endpoints: [{ path: '/free', method: 'GET', price_usdc: '0', description: '' }],
+  })]);
+  const seen: string[] = [];
+  globalThis.fetch = (async (input: unknown) => {
+    const url = input instanceof Request ? input.url : String(input);
+    seen.push(url);
+    if (url === 'https://free.example/openapi.json') {
+      const paths: Record<string, unknown> = {};
+      for (let i = 1; i <= 12; i++) paths[`/d${i}`] = { get: {} }; // 12 GET paths — discovery caps at 8, walk at 5
+      return openApiSpec(paths);
+    }
+    return new Response('free page', { status: 200 });
+  }) as any;
+  const result = await handler()({});
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.results[0].status, 'no_402', 'free answers everywhere ⇒ no_402 — never a false live');
+  assert.equal(parsed.results[0].probe_url, 'https://free.example/free', 'the first ANSWERED candidate is recorded');
+  assert.deepEqual(seen, [
+    'https://free.example/openapi.json',
+    'https://free.example/free',
+    'https://free.example',
+    'https://free.example/d1',
+    'https://free.example/d2',
+    'https://free.example/d3',
+  ], 'candidates [advertised, root, d1..d8] truncated to the 5-URL walk cap');
+  const dirAfter = readDirectory();
+  const free = dirAfter.endpoints.find((e: any) => e.name === 'Free');
+  assert.equal(free.liveness.status, 'no_402');
+  assert.equal(free.liveness.accepts, undefined, 'no_402 never invents an accepts snapshot');
+  ledgerUntouched();
+});
+
+it('every candidate errors ⇒ recorded error with the diagnostic (never live)', async () => {
+  writeDirectory([seedEntry('Down', 'https://down.example', { source: 'seed' })]);
+  const seen: string[] = [];
+  globalThis.fetch = (async (input: unknown) => {
+    const url = input instanceof Request ? input.url : String(input);
+    seen.push(url);
+    throw new Error(`simulated network failure for ${url}`);
+  }) as any;
+  const result = await handler()({});
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.results[0].status, 'error');
+  assert.match(parsed.results[0].error ?? '', /simulated network failure/);
+  assert.equal(parsed.results[0].probe_url, 'https://down.example', 'the last attempted candidate is recorded');
+  assert.equal(parsed.live_total, 0);
+  const dirAfter = readDirectory();
+  assert.equal(dirAfter.endpoints[0].liveness.status, 'error');
+  ledgerUntouched();
+});
+
+it('an unreachable openapi.json does not break the walk — root free ⇒ no_402', async () => {
+  writeDirectory([seedEntry('NoSpec', 'https://nospec.example', { source: 'seed' })]);
+  const seen: string[] = [];
+  globalThis.fetch = (async (input: unknown) => {
+    const url = input instanceof Request ? input.url : String(input);
+    seen.push(url);
+    if (url === 'https://nospec.example/openapi.json') return new Response('nope', { status: 404 });
+    if (url === 'https://nospec.example') return new Response('free page', { status: 200 });
+    throw new Error(`unexpected probe target ${url}`);
+  }) as any;
+  const result = await handler()({});
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.results[0].status, 'no_402');
+  assert.equal(parsed.results[0].probe_url, 'https://nospec.example');
+  assert.deepEqual(seen, ['https://nospec.example/openapi.json', 'https://nospec.example']);
+  ledgerUntouched();
+});
+
+it('configured paths stay exhaustive (mirror of the :152-182 contract, in a new case): first live wins early, NO discovery', async () => {
+  writeDirectory([seedEntry('Cfg', 'https://cfg.example', { source: 'seed' })]);
+  process.env.POLICY_CONFIG_PATH = policyFile({
+    payments: { enabled: true, maxPerRequest: 0.5, maxDaily: 10 },
+    liveness: { allowlist: [{ base_url: 'https://cfg.example', paths: ['/price/{address}', '/v2'] }] },
+  });
+  const seen: string[] = [];
+  globalThis.fetch = (async (input: unknown) => {
+    const url = input instanceof Request ? input.url : String(input);
+    seen.push(url);
+    if (url === 'https://cfg.example/price/x402-probe') return challenge402();
+    throw new Error(`unexpected probe target ${url}`);
+  }) as any;
+  const result = await handler()({});
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.mode, 'explicit');
+  assert.equal(parsed.results[0].status, 'live_402');
+  assert.equal(parsed.results[0].probe_url, 'https://cfg.example/price/x402-probe', 'the placeholder is substituted in the REQUEST URL only');
+  assert.deepEqual(seen, ['https://cfg.example/price/x402-probe'],
+    'exactly the configured paths are probed — no openapi fetch, no advertised paths, early exit skips /v2');
+  const policyOnDisk = readFileSync(process.env.POLICY_CONFIG_PATH!, 'utf8');
+  assert.ok(policyOnDisk.includes('/price/{address}'), 'the configured path string is never mutated (P3)');
+  ledgerUntouched();
+});
+
+it('configured paths that all answer free ⇒ no_402 and zero discovery — openapi would throw if it were ever fetched', async () => {
+  writeDirectory([seedEntry('CfgFree', 'https://cfgfree.example', { source: 'seed' })]);
+  process.env.POLICY_CONFIG_PATH = policyFile({
+    payments: { enabled: true, maxPerRequest: 0.5, maxDaily: 10 },
+    liveness: { allowlist: [{ base_url: 'https://cfgfree.example', paths: ['/a', '/b'] }] },
+  });
+  const seen: string[] = [];
+  globalThis.fetch = (async (input: unknown) => {
+    const url = input instanceof Request ? input.url : String(input);
+    seen.push(url);
+    if (url === 'https://cfgfree.example/a' || url === 'https://cfgfree.example/b') return new Response('free', { status: 200 });
+    throw new Error(`unexpected probe target ${url}`);
+  }) as any;
+  const result = await handler()({});
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.results[0].status, 'no_402');
+  assert.deepEqual(seen, ['https://cfgfree.example/a', 'https://cfgfree.example/b'],
+    'configured paths are the ONLY URLs probed — exhaustive, no discovery (fact 7)');
+  ledgerUntouched();
+});
