@@ -151,6 +151,105 @@ export async function findPaymentChallenge(baseUrl: string, timeoutMs: number = 
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// Issue #38 — bounded multi-path candidate discovery. Most x402 hosts serve a
+// free 200/404 landing page at root and challenge on an API PATH, so a
+// root-only probe records a permanent no_402 for a demonstrably payable
+// service (and the fail-closed liveness gate then refuses it forever). These
+// helpers let the refresh probe build a BOUNDED candidate URL list — advertised
+// paths, the base_url itself, and noise-filtered /openapi.json GET paths — and
+// walk it with early exit. Substitution is for REQUEST-URL construction only;
+// discovery is bounded, free, never follows redirects, and never pays.
+// ---------------------------------------------------------------------------
+
+/** The substitute token for parametrized probe candidates (issue #38, P3).
+ * MEASURED (plan fact 5): a clearly-marked placeholder is a valid
+ * representative probe — /price/x402-probe answers 402 where /price/{address}
+ * is the advertised shape. */
+export const PROBE_PLACEHOLDER = "x402-probe";
+
+/** Substitute path/query placeholders in a candidate path with the probe
+ * token (issue #38, P3): a trailing `*` and each `{...}` placeholder — in a
+ * path segment or in a query string — become `x402-probe`. Anything without
+ * placeholders is returned byte-identical. Callers apply this ONLY when
+ * building a request URL; the configured/advertised path string itself is
+ * never mutated. */
+export function probePlaceholderUrl(path: string): string {
+  return path
+    .replace(/\*$/, PROBE_PLACEHOLDER)
+    .replace(/\{[^{}]*\}/g, PROBE_PLACEHOLDER);
+}
+
+/** Paths treated as noise when picking /openapi.json discovery candidates
+ * (issue #38, P2): free static/well-known/health endpoints. They are dropped
+ * BEFORE the discovery cap so they can never starve the paid paths — the
+ * measured failure mode of findPaymentChallenge's 3-path insertion-order
+ * budget (plan fact 3: /.well-known/x402, /health and /llms.txt consumed the
+ * budget before /weather/current was ever reached). */
+const OPENAPI_NOISE_PATHS = new Set(["/llms.txt", "/robots.txt", "/favicon.ico", "/health", "/openapi.json"]);
+
+/** Discovery cap (issue #38, P2): at most this many GET paths are taken from
+ * one /openapi.json spec, after the noise filter, in insertion order. */
+export const OPENAPI_PROBE_PATH_LIMIT = 8;
+
+/** Select the discovery candidate paths from an OpenAPI spec (issue #38, P2):
+ * entries with a `get` operation only, noise-filtered, capped, ORDER
+ * PRESERVED (insertion order — the spec's own ordering is the service's self-
+ * description). Never throws: a junk spec (null, non-object, missing/odd
+ * `paths`) yields []. Paths are returned verbatim from the spec. */
+export function openApiProbePaths(spec: any, limit: number = OPENAPI_PROBE_PATH_LIMIT): string[] {
+  if (!spec || typeof spec !== "object" || !spec.paths || typeof spec.paths !== "object") return [];
+  const out: string[] = [];
+  for (const [path, methods] of Object.entries<any>(spec.paths)) {
+    if (out.length >= limit) break;
+    if (!methods?.get) continue;
+    if (path.startsWith("/.well-known/") || OPENAPI_NOISE_PATHS.has(path)) continue;
+    out.push(path);
+  }
+  return out;
+}
+
+/** The aggregate outcome of one bounded candidate walk (issue #38, P5): the
+ * liveness outcome plus the EXACT URL that produced it — the first live_402
+ * candidate when one exists, else the first candidate that answered
+ * (no_402), else the last candidate attempted (all-error). */
+export interface AggregateProbeResult {
+  result: LivenessProbeResult;
+  probe_url: string;
+}
+
+/** Walk candidate URLs with the per-URL probe and aggregate the outcomes
+ * (issue #38, P5/P6): a bounded sequential walk over the existing
+ * probePaymentChallenge (one shared HTTP stack — no second client, no new
+ * dependency, nothing ever paid).
+ *   - the FIRST live_402 wins and probe_url records that exact URL (early
+ *     exit — later candidates are never fetched);
+ *   - else no_402 when at least one candidate answered (any non-error
+ *     outcome — the highest-precedence answered candidate is reported);
+ *   - else error when EVERY candidate threw/aborted (the last attempt's
+ *     diagnostic and URL);
+ *   - zero candidates ⇒ a deterministic error outcome ("no candidate URLs").
+ * Candidates are de-duplicated by exact string equality (P4) and the walk is
+ * capped at `limit` URLs (default 5). Never throws. */
+export async function probeChallengeAcross(urls: string[], timeoutMs: number = 10000, limit: number = 5): Promise<AggregateProbeResult> {
+  const candidates = [...new Set(urls)].slice(0, Math.max(0, limit));
+  let firstAnswered: AggregateProbeResult | undefined;
+  let last: AggregateProbeResult | undefined;
+  for (const url of candidates) {
+    const result = await probePaymentChallenge(url, timeoutMs);
+    const at: AggregateProbeResult = { result, probe_url: url };
+    if (result.kind === "live_402") return at;
+    if (result.kind === "no_402" && firstAnswered === undefined) firstAnswered = at;
+    last = at;
+  }
+  if (firstAnswered) return firstAnswered;
+  if (last) return last; // every candidate errored — the last attempt is the record
+  return {
+    result: { kind: "error", latency_ms: 0, error: "no candidate URLs to probe" },
+    probe_url: "",
+  };
+}
+
 /** Extract chains from an x402 manifest/challenge: accepts[].network, flat
  * network, or SIWX extensions.supportedChains (challenge with empty accepts,
  * e.g. SIWX wallet-auth-gated services). */
