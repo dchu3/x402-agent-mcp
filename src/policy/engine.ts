@@ -31,6 +31,14 @@
 //      settled-amount baseline. Middle band ⇒ APPROVAL_REQUIRED, high band ⇒
 //      hard deny; inert for the mote-denominated Casper leg and when
 //      anomaly.enabled is false (the compat default).
+//   4.7 ENDPOINT_NOT_LIVE       — endpoint liveness gate (issue #34): fails
+//      closed when the caller-supplied liveness verdict (ctx.endpointLiveness,
+//      computed by buildPolicyContext from the directory row + config +
+//      injected clock — never by this engine, which never reads the
+//      directory) is not ok: the target is off the pin set, or its last 402
+//      probe is missing/stale/not-402. Fires only when
+//      liveness.require_fresh_402 is on and a verdict was supplied; an absent
+//      verdict leaves the rule inert.
 //   5. UNKNOWN_SERVICE          — services.unknown = deny and level UNKNOWN
 //   6. REQUEST_LIMIT_EXCEEDED   — per-request cap (level override ?? global)
 //   7. DAILY_LIMIT_EXCEEDED     — global daily cap
@@ -78,6 +86,7 @@ const DENY_CODES: ReadonlySet<ReasonCode> = new Set([
   "SERVICE_LIMIT_EXCEEDED",
   "CONFIG_INVALID",
   "RECIPIENT_NOT_ALLOWED", // rule 4.5 (issue #26): the recipient gate — emitted by the engine since #26
+  "ENDPOINT_NOT_LIVE", // rule 4.7 (issue #34): the liveness gate — a liveness refusal has no approval band
 ]);
 
 export class PolicyEngine {
@@ -249,6 +258,20 @@ export class PolicyEngine {
     } else if (anomalyEval.band === "deny") {
       reasons.push(anomalyEval.reason!);
       hardDeny = true;
+    }
+
+    // Rule 4.7: endpoint liveness gate (issue #34). The verdict arrives ON the
+    // context — computed by buildPolicyContext from the directory row +
+    // liveness config + injected clock — so this pure core never reads the
+    // directory (L1). The rule fires ONLY when the operator gate is on and the
+    // verdict is present and not ok; a context without a liveness verdict
+    // (every pre-#34 caller) changes nothing. The message is the verdict's
+    // own reason text.
+    if (cfg.liveness.require_fresh_402 && ctx.endpointLiveness?.ok === false) {
+      reasons.push({
+        code: "ENDPOINT_NOT_LIVE",
+        message: ctx.endpointLiveness.reason ?? `Endpoint ${ctx.service} failed the endpoint liveness gate (fail-closed)`,
+      });
     }
 
     // Rule 5: unknown service (services.unknown = deny refuses non-directory

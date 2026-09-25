@@ -10,10 +10,15 @@ const dir = mkdtempSync(join(tmpdir(), 'x402-check-payment-'));
 const env = { ...process.env };
 process.env.PAYMENT_LOG_PATH = join(dir, 'ledger.jsonl');
 process.env.X402_DIRECTORY_PATH = join(dir, 'endpoints.json');
+// Issue #34 fixture edit (L4, permitted class — assertions unchanged): the
+// default liveness gate is ON in seed-pinned mode, so a directory row a test
+// expects to ALLOW through the gate must be pinned (source: 'seed') and carry
+// a FRESH live_402 probe record. Entries without ALLOW assertions (SolPay)
+// gain the provenance field only.
 writeFileSync(process.env.X402_DIRECTORY_PATH, JSON.stringify({
   endpoints: [
-    { name: 'Analyzer', description: '', base_url: 'https://analyzer.example', chain: 'base', category: 'ai', tags: [], endpoints: [{ path: '/score', method: 'POST', price_usdc: '0.05', description: '' }] },
-    { name: 'SolPay', description: '', base_url: 'https://solpay.example', chain: 'solana', category: 'multi', tags: [], endpoints: [] },
+    { name: 'Analyzer', description: '', base_url: 'https://analyzer.example', chain: 'base', category: 'ai', tags: [], endpoints: [{ path: '/score', method: 'POST', price_usdc: '0.05', description: '' }], source: 'seed', liveness: { probed_at: new Date().toISOString(), status: 'live_402', latency_ms: 12, probe_url: 'https://analyzer.example' } },
+    { name: 'SolPay', description: '', base_url: 'https://solpay.example', chain: 'solana', category: 'multi', tags: [], endpoints: [], source: 'seed' },
   ],
   categories: [], last_updated: '2026-09-21',
 }), 'utf8');

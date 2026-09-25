@@ -100,6 +100,10 @@ it('cap enforcement per service while global cap intact (engine + store together
       anomaly: { enabled: false, window: 20, warnZ: 2.0, denyZ: 3.0, minSamples: 5, seedFromDirectory: true, defaultTolerance: 2.0 },
       // Issue #32: the facilitator settle-list.
       evm: { facilitatorNetworks: ['eip155:8453', 'eip155:137', 'eip155:42161'] },
+      // Issue #34 REQUIRED member: the liveness gate defaults (seed mode; no
+      // endpointLiveness is supplied on any context here, so rule 4.7 is
+      // inert for this suite by construction).
+      liveness: { require_fresh_402: true, max_age_seconds: 3600 },
     },
     configErrors: [],
   });

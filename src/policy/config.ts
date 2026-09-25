@@ -41,9 +41,13 @@ import { readFileSync } from "fs";
 import { PolicyEngine } from "./engine.js";
 import { DEFAULT_ANOMALY_CONFIG } from "./anomaly.js";
 import { DEFAULT_FACILITATOR_NETWORKS } from "../evm/networks.js";
-import { loadDirectory } from "../directory.js";
+import { findEntryForUrl, loadDirectory } from "../directory.js";
+import { livenessVerdict } from "./liveness.js";
 import type {
   AnomalyConfig,
+  EndpointLiveness,
+  LivenessAllowlistEntry,
+  LivenessConfig,
   PolicyConfig,
   PolicyContext,
   PolicyEngineState,
@@ -108,6 +112,14 @@ export function defaultPolicyConfig(errors: string[] = []): PolicyConfig {
     // recipient allowlist. DEFAULT_POLICY_CONFIG.anomaly.enabled === false and
     // the untouched existing test suite are the compat proof.
     anomaly: { ...DEFAULT_ANOMALY_CONFIG },
+    // Issue #34 (L10): the liveness gate ships with the issue's fail-closed
+    // defaults — require_fresh_402 TRUE, max_age_seconds 3600 — with the
+    // allowlist ABSENT (seed-pinned mode, L2). Per L3 this is a real
+    // tightening for catalog rows (a directory row must be pinned and freshly
+    // live) and inert for non-catalog hosts (no catalog claim to falsify), so
+    // the existing paid-path tests — all on non-directory hosts — stay green
+    // by construction. Fresh copies — DEFAULT_POLICY_CONFIG must stay pristine.
+    liveness: { require_fresh_402: true, max_age_seconds: 3600 },
   };
 }
 /** Frozen snapshot of the compat default, exported for documentation/tests.
@@ -140,6 +152,10 @@ function failClosedConfig(errors: string[]): PolicyConfig {
     // Fail-closed anomaly state: the disabled default (payments are disabled
     // here anyway — the engine short-circuits on configErrors before any rule).
     anomaly: { ...DEFAULT_ANOMALY_CONFIG },
+    // Fail-closed liveness state (issue #34): gate on, explicit EMPTY
+    // allowlist ⇒ strict mode with an empty pin set — NOTHING is live in this
+    // state (the engine additionally short-circuits on configErrors).
+    liveness: { require_fresh_402: true, max_age_seconds: 3600, allowlist: [] },
   };
 }
 
@@ -257,6 +273,56 @@ function anomalyPolicy(v: unknown, path: string, errors: string[]): void {
   }
 }
 
+function livenessPolicy(v: unknown, path: string, errors: string[]): void {
+  if (!isPlainObject(v)) {
+    errors.push(`${path} must be an object with require_fresh_402 / max_age_seconds / allowlist (issue #34)`);
+    return;
+  }
+  const known = new Set(["require_fresh_402", "max_age_seconds", "allowlist"]);
+  for (const key of Object.keys(v)) {
+    if (!known.has(key)) errors.push(`${path}.${key} is not a recognised policy key (typo protection)`);
+  }
+  if (v.require_fresh_402 !== undefined && typeof v.require_fresh_402 !== "boolean") {
+    errors.push(`${path}.require_fresh_402 must be a boolean`);
+  }
+  if (v.max_age_seconds !== undefined && !(typeof v.max_age_seconds === "number" && Number.isFinite(v.max_age_seconds) && v.max_age_seconds > 0)) {
+    errors.push(`${path}.max_age_seconds must be a finite number > 0`);
+  }
+  if (v.allowlist !== undefined) {
+    if (!Array.isArray(v.allowlist)) {
+      errors.push(`${path}.allowlist must be an array of { base_url, paths? } entries ([] is allowed and pins nothing — strict mode)`);
+    } else {
+      for (const [i, item] of v.allowlist.entries()) {
+        const ipath = `${path}.allowlist[${i}]`;
+        if (!isPlainObject(item)) {
+          errors.push(`${ipath} must be an object with a base_url string`);
+          continue;
+        }
+        for (const key of Object.keys(item)) {
+          if (key !== "base_url" && key !== "paths") errors.push(`${ipath}.${key} is not a recognised policy key (typo protection)`);
+        }
+        if (typeof item.base_url !== "string" || item.base_url.trim() === "") {
+          errors.push(`${ipath}.base_url must be a non-empty string`);
+        } else {
+          try {
+            const u = new URL(item.base_url);
+            if (u.protocol !== "http:" && u.protocol !== "https:") {
+              errors.push(`${ipath}.base_url must be an http/https URL — got '${item.base_url}'`);
+            }
+          } catch {
+            errors.push(`${ipath}.base_url must be a parseable http/https URL — got '${item.base_url}'`);
+          }
+        }
+        if (item.paths !== undefined) {
+          if (!Array.isArray(item.paths) || !item.paths.every((p: unknown) => typeof p === "string" && p.startsWith("/"))) {
+            errors.push(`${ipath}.paths must be an array of path strings, each starting with "/"`);
+          }
+        }
+      }
+    }
+  }
+}
+
 function evmPolicy(v: unknown, path: string, errors: string[]): void {
   if (!isPlainObject(v)) {
     errors.push(`${path} must be an object with a "facilitatorNetworks" array of CAIP-2 ids (issue #32)`);
@@ -279,15 +345,15 @@ function evmPolicy(v: unknown, path: string, errors: string[]): void {
 
 /** Strict validation of a parsed config document against the schema. Only
  * `payments` is required (safety-critical — the issue's fail-closed rule);
- * services/networks/tokens/recipients/anomaly/evm are optional and merge over
- * the defaults. Unknown keys are errors everywhere (typo protection: a
- * misspelled cap must never be silently ignored). */
+ * services/networks/tokens/recipients/anomaly/evm/liveness are optional and
+ * merge over the defaults. Unknown keys are errors everywhere (typo
+ * protection: a misspelled cap must never be silently ignored). */
 function validateDocument(doc: unknown, errors: string[]): void {
   if (!isPlainObject(doc)) {
     errors.push("policy config must be a JSON object");
     return;
   }
-  const knownTop = new Set(["payments", "services", "networks", "tokens", "recipients", "anomaly", "evm"]);
+  const knownTop = new Set(["payments", "services", "networks", "tokens", "recipients", "anomaly", "evm", "liveness"]);
   for (const key of Object.keys(doc)) {
     if (!knownTop.has(key)) errors.push(`policy config key "${key}" is not recognised (typo protection)`);
   }
@@ -361,6 +427,17 @@ function validateDocument(doc: unknown, errors: string[]): void {
   if (doc.evm !== undefined) {
     evmPolicy(doc.evm, "evm", errors);
   }
+
+  // liveness — optional; strict shape (issue #34, L8): require_fresh_402 a
+  // boolean, max_age_seconds a finite number > 0, allowlist an array of
+  // { base_url: parseable http/https URL, paths?: path strings starting with
+  // "/" } ([] allowed — it pins nothing and activates strict mode). A partial
+  // block merges over the defaults in applyFileConfig (the anomaly
+  // precedent). FILE-ONLY: no X402_POLICY_* env override (the recipients /
+  // anomaly precedent).
+  if (doc.liveness !== undefined) {
+    livenessPolicy(doc.liveness, "liveness", errors);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -420,6 +497,11 @@ function applyFileConfig(config: PolicyConfig, errors: string[]): void {
     };
     anomaly?: Partial<AnomalyConfig>;
     evm?: { facilitatorNetworks?: string[] };
+    liveness?: {
+      require_fresh_402?: boolean;
+      max_age_seconds?: number;
+      allowlist?: LivenessAllowlistEntry[];
+    };
   };
 
   // payments is fully specified (required) — replace wholesale.
@@ -479,6 +561,27 @@ function applyFileConfig(config: PolicyConfig, errors: string[]): void {
   // recipients/anomaly above).
   if (d.evm?.facilitatorNetworks) {
     config.evm = { facilitatorNetworks: [...d.evm.facilitatorNetworks] };
+  }
+
+  // Issue #34: merge the liveness block over the defaults ONLY when present,
+  // field-by-field with fresh copies — never aliasing DEFAULT_POLICY_CONFIG
+  // (same convention as recipients/anomaly/evm above). `allowlist` is
+  // distinguished from ABSENT (L2/L3): an omitted key keeps the default
+  // (seed-pinned mode); an explicit [] pins nothing and puts the gate in
+  // strict mode. Shapes are guaranteed by validateDocument.
+  if (d.liveness) {
+    const merged: LivenessConfig = {
+      require_fresh_402: d.liveness.require_fresh_402 ?? config.liveness.require_fresh_402,
+      max_age_seconds: d.liveness.max_age_seconds ?? config.liveness.max_age_seconds,
+    };
+    const allowlist = d.liveness.allowlist !== undefined ? d.liveness.allowlist : config.liveness.allowlist;
+    if (allowlist !== undefined) {
+      merged.allowlist = allowlist.map((a) => ({
+        base_url: a.base_url,
+        ...(a.paths !== undefined ? { paths: [...a.paths] } : {}),
+      }));
+    }
+    config.liveness = merged;
   }
 }
 
@@ -547,6 +650,9 @@ function applyEnvOverrides(config: PolicyConfig, errors: string[]): void {
   // NOTE (issue #30): the `anomaly` block has deliberately NO X402_POLICY_*
   // override — same precedent as `recipients`: the thresholds/seed settings
   // are file-only operator config (see applyFileConfig).
+  // NOTE (issue #34): the `liveness` block likewise has deliberately NO
+  // X402_POLICY_* override — fail-closed pin-set semantics need the file's
+  // structured shape (see applyFileConfig).
 
   // Per-level service overrides: X402_POLICY_SERVICE_<LEVEL> = allow|deny|approval
   // plus optional X402_POLICY_SERVICE_<LEVEL>_MAX_PER_REQUEST / _MAX_DAILY.
@@ -632,12 +738,48 @@ export interface BuildContextOptions {
   recipient?: string;
   purpose?: string;
   agentContext?: string;
+  /** Injectable clock (ms since epoch) for the liveness staleness check
+   * (issue #34) — deterministic tests; defaults to Date.now(). */
+  now?: number;
+}
+
+/** Compute the liveness verdict for a prospective target (issue #34, L1): the
+ * directory row (findEntryForUrl — origin match, never throws) plus the
+ * liveness config plus the injected clock, evaluated by the PURE helper
+ * (src/policy/liveness.ts). NEVER throws: on any read failure the verdict is
+ * ok:false ONLY in explicit-allowlist (strict) mode — otherwise the gate is
+ * inert and evaluation proceeds exactly as before. */
+function computeEndpointLiveness(url: string, now?: number): EndpointLiveness | undefined {
+  let cfg: LivenessConfig;
+  try {
+    cfg = loadPolicyConfig().config.liveness;
+  } catch {
+    return undefined; // config not even loadable — the engine already fails closed on its own configErrors path
+  }
+  try {
+    const entry = findEntryForUrl(url);
+    return livenessVerdict({ url, entry, cfg, nowMs: now ?? Date.now() });
+  } catch {
+    if (cfg.allowlist !== undefined) {
+      return {
+        ok: false,
+        status: "never_probed",
+        stale: true,
+        on_allowlist: false,
+        reason: "Liveness state could not be read and liveness.allowlist is explicit — failing closed (strict mode)",
+      };
+    }
+    return { ok: true, status: "never_probed", stale: true, on_allowlist: false };
+  }
 }
 
 /** Build the full PolicyContext for a prospective payment to `url`: derives the
  * service hostname and trust level (the engine itself stays pure). An
  * unparseable URL yields service "" / UNKNOWN — deterministic and fail-closed
- * at the derivation layer. */
+ * at the derivation layer. Issue #34: additionally computes the endpoint
+ * liveness verdict (computeEndpointLiveness) so the engine's rule 4.7 can
+ * refuse an off-pin-set or stale endpoint WITHOUT reading the directory
+ * itself. */
 export function buildPolicyContext(
   url: string,
   chain: string,
@@ -660,6 +802,7 @@ export function buildPolicyContext(
     ...(opts.recipient !== undefined ? { recipient: opts.recipient } : {}),
     ...(opts.purpose !== undefined ? { purpose: opts.purpose } : {}),
     ...(opts.agentContext !== undefined ? { agentContext: opts.agentContext } : {}),
+    endpointLiveness: computeEndpointLiveness(url, opts.now),
     trustLevel: resolveTrustLevel(service),
   };
 }
