@@ -1,18 +1,25 @@
 import { strict as assert } from 'node:assert';
 import { afterEach, after, it } from 'node:test';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { WCSPR_ASSETS } from '../casper/accepts.js';
 const dir = mkdtempSync(join(tmpdir(), 'x402-test-'));
 const env = { ...process.env };
 process.env.PAYMENT_LOG_PATH = join(dir, 'ledger.jsonl');
+// Hermetic directory (issue #37): this suite set no X402_DIRECTORY_PATH, so
+// the #34 liveness gate read the operator's LIVE gitignored endpoints.json —
+// whose FAILED seed row for https://example.invalid hard-DENYed every fixture
+// here (ENDPOINT_NOT_LIVE) before any assertion ran. An empty temp directory
+// (the fetch.test.ts repo pattern) keeps the suite off operator data.
+process.env.X402_DIRECTORY_PATH = join(dir, 'endpoints.json');
+writeFileSync(process.env.X402_DIRECTORY_PATH, JSON.stringify({ endpoints: [], categories: [], last_updated: '2026-09-25' }), 'utf8');
 const { registerFetchTool } = await import('./fetch.js');
 const { boundedText } = await import('./casper-fetch.js');
 const { logPayment, getDailySpent } = await import('../payment-utils.js');
 const { casperBudget } = await import('../casper/budget.js');
 const originalFetch = globalThis.fetch;
-afterEach(() => { globalThis.fetch = originalFetch; process.env = { ...env, PAYMENT_LOG_PATH: join(dir, 'ledger.jsonl') }; });
+afterEach(() => { globalThis.fetch = originalFetch; process.env = { ...env, PAYMENT_LOG_PATH: join(dir, 'ledger.jsonl'), X402_DIRECTORY_PATH: join(dir, 'endpoints.json') }; });
 after(() => { process.env = env; rmSync(dir, {recursive:true, force:true}); });
 function handler() {
   let callback: any;
