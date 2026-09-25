@@ -222,3 +222,68 @@ for #32).
 Recipient allowlists are chain-scoped on the new chains — see the recipient
 section above: a bare '0x…' entry authorises that address on BASE only; use
 'polygon:0x…' / '*:0x…' for the other EVM chains.
+
+---------------------------------------------------------------------------
+Endpoint liveness (issue #34) — the 'liveness' block (rule 4.7,
+ENDPOINT_NOT_LIVE)
+---------------------------------------------------------------------------
+
+The example ships the FAIL-CLOSED DEFAULTS with the allowlist OMITTED:
+require_fresh_402: true, max_age_seconds: 3600. That is seed-pinned mode —
+the pin set is the directory's source: "seed" rows — and it is INERT for
+hosts that are not directory rows (there is no catalog claim to falsify:
+services.unknown, recipients and caps govern them exactly as today). The
+example deliberately does NOT set 'allowlist' — see "strict mode" below.
+
+The gate: with require_fresh_402 on, a payment to a DIRECTORY row is refused
+(ENDPOINT_NOT_LIVE) unless the row is PINNED and its recorded last probe is a
+fresh live_402 (status exactly 'live_402', probed_at no older than
+max_age_seconds). Catalog membership alone proves nothing: a row that is not
+pinned, never probed, stale, or whose last probe answered without a 402 or
+errored is refused. The same verdict is re-derived inside the signing hook
+(the INTENT_ENDPOINT_NOT_LIVE abort), so a record that ages out between the
+policy check and the signature can no longer be paid. x402_check_payment
+echoes it as 'endpoint_liveness'.
+
+Pin-set rules (the 'allowlist' key):
+
+  OMITTED          — seed mode: the directory's source: "seed" rows are the
+                     pin set.
+  []               — pins NOTHING and activates STRICT MODE: every host not
+                     on an allowlist entry is refused, including hosts that
+                     are not directory rows at all.
+  [{ base_url, paths? }] — pins the directory rows whose ORIGIN (scheme://
+                     host[:port]) matches a configured base_url. With 'paths',
+                     only those pathnames pass the gate per-URL, and the
+                     refresh tool probes those URLs (first live_402 wins).
+                     Fail-closed wart, documented not hidden: a configured
+                     base_url that matches NO directory row pins NOTHING —
+                     liveness records live on directory entries and this
+                     change never grows the catalog, so add the host to the
+                     directory first (or it can never become live).
+
+Refresh: liveness records are written ONLY by the x402_probe_allowlist tool
+(10 s timeout per probe, concurrency 4, no redirects, never pays; each record
+is written atomically onto its directory entry). Run it on your own schedule
+— e.g. cron, like the directory crawler under "Automated Directory Refresh".
+There is no background probing inside the MCP, and x402_search performs ZERO
+network calls: it ranks by the recorded probes instead (fresh live_402 first,
+newest probe first; unpinned rows are withheld unless include_unverified:
+true, and are always live: false).
+
+Fields:
+
+  require_fresh_402 — the gate switch. true = the default, described above.
+                      false = the escape hatch: fetch behaviour is exactly
+                      the pre-#34 behaviour; search keeps its liveness
+                      metadata (ranked, annotated) unchanged.
+  max_age_seconds   — staleness bound for probe records (finite > 0). A
+                      record older than this is stale and refuses. A missing
+                      or unparseable probed_at is ALWAYS stale (fail closed).
+  allowlist         — optional; see the pin-set rules above. An explicit []
+                      means "nothing is live" — combine with care.
+
+This block is FILE-ONLY: there is deliberately no X402_POLICY_* env override
+for it (the recipients/anomaly precedent — pin-set structure does not fit a
+flat env var). Unknown keys inside the block are errors (typo protection),
+like everywhere else in the config.

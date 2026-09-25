@@ -58,5 +58,9 @@
     "minSamples": 5,
     "seedFromDirectory": true,
     "defaultTolerance": 2.0
+  },
+  "liveness": {
+    "require_fresh_402": true,
+    "max_age_seconds": 3600
   }
 }
