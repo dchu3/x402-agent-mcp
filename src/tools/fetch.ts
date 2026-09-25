@@ -13,7 +13,7 @@ import { CASPER_CHAIN, toCasperCaip2 } from "../casper/networks.js";
 import { caip2Of, isEvmNetwork, isUsdChain } from "../evm/networks.js";
 import { parseChainFromNetwork } from "./probe-utils.js";
 import { checkSpendingLimit, logPayment, getDailySpent, getMaxPerCall, getMaxDailySpend } from "../payment-utils.js";
-import { getPolicyEngine, buildPolicyContext } from "../policy/config.js";
+import { getPolicyEngine, buildPolicyContext, livenessVerdictForUrl } from "../policy/config.js";
 import { getPerServiceSpent, recordServicePayment } from "../policy/budget-store.js";
 import { getAnomalyInputs, recordSettledAmount } from "../policy/anomaly-store.js";
 import { extractSettlementReceipt, RECEIPT_VERIFIED, RECEIPT_NOTE } from "./receipt-utils.js";
@@ -455,6 +455,22 @@ export function registerFetchTool(server: McpServer): void {
           manager: intentManager,
           client,
           label: "x402_fetch",
+          // Issue #34 (L9): signing-time liveness recheck. Re-derives the
+          // verdict from the CACHED directory + config + the real clock — no
+          // new network I/O — at payload creation, inside the enforcement
+          // hook: a record that aged out or flipped to error/no_402 between
+          // the Step 3.5 gate and the signature aborts with
+          // INTENT_ENDPOINT_NOT_LIVE (surfaced below via intentAbortReasons,
+          // which maps INTENT_* markers onto the structured refusal shape).
+          // Fail-closed on the unreachable re-derivation failure path: the
+          // same failure at the gate above would already have refused.
+          recheck: () => {
+            const verdict = livenessVerdictForUrl(url);
+            if (verdict === undefined) {
+              return { ok: false, reason: "the liveness verdict could not be re-derived at signing time — failing closed" };
+            }
+            return { ok: verdict.ok, reason: verdict.reason };
+          },
           run: async () => {
             const paidFetch = wrapFetchWithPayment(fetch, client);
             return paidFetch(url, {

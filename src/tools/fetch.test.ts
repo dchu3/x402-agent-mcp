@@ -1130,3 +1130,225 @@ it('multi-EVM drift: the probe binds base but the paid leg serves a polygon-only
   assert.ok(!entries.some((e: any) => e.url === url && e.status === 'success'), 'no ledger success for the drifted offer');
   assert.equal(entries.find((e: any) => e.url === url)?.status, 'failed', 'the aborted attempt is audited like any other failure');
 });
+
+// ---------------------------------------------------------------------------
+// Issue #34 — the fail-closed endpoint liveness gate in x402_fetch (rule 4.7,
+// ENDPOINT_NOT_LIVE) and the signing-time recheck (L9). These tests NEED real
+// directory rows (the gate derives from the catalog claim, L3), so they write
+// their own rows into the hermetic X402_DIRECTORY_PATH and restore the empty
+// directory afterwards — every pre-#34 test above ran with an EMPTY directory
+// (the L3 inert case) and is untouched.
+// ---------------------------------------------------------------------------
+
+const { clearDirectoryCache } = await import('../directory.js');
+
+// Capture the hermetic path: the module-level `after` restores process.env
+// before section `after` hooks run, so writeLivenessDirectory must not
+// re-read the env var.
+const LIVENESS_DIR_PATH = process.env.X402_DIRECTORY_PATH!;
+
+function writeLivenessDirectory(endpoints: unknown[]): void {
+  writeFileSync(LIVENESS_DIR_PATH, JSON.stringify({ endpoints, categories: [], last_updated: '2026-09-25' }), 'utf8');
+  clearDirectoryCache();
+}
+
+function seedLiveEntry(baseUrl: string, probedAgoMs: number): Record<string, unknown> {
+  return {
+    name: 'LivenessRow', description: '', base_url: baseUrl, chain: 'solana', category: 'ai', tags: [],
+    endpoints: [], source: 'seed',
+    liveness: { probed_at: new Date(Date.now() - probedAgoMs).toISOString(), status: 'live_402', latency_ms: 31, probe_url: baseUrl },
+  };
+}
+
+// These tests are appended LAST in the file and manage their own rows; the
+// module-level after hook removes the whole temp dir at the end, so no
+// restore hook is needed here.
+
+it('liveness gate: an UNPINNED catalog row is DENIED ENDPOINT_NOT_LIVE before the payment layer (catalog membership is not proof of liveness)', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  const host = 'unpinned-catalog.invalid';
+  writeLivenessDirectory([
+    { name: 'UnpinnedRow', description: '', base_url: `https://${host}`, chain: 'solana', category: 'ai', tags: [], endpoints: [] }, // NO source ⇒ never pinned (seed mode)
+  ]);
+  const before = ledgerLines();
+  let calls = 0;
+  let signatureSeen = false;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    calls++;
+    if (noSignatureHeader(input, init)) signatureSeen = true;
+    return probeChallengeFixed();
+  }) as any;
+  const result = await handler()({ url: `https://${host}/api` });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(calls, 1, 'exactly ONE network call — the 402 probe; the paid fetch must never run');
+  assert.equal(signatureSeen, false);
+  assert.equal(parsed.policy_decision, 'DENY');
+  assert.deepEqual(parsed.reasons.map((r: any) => r.code), ['ENDPOINT_NOT_LIVE']);
+  assert.match(parsed.reasons[0].message, /not pinned|not in the liveness allowlist|catalog membership is not proof of liveness/);
+  for (const key of ['error', 'url', 'chain', 'estimated_cost_usdc', 'daily_spent_usdc', 'max_per_call', 'max_daily']) {
+    assert.ok(key in parsed, `refusal keeps the #19 key ${key}`);
+  }
+  assert.deepEqual(ledgerLines(), before, 'DENY must not write to the payment ledger');
+});
+
+it('liveness gate: a pinned row with a FRESH live_402 record pays end-to-end (gate + recheck both pass)', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  process.env.SOLANA_RPC_URL = RPC_SIM_URL;
+  const host = 'pinned-fresh.invalid';
+  writeLivenessDirectory([seedLiveEntry(`https://${host}`, 60_000)]); // probed live 1 minute ago
+  const url = `https://${host}/api`;
+  let probes = 0, paidAttempts = 0, rpcCalls = 0, signedRetries = 0;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    const urlStr = input instanceof Request ? input.url : String(input);
+    if (urlStr.startsWith(RPC_SIM_URL)) {
+      rpcCalls++;
+      return rpcSimResponse(await requestBodyText(input, init));
+    }
+    assert.equal(urlStr, url, 'no other endpoint call may happen');
+    if (noSignatureHeader(input, init)) {
+      signedRetries++;
+      return new Response('{"result":"ok"}', { status: 200, headers: { 'PAYMENT-RESPONSE': receiptB64 } });
+    }
+    if (probes === 0) { probes++; return chargeableSolanaChallenge(url); }
+    paidAttempts++;
+    return chargeableSolanaChallenge(url);
+  }) as any;
+  const before = ledgerLines();
+  const result = await handler()({ url });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(probes, 1);
+  assert.equal(paidAttempts, 1);
+  assert.equal(rpcCalls, 1, 'payload creation ran — the liveness recheck passed at signing time');
+  assert.equal(signedRetries, 1, 'the payment was signed and settled');
+  assert.equal(parsed.status, 200);
+  assert.equal(parsed.paid, true);
+  assert.equal(parsed.chain, 'solana');
+  assert.equal(parsed.policy_decision, undefined, 'ALLOW adds no policy keys to the success output');
+  const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
+  assert.equal(entries.find((e: any) => e.url === url)?.status, 'success');
+});
+
+it('liveness gate: a STALE probe record (older than max_age_seconds) is DENIED ENDPOINT_NOT_LIVE', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  const host = 'stale-record.invalid';
+  writeLivenessDirectory([seedLiveEntry(`https://${host}`, 7_200_000)]); // probed live 2h ago — stale under the 3600 s default
+  const before = ledgerLines();
+  let calls = 0;
+  globalThis.fetch = (async () => { calls++; return probeChallengeFixed(); }) as any;
+  const result = await handler()({ url: `https://${host}/api` });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(calls, 1, 'only the probe may run — staleness refuses before any payment attempt');
+  assert.equal(parsed.policy_decision, 'DENY');
+  assert.deepEqual(parsed.reasons.map((r: any) => r.code), ['ENDPOINT_NOT_LIVE']);
+  assert.match(parsed.reasons[0].message, /max_age_seconds/, 'the refusal names the staleness bound');
+  assert.deepEqual(ledgerLines(), before, 'DENY must not write to the payment ledger');
+});
+
+it('liveness gate: a never-probed pinned row and a no_402 record are both refused (missing/unsatisfying record ⇒ not live)', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  const neverHost = 'never-probed.invalid';
+  const no402Host = 'no402-record.invalid';
+  writeLivenessDirectory([
+    { name: 'Never', description: '', base_url: `https://${neverHost}`, chain: 'solana', category: 'ai', tags: [], endpoints: [], source: 'seed' },
+    { name: 'No402', description: '', base_url: `https://${no402Host}`, chain: 'solana', category: 'ai', tags: [], endpoints: [], source: 'seed', liveness: { probed_at: new Date().toISOString(), status: 'no_402', latency_ms: 20, probe_url: `https://${no402Host}` } },
+  ]);
+  let calls = 0;
+  globalThis.fetch = (async () => { calls++; return probeChallengeFixed(); }) as any;
+  for (const host of [neverHost, no402Host]) {
+    const before = ledgerLines();
+    const result = await handler()({ url: `https://${host}/api` });
+    const parsed = JSON.parse(result.content[0].text);
+    assert.equal(parsed.policy_decision, 'DENY', `${host} must be refused`);
+    assert.deepEqual(parsed.reasons.map((r: any) => r.code), ['ENDPOINT_NOT_LIVE']);
+    assert.deepEqual(ledgerLines(), before, `${host}: DENY must not write to the ledger`);
+  }
+  assert.equal(calls, 2, 'one probe per request, nothing more');
+});
+
+it('liveness gate OFF (require_fresh_402: false): the flow is unchanged for a catalog row — unpinned and never-probed still pays', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  process.env.POLICY_CONFIG_PATH = policyConfigFile({
+    payments: { enabled: true, maxPerRequest: 0.5, maxDaily: 10 },
+    liveness: { require_fresh_402: false },
+  });
+  const host = 'gate-off.invalid';
+  writeLivenessDirectory([
+    { name: 'OffSwitchRow', description: '', base_url: `https://${host}`, chain: 'solana', category: 'ai', tags: [], endpoints: [] }, // unpinned + never probed
+  ]);
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls++;
+    if (calls === 1) return probeChallengeFixed();
+    return new Response('{"result":"ok"}', { status: 200 });
+  }) as any;
+  const result = await handler()({ url: `https://${host}/api` });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.status, 200, 'with the gate off, today’s behaviour is unchanged (L3 / L10 escape hatch)');
+  assert.equal(parsed.paid, true);
+  assert.equal(parsed.policy_decision, undefined);
+});
+
+it('explicit allowlist: [] (strict mode) DENIES every off-list host with ENDPOINT_NOT_LIVE — even a non-catalog one', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  process.env.POLICY_CONFIG_PATH = policyConfigFile({
+    payments: { enabled: true, maxPerRequest: 0.5, maxDaily: 10 },
+    liveness: { allowlist: [] },
+  });
+  writeLivenessDirectory([]); // the host is deliberately NOT a catalog row
+  const before = ledgerLines();
+  let calls = 0;
+  globalThis.fetch = (async () => { calls++; return probeChallengeFixed(); }) as any;
+  const result = await handler()({ url: 'https://strict-offlist.invalid/api' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(calls, 1, 'the refusal precedes the payment layer');
+  assert.equal(parsed.policy_decision, 'DENY');
+  assert.deepEqual(parsed.reasons.map((r: any) => r.code), ['ENDPOINT_NOT_LIVE'], 'strict allowlist mode refuses with ONLY the liveness reason');
+  assert.match(parsed.reasons[0].message, /not in the liveness allowlist/);
+  assert.deepEqual(ledgerLines(), before);
+});
+
+it('signing-time recheck (L9): a record that goes stale between the gate and the signature aborts INTENT_ENDPOINT_NOT_LIVE — no signature exists', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  process.env.SOLANA_RPC_URL = RPC_SIM_URL;
+  const host = 'recheck-stale.invalid';
+  writeLivenessDirectory([seedLiveEntry(`https://${host}`, 60_000)]); // fresh at gate time
+  const url = `https://${host}/api`;
+  let calls = 0;
+  let signatureSeen = false;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    calls++;
+    const urlStr = input instanceof Request ? input.url : String(input);
+    if (urlStr.startsWith(RPC_SIM_URL)) {
+      rpcCallsMarker++; // must never happen: the abort precedes payload creation
+      return rpcSimResponse(await requestBodyText(input, init));
+    }
+    if (noSignatureHeader(input, init)) signatureSeen = true;
+    if (calls === 1) return chargeableSolanaChallenge(url); // probe — gate will ALLOW (fresh record)
+    // Paid leg: the record ages out BETWEEN the gate and the signature.
+    writeLivenessDirectory([seedLiveEntry(`https://${host}`, 7_200_000)]);
+    return chargeableSolanaChallenge(url);
+  }) as any;
+  let rpcCallsMarker = 0;
+  const before = ledgerLines();
+  const result = await handler()({ url });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(calls, 2, 'probe + one paid attempt — the abort lands before any signed retry');
+  assert.equal(signatureSeen, false, 'no signature was ever created');
+  assert.equal(rpcCallsMarker, 0, 'payload creation (and its RPC touch) never ran');
+  assert.equal(parsed.policy_decision, 'ALLOW', 'policy allowed at the gate — the RECHECK is what refused at signing');
+  assert.deepEqual(parsed.reasons.map((r: any) => r.code), ['INTENT_UNAUTHORISED', 'ENDPOINT_NOT_LIVE']);
+  assert.match(parsed.error, /payment-intent boundary/);
+  for (const key of ['error', 'url', 'chain', 'estimated_cost_usdc', 'daily_spent_usdc', 'max_per_call', 'max_daily']) {
+    assert.ok(key in parsed, `refusal keeps the #19 key ${key}`);
+  }
+  const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
+  assert.ok(!entries.some((e: any) => e.url === url && e.status === 'success'), 'no ledger success for an aborted payment');
+  assert.equal(entries.find((e: any) => e.url === url)?.status, 'failed', 'the aborted attempt is audited like any other failure');
+});

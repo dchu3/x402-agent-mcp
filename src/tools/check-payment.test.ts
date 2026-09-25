@@ -326,3 +326,104 @@ it('price anomaly: a Casper inspection stays inert on rule 4.6 (amount 0 by desi
   assert.equal(payment.calls, 0);
   assert.deepEqual(ledgerLines(), BASELINE_ENTRIES.map((e) => JSON.stringify(e)), 'inspection must not write to the ledger');
 });
+
+// ---------------------------------------------------------------------------
+// Issue #34 — x402_check_payment reports the endpoint liveness verdict (rule
+// 4.7): the same verdict x402_fetch would enforce at the gate, echoed as
+// endpoint_liveness. Inspection-only: these tests assert ZERO payment-layer
+// calls and an untouched ledger through every check. The standard fixture
+// (Analyzer, seed + fresh live_402) is restored after every rewrite.
+// ---------------------------------------------------------------------------
+
+const { clearDirectoryCache: clearDirCache34 } = await import('../directory.js');
+const STANDARD_FIXTURE_34 = readFileSync(process.env.X402_DIRECTORY_PATH!, 'utf-8');
+
+function restoreDirectory34(): void {
+  writeFileSync(process.env.X402_DIRECTORY_PATH!, STANDARD_FIXTURE_34, 'utf8');
+  clearDirCache34();
+}
+
+it('endpoint_liveness: the verdict is echoed on the inspection output — zero payment-layer calls', async () => {
+  const payment = payingFetchMock();
+  const result = await handler()({ url: 'https://analyzer.example/score', amount: 0.05, chain: 'base', token: 'USDC' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.decision, 'ALLOW');
+  assert.deepEqual(parsed.endpoint_liveness, { ok: true, status: 'live_402', stale: false, on_allowlist: true }, 'a pinned seed row with a fresh live record passes and says so');
+  assert.equal(payment.calls, 0, 'x402_check_payment must make ZERO payment-layer calls');
+});
+
+it('endpoint_liveness: a non-catalog host is INERT in seed mode (L3) — ok:true, never_probed', async () => {
+  const payment = payingFetchMock();
+  const result = await handler()({ url: 'https://stranger.example/api', amount: 0.05, chain: 'base', token: 'USDC' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.decision, 'ALLOW');
+  assert.deepEqual(parsed.endpoint_liveness, { ok: true, status: 'never_probed', stale: true, on_allowlist: false }, 'no catalog claim to falsify ⇒ inert ok (L3) — this is what keeps every non-directory host unchanged');
+  assert.equal(payment.calls, 0);
+});
+
+it('endpoint_liveness: a STALE probe on a pinned row is reported DENY ENDPOINT_NOT_LIVE — identical to what fetch would do, never paying', async () => {
+  const payment = payingFetchMock();
+  const fixture = JSON.parse(STANDARD_FIXTURE_34);
+  fixture.endpoints[0].liveness = { probed_at: new Date(Date.now() - 7_200_000).toISOString(), status: 'live_402', latency_ms: 12, probe_url: 'https://analyzer.example' }; // 2h ago — stale under the 3600 s default
+  writeFileSync(process.env.X402_DIRECTORY_PATH!, JSON.stringify(fixture), 'utf8');
+  clearDirCache34();
+  try {
+    const before = ledgerLines();
+    const result = await handler()({ url: 'https://analyzer.example/score', amount: 0.05, chain: 'base', token: 'USDC' });
+    const parsed = JSON.parse(result.content[0].text);
+    assert.equal(parsed.decision, 'DENY', 'the inspection surfaces the same refusal x402_fetch would produce');
+    assert.deepEqual(parsed.reasons.map((r: any) => r.code), ['ENDPOINT_NOT_LIVE']);
+    assert.equal(parsed.endpoint_liveness.ok, false);
+    assert.equal(parsed.endpoint_liveness.stale, true);
+    assert.equal(parsed.endpoint_liveness.on_allowlist, true, 'the row IS pinned — it is the record that fails');
+    assert.match(parsed.reasons[0].message, /max_age_seconds/);
+    assert.equal(payment.calls, 0, 'x402_check_payment must make ZERO payment-layer calls');
+    assert.deepEqual(ledgerLines(), before, 'inspection never writes to the ledger');
+  } finally {
+    restoreDirectory34();
+  }
+});
+
+it('endpoint_liveness: an UNPINNED catalog row is reported not-live (catalog membership is not proof of liveness)', async () => {
+  const payment = payingFetchMock();
+  const fixture = JSON.parse(STANDARD_FIXTURE_34);
+  delete fixture.endpoints[0].source;   // no provenance ⇒ never pinned in seed mode
+  delete fixture.endpoints[0].liveness; // and never probed
+  writeFileSync(process.env.X402_DIRECTORY_PATH!, JSON.stringify(fixture), 'utf8');
+  clearDirCache34();
+  try {
+    const result = await handler()({ url: 'https://analyzer.example/score', amount: 0.05, chain: 'base', token: 'USDC' });
+    const parsed = JSON.parse(result.content[0].text);
+    assert.equal(parsed.decision, 'DENY');
+    assert.deepEqual(parsed.reasons.map((r: any) => r.code), ['ENDPOINT_NOT_LIVE']);
+    assert.equal(parsed.endpoint_liveness.ok, false);
+    assert.equal(parsed.endpoint_liveness.on_allowlist, false);
+    assert.match(parsed.reasons[0].message, /catalog membership is not proof of liveness/);
+    assert.equal(payment.calls, 0);
+  } finally {
+    restoreDirectory34();
+  }
+});
+
+it('endpoint_liveness: require_fresh_402: false leaves inspection ALLOW for an unpinned row (the verdict is echoed ok:true)', async () => {
+  const payment = payingFetchMock();
+  const fixture = JSON.parse(STANDARD_FIXTURE_34);
+  delete fixture.endpoints[0].source;
+  delete fixture.endpoints[0].liveness;
+  writeFileSync(process.env.X402_DIRECTORY_PATH!, JSON.stringify(fixture), 'utf8');
+  clearDirCache34();
+  try {
+    process.env.POLICY_CONFIG_PATH = recipientsConfigFile({
+      payments: { enabled: true, maxPerRequest: 0.5, maxDaily: 10 },
+      liveness: { require_fresh_402: false },
+    });
+    const result = await handler()({ url: 'https://analyzer.example/score', amount: 0.05, chain: 'base', token: 'USDC' });
+    const parsed = JSON.parse(result.content[0].text);
+    assert.equal(parsed.decision, 'ALLOW', 'the off-switch is the documented escape hatch (L3/L10)');
+    assert.equal(parsed.endpoint_liveness.ok, true, 'the verdict is still computed and echoed — ok unconditionally');
+    assert.equal(parsed.endpoint_liveness.status, 'never_probed');
+    assert.equal(payment.calls, 0);
+  } finally {
+    restoreDirectory34();
+  }
+});

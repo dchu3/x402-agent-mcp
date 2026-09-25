@@ -78,6 +78,13 @@ export interface ExecuteGuardedArgs<T> {
   label: string;
   /** Injectable clock for deterministic expiry tests. */
   now?: number;
+  /** Issue #34 (L9): optional signing-time liveness recheck, invoked INSIDE
+   * the enforcement hook at payload creation — immediately before any
+   * signature. Returning { ok: false } aborts with INTENT_ENDPOINT_NOT_LIVE,
+   * so a record that aged out or flipped to error between the policy gate and
+   * the signature can no longer be paid. Deterministic, caller-supplied; the
+   * closure performs no network I/O. */
+  recheck?: () => { ok: boolean; reason?: string };
 }
 
 /** The only sanctioned execution wrapper for paid fetches.
@@ -105,7 +112,20 @@ export async function executeGuarded<T>(args: ExecuteGuardedArgs<T>): Promise<Gu
   if (v.valid === false) return { ok: false, code: v.code, message: v.message };
   const b = manager.beginAttempt(intent, args.now);
   if (b.valid === false) return { ok: false, code: b.code, message: b.message };
-  client.onBeforePaymentCreation(intentEnforcement({ intent, manager, executorLabel: label }));
+  const enforcement = intentEnforcement({ intent, manager, executorLabel: label });
+  // Issue #34 (L9): when a recheck is supplied it runs FIRST inside the
+  // payload-creation hook — the same abort-before-signing pattern as the
+  // intent validation — and only then is the intent checked and consumed.
+  // A failed recheck leaves the intent UNCONSUMED (nothing was signed, so the
+  // authorisation must not be spent).
+  const hook: BeforePaymentCreationHook = args.recheck === undefined
+    ? enforcement
+    : async (context) => {
+      const check = args.recheck!();
+      if (check.ok === false) return { abort: true as const, reason: 'INTENT_ENDPOINT_NOT_LIVE' };
+      return enforcement(context);
+    };
+  client.onBeforePaymentCreation(hook);
   const result = await run();
   return { ok: true, result };
 }

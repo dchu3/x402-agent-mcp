@@ -773,6 +773,15 @@ function computeEndpointLiveness(url: string, now?: number): EndpointLiveness | 
   }
 }
 
+/** Compute the CURRENT liveness verdict for a URL (issue #34) — the exact
+ * derivation buildPolicyContext performs for ctx.endpointLiveness, exported
+ * so x402_fetch's signing-time recheck (L9) re-derives the verdict with NO new
+ * network I/O (cached directory + config + injected/real clock). Never
+ * throws; undefined only when the policy config itself cannot be loaded. */
+export function livenessVerdictForUrl(url: string, now?: number): EndpointLiveness | undefined {
+  return computeEndpointLiveness(url, now);
+}
+
 /** Build the full PolicyContext for a prospective payment to `url`: derives the
  * service hostname and trust level (the engine itself stays pure). An
  * unparseable URL yields service "" / UNKNOWN — deterministic and fail-closed
