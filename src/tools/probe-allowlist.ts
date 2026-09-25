@@ -6,6 +6,19 @@
 // redirect: "error"; nothing is ever paid and no credentials are ever sent —
 // this tool imports NO wallet/payment code (the no-bypass suite pins that).
 //
+// Issue #38 — each row is probed across a BOUNDED candidate URL list, in this
+// exact precedence order (P1): (1) the allowlist entry's configured `paths`
+// when present — operator intent, exhaustive, NO discovery; (2) the directory
+// row's advertised endpoints[] paths whose method is GET (or absent), with
+// `{param}`/`*` placeholders substituted ONLY in the built request URL (P3);
+// (3) the row's base_url itself; (4) up to 8 noise-filtered GET paths
+// discovered from the row's /openapi.json (P2 — the discovery fallback that
+// fixes the live "free root, paid API path" shape). Candidates are
+// de-duplicated by exact string equality and the walk is capped at 5 URLs per
+// row (P4), so worst case per row is 5 probes + 1 spec GET. The FIRST
+// live_402 wins and its exact URL is the record's probe_url; else no_402 when
+// any candidate answered; else error (P5). Root-only services are unaffected.
+//
 // Every result is recorded on the directory entry through recordLiveness
 // (atomic write over livePaths(), the addToDirectory path — the
 // X402_DIRECTORY_PATH override is consulted first). Timeout/network failure
@@ -18,7 +31,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { loadDirectory, recordLiveness } from "../directory.js";
 import type { EndpointEntry, LivenessRecord } from "../directory.js";
-import { probePaymentChallenge } from "./probe-utils.js";
+import { probeChallengeAcross, fetchJson, openApiProbePaths, probePlaceholderUrl } from "./probe-utils.js";
 import type { LivenessProbeResult } from "./probe-utils.js";
 import { loadPolicyConfig } from "../policy/config.js";
 import { entryOrigin, pinnedEntryFor } from "../policy/liveness.js";
@@ -47,21 +60,52 @@ function acceptsSnapshot(challenge: any): LivenessRecord["accepts"] | undefined 
   });
 }
 
-/** Probe an entry: the base_url by default; when the pinning allowlist entry
- * carries `paths`, those drive which URLs are probed (L2) — in order, first
- * live_402 wins, else the LAST probe's outcome is the record. Never throws. */
-async function probeEntry(origin: string, entry: EndpointEntry, cfgEntry?: LivenessAllowlistEntry): Promise<{ result: LivenessProbeResult; probe_url: string }> {
-  const base = entry.base_url;
-  const urls = cfgEntry?.paths !== undefined && cfgEntry.paths.length > 0
-    ? cfgEntry.paths.map((p) => `${origin}${p}`)
-    : [base];
-  let last: { result: LivenessProbeResult; probe_url: string } | undefined;
-  for (const u of urls) {
-    const result = await probePaymentChallenge(u, PROBE_TIMEOUT_MS);
-    last = { result, probe_url: u };
-    if (result.kind === "live_402") return last;
+/** Bounded candidate walk per row (issue #38, P4): at most this many
+ * de-duplicated URLs are probed per row — bounded work, bounded latency. */
+const MAX_PROBE_CANDIDATES = 5;
+/** Discovery cap (issue #38, P2): at most this many GET paths are taken from
+ * one /openapi.json spec after the noise filter. */
+const MAX_DISCOVERY_PATHS = 8;
+
+/** Build the candidate URL list for one row (issue #38, P1 precedence):
+ * (1) an allowlist entry's configured `paths`, when present — operator intent,
+ *     EXHAUSTIVE, no discovery (fact 7); placeholders are substituted ONLY
+ *     here, when building the request URL (P3) — the configured string itself
+ *     is never mutated;
+ * (2) the directory row's advertised endpoints[] paths whose method is GET or
+ *     absent, placeholders substituted (P3);
+ * (3) the row's base_url itself;
+ * (4) up to MAX_DISCOVERY_PATHS noise-filtered GET paths from the row's
+ *     /openapi.json (P2) — fetched once per row via the shared fetchJson.
+ * The unconfigured list is exact-string de-duplicated and capped at
+ * MAX_PROBE_CANDIDATES (P4). Never throws. */
+async function candidateUrls(origin: string, entry: EndpointEntry, cfgEntry?: LivenessAllowlistEntry): Promise<string[]> {
+  if (cfgEntry?.paths !== undefined && cfgEntry.paths.length > 0) {
+    return cfgEntry.paths.map((p) => probePlaceholderUrl(`${origin}${p}`));
   }
-  return last!; // urls is never empty (paths [] keeps the base_url probe)
+  const candidates: string[] = [];
+  for (const ep of entry.endpoints ?? []) {
+    if (typeof ep?.path !== "string" || ep.path === "") continue;
+    const method = typeof ep.method === "string" && ep.method !== "" ? ep.method.toUpperCase() : "GET";
+    if (method !== "GET") continue;
+    const path = ep.path.startsWith("/") ? ep.path : `/${ep.path}`;
+    candidates.push(probePlaceholderUrl(`${origin}${path}`));
+  }
+  candidates.push(entry.base_url);
+  const spec = await fetchJson(`${entry.base_url}/openapi.json`, PROBE_TIMEOUT_MS);
+  for (const p of openApiProbePaths(spec, MAX_DISCOVERY_PATHS)) {
+    const path = p.startsWith("/") ? p : `/${p}`;
+    candidates.push(probePlaceholderUrl(`${origin}${path}`));
+  }
+  return [...new Set(candidates)].slice(0, MAX_PROBE_CANDIDATES);
+}
+
+/** Probe an entry across its bounded candidate list (issue #38): first
+ * live_402 wins and its exact URL is the record's probe_url; else no_402 when
+ * at least one candidate answered; else error. Never throws. */
+async function probeEntry(origin: string, entry: EndpointEntry, cfgEntry?: LivenessAllowlistEntry): Promise<{ result: LivenessProbeResult; probe_url: string }> {
+  const urls = await candidateUrls(origin, entry, cfgEntry);
+  return await probeChallengeAcross(urls, PROBE_TIMEOUT_MS, Math.max(1, urls.length));
 }
 
 /** Promise pool: apply fn to items with at most `limit` in flight. */
