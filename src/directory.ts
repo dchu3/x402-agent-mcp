@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, renameSync, rmSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, renameSync, rmSync, realpathSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 
@@ -140,8 +140,78 @@ function quarantineCorruptFile(p: string): void {
   }
 }
 
+/** Issue #37 structural guard: a test run must never read the operator's
+ * LIVE, gitignored endpoints.json — the operator's real data, not fixture
+ * data (the casper-fetch suite went red exactly this way: it set no
+ * X402_DIRECTORY_PATH override, so the #34 liveness gate evaluated the live
+ * file's FAILED seed row and hard-DENYed before any assertion ran).
+ *
+ * Throws when ALL of the following hold:
+ *   (a) the current process is under the node:test runner —
+ *       `process.env.NODE_TEST_CONTEXT` is set (production/MCP runtime never
+ *       sets it, and a direct `node file.js` run leaves it unset, so the
+ *       guard is inert outside test runs);
+ *   (b) no X402_DIRECTORY_PATH override is in effect;
+ *   (c) at least one candidate path EXISTS on disk.
+ *
+ * `opts` overrides the env-derived defaults so the guard is directly
+ * unit-testable without child processes (see directory.test.ts).
+ *
+ * Remediation (named in the thrown message): tests that reach the directory
+ * MUST set X402_DIRECTORY_PATH to a temp path — the repo test pattern (see
+ * src/tools/fetch.test.ts).
+ *
+ * Pure-ish: reads env + existsSync/realpathSync only; no writes, never
+ * mutates the directory cache, and never throws from the de-dup step. The
+ * only side effect is ONE stderr line at the throw point so a firing stays
+ * visible in test output even when a caller catches the throw. */
+export function guardLiveDirectoryRead(
+  candidates: string[],
+  opts?: { isTestRun?: boolean; override?: string },
+): void {
+  const isTestRun = opts?.isTestRun ?? Boolean(process.env.NODE_TEST_CONTEXT);
+  const override = opts?.override ?? process.env.X402_DIRECTORY_PATH;
+  if (!isTestRun) return; // production / MCP runtime / direct node run: inert
+  if (override) return; // a hermetic override is in effect
+  // livePaths() items 2-3 (dist-relative and cwd-relative) can resolve to the
+  // SAME file; de-duplicate by realpath so one existing file is reported once.
+  // Best-effort: a failed lookup keeps the raw path and never throws here.
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    let key = candidate;
+    try {
+      key = realpathSync(candidate);
+    } catch {
+      // missing or unreadable — keep the raw path as the de-dup key
+    }
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (existsSync(candidate)) {
+      const message =
+        `[x402] test-run guard: this test run is about to read the operator's LIVE endpoints.json at ${candidate} ` +
+        `without an X402_DIRECTORY_PATH override. Tests that reach the directory MUST set X402_DIRECTORY_PATH ` +
+        `to a temp path (see src/tools/fetch.test.ts for the pattern) — issue #37.`;
+      // One stderr echo at the throw point (issue #37 canary finding): some
+      // read paths swallow this throw — computeEndpointLiveness
+      // (src/policy/config.ts:752-775) catches it and returns a fail-open
+      // verdict when liveness.allowlist is omitted — so a firing must stay
+      // visible in test output even when a caller catches it. The thrown
+      // message itself is unchanged.
+      console.error(message);
+      throw new Error(message);
+    }
+  }
+}
+
 export function loadDirectory(): EndpointDirectory {
   if (cachedDirectory) return cachedDirectory;
+  // Issue #37: before ANY file read, refuse (loudly) when a test run without
+  // an X402_DIRECTORY_PATH override would touch the operator's live
+  // repo-root endpoints.json. Inert in production (no NODE_TEST_CONTEXT),
+  // inert in every suite that sets the override, and inert when the live
+  // file is absent (clean checkout) — see guardLiveDirectoryRead. Checked
+  // after the cache test: a cache hit performs no read, so it must not fire.
+  guardLiveDirectoryRead([join(__dirname, "..", "endpoints.json")]);
   // Try live file first, then template
   const searchPaths = livePaths();
   const templatePaths = [

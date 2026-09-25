@@ -1,9 +1,22 @@
 import { strict as assert } from 'node:assert';
-import { afterEach, it } from 'node:test';
+import { after, afterEach, it } from 'node:test';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { registerHealthCheckTool } from './health.js';
 
+// Hermetic directory (issue #37): a `name`-based lookup resolves through
+// loadDirectory(); without an X402_DIRECTORY_PATH override that reads the
+// operator's LIVE gitignored endpoints.json. Pin the suite to an empty temp
+// directory (the fetch.test.ts repo pattern) so directory data never leaks in.
+const dir = mkdtempSync(join(tmpdir(), 'x402-health-test-'));
+const env = { ...process.env };
+process.env.X402_DIRECTORY_PATH = join(dir, 'endpoints.json');
+writeFileSync(process.env.X402_DIRECTORY_PATH, JSON.stringify({ endpoints: [], categories: [], last_updated: '2026-09-25' }), 'utf8');
+
 const originalFetch = globalThis.fetch;
-afterEach(() => { globalThis.fetch = originalFetch; });
+afterEach(() => { globalThis.fetch = originalFetch; process.env = { ...env, X402_DIRECTORY_PATH: join(dir, 'endpoints.json') }; });
+after(() => { process.env = env; rmSync(dir, { recursive: true, force: true }); });
 
 function handler() {
   let callback: any;

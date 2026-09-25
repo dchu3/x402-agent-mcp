@@ -12,7 +12,7 @@ const overridePath = join(dir, 'endpoints.json');
 const env = { ...process.env };
 process.env.X402_DIRECTORY_PATH = overridePath;
 
-const { addToDirectory, loadDirectory, clearDirectoryCache, atomicWriteFileSync, advertisedPriceUsd, findEntryForUrl, recordLiveness } = await import('./directory.js');
+const { addToDirectory, loadDirectory, clearDirectoryCache, atomicWriteFileSync, advertisedPriceUsd, findEntryForUrl, recordLiveness, guardLiveDirectoryRead } = await import('./directory.js');
 import type { LivenessRecord } from './directory.js';
 
 // endpoints.json at the repo root is gitignored operator data; its absence
@@ -272,5 +272,60 @@ it('recordLiveness returns false for a base_url with no directory entry — noth
   // ...nor does a match against a malformed-entry lookup crash it.
   assert.equal(recordLiveness('https://not-a-url', RECORD), false);
   assert.equal(readFileSync(overridePath, 'utf-8'), before);
+  assertRepoRootUntouched();
+});
+
+// ---------------------------------------------------------------------------
+// Issue #37 — structural guard: a test run (node:test child ⇒
+// NODE_TEST_CONTEXT set) must never read the operator's LIVE gitignored
+// repo-root endpoints.json. loadDirectory() calls guardLiveDirectoryRead with
+// the repo-root candidate before any read; these cases call the exported
+// function directly (deterministic — no child processes). The "live" file
+// simulated here lives in the suite's own temp dir, never the repo root.
+// Note: this file's afterEach keeps X402_DIRECTORY_PATH set, so the
+// no-opts ambient-override case below is deterministic too.
+// ---------------------------------------------------------------------------
+
+it('guardLiveDirectoryRead throws for a test run with no override when the candidate exists — names the path and the remediation', () => {
+  const liveSim = join(dir, 'live-sim.json');
+  writeFileSync(liveSim, JSON.stringify(template), 'utf8');
+  assert.throws(
+    () => guardLiveDirectoryRead([liveSim], { isTestRun: true, override: '' }),
+    /test-run guard[\s\S]*live-sim\.json[\s\S]*X402_DIRECTORY_PATH/,
+    'the message must name the offending path and the X402_DIRECTORY_PATH remediation (issue #37)',
+  );
+  assertRepoRootUntouched();
+});
+
+it('guardLiveDirectoryRead is inert when an override is in effect — passed explicitly or ambient via X402_DIRECTORY_PATH', () => {
+  const liveSim = join(dir, 'live-sim.json');
+  writeFileSync(liveSim, JSON.stringify(template), 'utf8');
+  assert.doesNotThrow(
+    () => guardLiveDirectoryRead([liveSim], { isTestRun: true, override: join(dir, 'hermetic.json') }),
+    'an explicit override suppresses the guard',
+  );
+  // Ambient: this suite sets X402_DIRECTORY_PATH at module load (and afterEach
+  // keeps it set), so the env-derived default must keep the guard inert here.
+  assert.doesNotThrow(() => guardLiveDirectoryRead([liveSim]), 'the ambient X402_DIRECTORY_PATH override suppresses the guard');
+  assertRepoRootUntouched();
+});
+
+it('guardLiveDirectoryRead is inert outside a test run (production / direct node run)', () => {
+  const liveSim = join(dir, 'live-sim.json');
+  writeFileSync(liveSim, JSON.stringify(template), 'utf8');
+  assert.doesNotThrow(
+    () => guardLiveDirectoryRead([liveSim], { isTestRun: false, override: '' }),
+    'production never sets NODE_TEST_CONTEXT — the guard must be inert there',
+  );
+  assertRepoRootUntouched();
+});
+
+it('guardLiveDirectoryRead is inert when the candidate does not exist (clean checkout), and de-duplicates repeated paths without throwing', () => {
+  const missing = join(dir, 'does-not-exist.json');
+  assert.equal(existsSync(missing), false);
+  assert.doesNotThrow(() => guardLiveDirectoryRead([missing], { isTestRun: true, override: '' }));
+  // The same file passed twice (dist-relative vs cwd-relative resolution of
+  // one live path) stays one candidate; the de-dup step itself never throws.
+  assert.doesNotThrow(() => guardLiveDirectoryRead([missing, missing], { isTestRun: true, override: '' }));
   assertRepoRootUntouched();
 });
