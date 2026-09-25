@@ -12,7 +12,8 @@ const overridePath = join(dir, 'endpoints.json');
 const env = { ...process.env };
 process.env.X402_DIRECTORY_PATH = overridePath;
 
-const { addToDirectory, loadDirectory, clearDirectoryCache, atomicWriteFileSync, advertisedPriceUsd } = await import('./directory.js');
+const { addToDirectory, loadDirectory, clearDirectoryCache, atomicWriteFileSync, advertisedPriceUsd, findEntryForUrl, recordLiveness } = await import('./directory.js');
+import type { LivenessRecord } from './directory.js';
 
 // endpoints.json at the repo root is gitignored operator data; its absence
 // (clean checkout) is the normal case. Snapshot it once at module load if it
@@ -190,4 +191,86 @@ it('advertisedPriceUsd matches hostname + path and tolerates garbage', () => {
   // The malformed-price and malformed-base_url entries never throw — the scan
   // skips them and keeps looking at the rest of the directory.
   assert.equal(advertisedPriceUsd('https://malformed.invalid/x'), undefined, 'a non-numeric price_usdc ⇒ undefined');
+});
+
+// ---------------------------------------------------------------------------
+// Issue #34 — liveness records (L4): findEntryForUrl (origin match) locates
+// the entry a URL belongs to; recordLiveness persists the entry's most recent
+// probe through the SAME atomic write path addToDirectory uses (the
+// X402_DIRECTORY_PATH override is consulted first; the repo-root file stays
+// untouched).
+// ---------------------------------------------------------------------------
+
+function writeLivenessFixture(): void {
+  writeFileSync(overridePath, JSON.stringify({
+    endpoints: [
+      { ...entry, name: 'LiveSvc', base_url: 'https://live.invalid', source: 'seed' },
+      { ...entry, name: 'PortSvc', base_url: 'https://port.invalid:8443/' },
+      { ...entry, name: 'Malformed', base_url: 'not-a-url' },
+    ],
+    categories: [], last_updated: '2026-09-21',
+  }), 'utf8');
+  clearDirectoryCache();
+}
+
+const RECORD: LivenessRecord = {
+  probed_at: '2026-09-25T12:00:00.000Z',
+  status: 'live_402',
+  latency_ms: 42,
+  probe_url: 'https://live.invalid',
+  accepts: [{ scheme: 'exact', network: 'eip155:8453', amount: '10000', payTo: '0xabc', asset: '0xdef' }],
+};
+
+it('findEntryForUrl matches by origin — host case, default port, and trailing slash all normalised', () => {
+  writeLivenessFixture();
+  assert.equal(findEntryForUrl('https://live.invalid/some/path?q=1')?.name, 'LiveSvc');
+  assert.equal(findEntryForUrl('https://LIVE.invalid/x')?.name, 'LiveSvc', 'host match is case-insensitive');
+  assert.equal(findEntryForUrl('https://live.invalid:443/x')?.name, 'LiveSvc', 'the default https port normalises away');
+  assert.equal(findEntryForUrl('https://live.invalid/x'), findEntryForUrl('https://live.invalid'), 'paths on the query URL are irrelevant to the origin match');
+  assert.equal(findEntryForUrl('http://live.invalid/x'), undefined, 'scheme is part of the origin — http ≠ https');
+  assert.equal(findEntryForUrl('https://port.invalid:8443/api')?.name, 'PortSvc', 'a non-default port is part of the origin');
+  assert.equal(findEntryForUrl('https://port.invalid/api'), undefined, 'origin 443 ≠ origin 8443');
+  assertRepoRootUntouched();
+});
+
+it('findEntryForUrl never throws: malformed directory base_urls and unparseable input URLs never match', () => {
+  writeLivenessFixture();
+  assert.equal(findEntryForUrl('https://not-a-url/x'), undefined, 'a malformed DIRECTORY entry can never match');
+  assert.equal(findEntryForUrl('not a url'), undefined, 'unparseable input ⇒ undefined');
+  assert.equal(findEntryForUrl(''), undefined);
+  assert.equal(findEntryForUrl('https://stranger.invalid/x'), undefined, 'no matching host ⇒ undefined');
+  assertRepoRootUntouched();
+});
+
+it('recordLiveness writes the record atomically to the override file (never the repo root) and survives a cold reload', () => {
+  writeLivenessFixture();
+  assert.equal(recordLiveness('https://live.invalid', RECORD), true);
+  assert.deepEqual(readdirSync(dir).filter((f) => f.includes('.tmp-')), [], 'atomic write leaves no temp files');
+  clearDirectoryCache();
+  const reloaded = loadDirectory();
+  const saved = reloaded.endpoints.find((e) => e.name === 'LiveSvc');
+  assert.deepEqual(saved?.liveness, RECORD, 'the record round-trips through the file — accepts included');
+  assertRepoRootUntouched();
+});
+
+it('recordLiveness locates the entry by ORIGIN — case/default-port/trailing-path spellings land on the same entry, and the cache reflects it immediately', () => {
+  writeLivenessFixture();
+  const errorRecord: LivenessRecord = { probed_at: '2026-09-25T13:00:00.000Z', status: 'error', latency_ms: 10000, probe_url: 'https://live.invalid' };
+  assert.equal(recordLiveness('https://LIVE.invalid:443/some/path', errorRecord), true, 'the origin-normalised spelling matches the same entry');
+  assert.equal(findEntryForUrl('https://live.invalid/x')?.liveness?.status, 'error', 'the cached directory reflects the latest probe without a reload');
+  assert.equal(findEntryForUrl('https://live.invalid/x')?.liveness?.accepts, undefined, 'error records carry no accepts snapshot');
+  const onFile = JSON.parse(readFileSync(overridePath, 'utf-8'));
+  assert.equal(onFile.endpoints.find((e: any) => e.name === 'LiveSvc').liveness.status, 'error');
+  assertRepoRootUntouched();
+});
+
+it('recordLiveness returns false for a base_url with no directory entry — nothing is written', () => {
+  writeLivenessFixture();
+  const before = readFileSync(overridePath, 'utf-8');
+  assert.equal(recordLiveness('https://stranger.invalid', RECORD), false, 'no entry matches ⇒ false');
+  assert.equal(readFileSync(overridePath, 'utf-8'), before, 'an unknown origin must not dirty the directory file');
+  // ...nor does a match against a malformed-entry lookup crash it.
+  assert.equal(recordLiveness('https://not-a-url', RECORD), false);
+  assert.equal(readFileSync(overridePath, 'utf-8'), before);
+  assertRepoRootUntouched();
 });

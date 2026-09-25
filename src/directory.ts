@@ -38,6 +38,25 @@ export interface EndpointEntry {
    * by x402_crawl_directory. Entries added through other paths may omit it
    * and are treated as unclassified by the #19 policy engine. */
   source?: string;
+  /** Issue #34 (L4): the entry's MOST RECENT liveness probe record, written
+   * by x402_probe_allowlist via recordLiveness. Consumed by x402_search
+   * (ranking + emitted liveness metadata) and by the policy liveness gate
+   * (rule 4.7). Absent means never probed. */
+  liveness?: LivenessRecord;
+}
+
+/** The most recent liveness probe for a directory entry (issue #34, L4 —
+ * per entry, singular). `accepts` is present ONLY when the probe answered 402
+ * with a parseable accepts array (never invented on no_402/error). */
+export interface LivenessRecord {
+  /** ISO timestamp of the probe. */
+  probed_at: string;
+  status: "live_402" | "no_402" | "error";
+  latency_ms: number;
+  /** The exact URL the probe hit (the entry's base_url, or a pinned
+   * allowlist path under it). */
+  probe_url: string;
+  accepts?: Array<{ scheme?: string; network?: string; amount?: string; payTo?: string; asset?: string }>;
 }
 
 export interface EndpointDirectory {
@@ -202,6 +221,52 @@ export function advertisedPriceUsd(url: string): number | undefined {
   } catch {
     return undefined; // unparseable URL or directory unavailable
   }
+}
+
+/** Origin-based directory lookup (issue #34): find the entry whose base_url
+ * ORIGIN (scheme://host, default ports normalised, case-insensitive) matches
+ * the target URL's origin. Unparseable input URLs and malformed entry
+ * base_urls never match; a directory-load failure yields undefined instead of
+ * throwing — this helper sits on the policy/search read paths and must not
+ * crash them. */
+export function findEntryForUrl(url: string): EndpointEntry | undefined {
+  try {
+    const target = new URL(url);
+    const directory = loadDirectory();
+    for (const entry of directory.endpoints) {
+      try {
+        if (new URL(entry.base_url).origin === target.origin) return entry;
+      } catch {
+        continue; // malformed entry base_url can never match — skip
+      }
+    }
+    return undefined;
+  } catch {
+    return undefined; // unparseable URL or directory unavailable
+  }
+}
+
+/** Record an entry's latest liveness probe (issue #34, L4). Locates the entry
+ * by base_url ORIGIN match (same rule as findEntryForUrl), mutates the cached
+ * directory, and writes it back atomically (atomicWriteFileSync over
+ * livePaths(), exactly like addToDirectory — the X402_DIRECTORY_PATH override
+ * is consulted first). Returns false when no entry matches the origin (the
+ * probe result is dropped; nothing is written). */
+export function recordLiveness(baseUrl: string, record: LivenessRecord): boolean {
+  const entry = findEntryForUrl(baseUrl);
+  if (!entry) return false;
+  entry.liveness = record;
+  const dir = loadDirectory();
+  const possiblePaths = livePaths();
+  for (const p of possiblePaths) {
+    try {
+      atomicWriteFileSync(p, JSON.stringify(dir, null, 2) + "\n");
+      return true;
+    } catch {
+      continue;
+    }
+  }
+  throw new Error("Could not write to endpoints.json");
 }
 
 export function addToDirectory(entry: EndpointEntry): boolean {
