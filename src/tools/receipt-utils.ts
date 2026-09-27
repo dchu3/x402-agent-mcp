@@ -21,7 +21,7 @@ export const RECEIPT_NOTE = "server-provided, not independently verified on-chai
 export interface SettlementReceipt {
   /** Raw base64 header value, or null when no receipt header is present. */
   receipt: string | null;
-  /** Settlement transaction hash — only when the receipt decodes with success === true. */
+  /** Settlement transaction hash — extracted whenever the receipt carries one, except when it explicitly says success: false. A receipt that omits the optional `success` field still yields its hash (#43). */
   txHash?: string;
 }
 
@@ -33,7 +33,7 @@ export function extractSettlementReceipt(source: Headers | HeaderGetter): Settle
   let txHash: string | undefined;
   try {
     const decoded = JSON.parse(Buffer.from(receipt, "base64").toString("utf8"));
-    if (decoded && typeof decoded === "object" && decoded.success === true) {
+    if (decoded && typeof decoded === "object" && decoded.success !== false) {
       // v2 settle schema uses "transaction"; keep legacy fallbacks for older sellers.
       const candidate = decoded.transaction ?? decoded.settlement?.txHash ?? decoded.transactionHash ?? decoded.txHash;
       if (typeof candidate === "string" && candidate.length > 0) txHash = candidate;

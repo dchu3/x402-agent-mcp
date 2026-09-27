@@ -59,6 +59,34 @@ it('legacy nested settlement.txHash fallback still works', () => {
   assert.equal(result.txHash, '0x999');
 });
 
+it('omitted success with "transaction" (svm402 Solana shape) -> txHash extracted', () => {
+  const raw = b64({ transaction: '5j7sSIG', network: 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp' });
+  const result = extractSettlementReceipt(new Headers({ 'payment-response': raw }));
+  assert.equal(result.receipt, raw);
+  assert.equal(result.txHash, '5j7sSIG');
+});
+
+it('omitted success with legacy nested settlement.txHash -> txHash extracted', () => {
+  const raw = b64({ settlement: { txHash: '0x777' } });
+  const result = extractSettlementReceipt(new Headers({ 'payment-response': raw }));
+  assert.equal(result.receipt, raw);
+  assert.equal(result.txHash, '0x777');
+});
+
+it('omitted success with no hash field at all -> txHash undefined, receipt preserved', () => {
+  const raw = b64({ network: 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp' });
+  const result = extractSettlementReceipt(new Headers({ 'payment-response': raw }));
+  assert.equal(result.receipt, raw);
+  assert.equal(result.txHash, undefined);
+});
+
+it('explicit success:false with a transaction present -> txHash undefined (failure receipt)', () => {
+  const raw = b64({ success: false, transaction: '0xshouldnotleak', network: 'eip155:8453' });
+  const result = extractSettlementReceipt(new Headers({ 'payment-response': raw }));
+  assert.equal(result.receipt, raw);
+  assert.equal(result.txHash, undefined);
+});
+
 it('success:true with missing/empty/non-string transaction -> txHash undefined', () => {
   for (const payload of [
     { success: true },
