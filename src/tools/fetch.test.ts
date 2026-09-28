@@ -1352,3 +1352,137 @@ it('signing-time recheck (L9): a record that goes stale between the gate and the
   assert.ok(!entries.some((e: any) => e.url === url && e.status === 'success'), 'no ledger success for an aborted payment');
   assert.equal(entries.find((e: any) => e.url === url)?.status, 'failed', 'the aborted attempt is audited like any other failure');
 });
+
+// ---------------------------------------------------------------------------
+// Issue #45 — a refused (non-200) paid fetch must write a SELF-DESCRIBING
+// ledger row. Today the accounting block (fetch.ts) writes
+// {..., amount_usdc: <attempted>, status: "failed"} with no `error` and no
+// `http_status`, even though resp.status and the gateway body's error string
+// are in hand at the call site — the live 2026-09-28T12:35:46.268Z svm402 row
+// proves the defect ({..., amount_usdc: 0.01, status: "failed"}, cause only
+// readable in the seller's audit log). These tests pin the fix's observable
+// contract: reason + HTTP status on every non-200 row, settled spend reading
+// 0 with the attempted price in attempted_amount_usdc, and byte-compatible
+// rehydration for pre-#45 rows. The existing non-200 parity (:211), anomaly
+// (:916) and intent-abort (:326, :1131, :1353) assertions above stay green
+// and unmodified — every consumer gates on status === "success".
+// ---------------------------------------------------------------------------
+
+it('issue #45: a refused paid fetch (402 on the signed leg) writes a self-describing failed row — reason, http_status, attempted amount', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  process.env.SOLANA_RPC_URL = RPC_SIM_URL;
+  const url = 'https://refused-402-test.invalid/api';
+  let signedCalls = 0, rpcCalls = 0;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    const urlStr = input instanceof Request ? input.url : String(input);
+    if (urlStr.startsWith(RPC_SIM_URL)) {
+      rpcCalls++;
+      return rpcSimResponse(await requestBodyText(input, init));
+    }
+    if (noSignatureHeader(input, init)) {
+      signedCalls++;
+      // The gateway refuses the signed payment: a plain 402 whose body is the
+      // challenge-shaped error (the exact shape verified live 2026-09-28).
+      return new Response(JSON.stringify({ x402Version: 2, error: 'Payment verification failed — invalid or insufficient payment', accepts: [] }), { status: 402 });
+    }
+    return chargeableSolanaChallenge(url); // the probe AND the wrapper's unsigned paid attempt
+  }) as any;
+  const { getDailySpent } = await import('../payment-utils.js') as typeof import('../payment-utils.js'); // same instance fetch.js logs into
+  const dailyBefore = getDailySpent();
+  const before = ledgerLines();
+  const result = await handler()({ url });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.status, 402, 'the refused paid leg must surface as the 402 response');
+  assert.equal(parsed.paid, false, 'a refused payment is not paid');
+  assert.equal(rpcCalls, 1, 'payload creation ran — the refusal happens after signing, at the gateway');
+  assert.equal(signedCalls, 1, 'exactly one signed retry, then the gateway refusal is returned');
+  const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
+  const failedEntry = entries.find((e: any) => e.url === url && e.status === 'failed');
+  assert.ok(failedEntry, 'the refused attempt must appear in the ledger');
+  assert.equal(failedEntry.http_status, 402, 'AC1: the row carries the HTTP status');
+  assert.equal(failedEntry.error, 'Payment verification failed — invalid or insufficient payment', 'AC1: the row carries the gateway error string verbatim');
+  assert.equal(failedEntry.amount_usdc, 0, 'AC3: a refused payment reads as zero settled spend');
+  assert.equal(failedEntry.attempted_amount_usdc, 0.01, 'the attempted price is preserved on the row');
+  assert.equal(getDailySpent(), dailyBefore, 'a refused payment must not move the daily spend');
+});
+
+it('issue #45: a 500-after-settlement row carries http_status + error and reads as zero settled spend (spend guards exactly where :211/:896 put them)', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  const host = 'refused-500-test.invalid';
+  const url = `https://${host}/api`;
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls++;
+    if (calls === 1) return probeChallengeFixed(); // probe: 402 with a $0.01 Solana offer
+    return new Response('server error', { status: 500 }); // the paid leg fails, body not JSON
+  }) as any;
+  const { getDailySpent } = await import('../payment-utils.js') as typeof import('../payment-utils.js'); // same instance fetch.js records into
+  const store = await import('../policy/budget-store.js') as typeof import('../policy/budget-store.js');
+  const dailyBefore = getDailySpent();
+  const before = ledgerLines();
+  const result = await handler()({ url });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.status, 500, 'the flow must reach the accounting block through a non-200 response');
+  const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
+  const failedEntry = entries.find((e: any) => e.url === url && e.status === 'failed');
+  assert.ok(failedEntry, 'the non-200 settlement attempt must appear in the ledger');
+  assert.equal(failedEntry.http_status, 500, 'AC2: the row carries the HTTP status');
+  assert.equal(failedEntry.error, 'HTTP 500', 'AC2: a non-JSON body falls back to HTTP <status>');
+  assert.equal(failedEntry.amount_usdc, 0, 'AC3: nothing settled — the settled-spend field reads 0');
+  assert.equal(failedEntry.attempted_amount_usdc, 0.01, 'the attempted price is preserved on the row');
+  assert.equal(store.getPerServiceSpent(host), 0, 'a failed settlement must not move per-service spend (the :211 guard)');
+  assert.equal(getDailySpent(), dailyBefore, 'a failed settlement must not move the daily spend');
+});
+
+it('issue #45: a 503 whose body is not JSON still carries error "HTTP 503" — the reason field is never absent on a non-200 row', async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  const host = 'refused-503-test.invalid';
+  const url = `https://${host}/api`;
+  let calls = 0;
+  globalThis.fetch = (async () => {
+    calls++;
+    if (calls === 1) return probeChallengeFixed(); // probe: 402 with a $0.01 Solana offer
+    return new Response('<html>Service Unavailable</html>', { status: 503 }); // not JSON
+  }) as any;
+  const before = ledgerLines();
+  const result = await handler()({ url });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.status, 503, 'the flow must reach the accounting block through a non-200 response');
+  const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
+  const failedEntry = entries.find((e: any) => e.url === url && e.status === 'failed');
+  assert.ok(failedEntry, 'the non-200 attempt must appear in the ledger');
+  assert.equal(failedEntry.http_status, 503, 'the row carries the HTTP status');
+  assert.equal(failedEntry.error, 'HTTP 503', 'never undefined: non-JSON bodies fall back to HTTP <status>');
+  assert.equal(failedEntry.amount_usdc, 0, 'nothing settled');
+  assert.equal(failedEntry.attempted_amount_usdc, 0.01, 'the attempted price is preserved on the row');
+});
+
+it('issue #45: a pre-#45 legacy failed row (no http_status) rehydrates identically — spend accounting unchanged by its presence', async () => {
+  // Mirrors payment-utils.rehydrate.test.ts's style: a fresh query-busted
+  // module pair over a temp ledger holding the exact live row shape pre-#45
+  // produced (the 2026-09-28T12:35Z svm402 refusal) next to one settled
+  // success. Old rows must keep rehydrating and counting spend exactly as
+  // before — the new fields are purely additive and never invented on old rows.
+  const legacyDir = mkdtempSync(join(tmpdir(), 'x402-fetch-legacy-'));
+  extraDirs.push(legacyDir);
+  process.env.PAYMENT_LOG_PATH = join(legacyDir, 'ledger.jsonl');
+  const legacyFailed = JSON.stringify({
+    timestamp: '2026-09-28T12:35:46.268Z', url: 'https://legacy-failed.invalid/api', method: 'GET',
+    chain: 'solana', amount_usdc: 0.01, status: 'failed',
+  });
+  const settled = JSON.stringify({
+    timestamp: new Date().toISOString(), url: 'https://legacy-failed.invalid/api', method: 'GET',
+    chain: 'solana', amount_usdc: 0.25, status: 'success',
+  });
+  writeFileSync(process.env.PAYMENT_LOG_PATH, legacyFailed + '\n' + settled + '\n', 'utf8');
+  const raw = JSON.parse(legacyFailed);
+  assert.ok(!('http_status' in raw) && !('attempted_amount_usdc' in raw), 'the fixture is genuinely pre-#45 shaped');
+  const { getDailySpent } = await import(`../payment-utils.js?legacy45=${++bust}`) as typeof import('../payment-utils.js'); // "restart" against the same ledger
+  const store = await import(`../policy/budget-store.js?legacy45=${bust}`) as typeof import('../policy/budget-store.js');
+  assert.equal(getDailySpent(), 0.25, 'the legacy failed row must not count as spend (the status gate is unchanged)');
+  assert.equal(getDailySpent('solana'), 0.25);
+  assert.equal(store.getPerServiceSpent('legacy-failed.invalid'), 0.25, 'per-service rehydration ignores the failed row exactly as before');
+});
