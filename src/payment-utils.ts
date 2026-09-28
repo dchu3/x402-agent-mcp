@@ -12,6 +12,14 @@ export interface PaymentLogEntry {
   tx_hash?: string;
   status: "success" | "failed";
   error?: string;
+  // Issue #45: a refused (non-200) paid fetch row is self-describing — it
+  // carries the HTTP status and the gateway's error string (or `HTTP <status>`
+  // when the body is not JSON), reads amount_usdc as 0 because nothing
+  // settled, and preserves the advertised price in attempted_amount_usdc.
+  // Both fields are optional: rows written before #45 (and the intent-abort
+  // catch rows) rehydrate and read exactly as before.
+  http_status?: number;
+  attempted_amount_usdc?: number;
 }
 
 const LOG_PATH = process.env.PAYMENT_LOG_PATH || "./x402-payments.jsonl";
