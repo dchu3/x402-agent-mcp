@@ -510,12 +510,40 @@ export function registerFetchTool(server: McpServer): void {
           if (meta?.cost?.usd) actualCost = meta.cost.usd;
         }
 
+        // Issue #45: a refused (non-200) paid fetch must still leave a
+        // self-describing ledger row. The reason is in hand right here — the
+        // gateway's 402/5xx body carries its own `error` string (verified live
+        // 2026-09-28: {"x402Version":2,"error":"Payment verification failed —
+        // invalid or insufficient payment","accepts":[...]}) — and resp.status
+        // is known at this call site; today both are discarded, so the only
+        // way to tell "client unfunded / payment refused" from "settled, then
+        // the server failed" is the seller's server-side audit log. A non-JSON
+        // body falls back to `HTTP <status>` — the field is never absent on a
+        // non-200 row. Nothing settles on a non-200, so the settled-spend
+        // field reads 0 and the attempted price moves to
+        // attempted_amount_usdc: every accounting consumer (ledger
+        // rehydration, budget-store, anomaly-store) gates on
+        // status === "success", so no budget, cap or baseline changes. The
+        // 200 (success) path below stays byte-identical to the pre-#45 row.
+        const failureRowFields = isSuccessfulPayment
+          ? {}
+          : {
+              amount_usdc: 0,
+              attempted_amount_usdc: actualCost,
+              http_status: resp.status,
+              error:
+                typeof bodyResult === "object" && bodyResult !== null &&
+                typeof (bodyResult as any).error === "string" && (bodyResult as any).error !== ""
+                  ? (bodyResult as any).error
+                  : `HTTP ${resp.status}`,
+            };
+
         logPayment({
           timestamp: new Date().toISOString(),
           url,
           method,
           chain: useChain,
-          amount_usdc: actualCost,
+          ...(isSuccessfulPayment ? { amount_usdc: actualCost } : failureRowFields),
           tx_hash: txHash,
           status: isSuccessfulPayment ? "success" : "failed",
         });
