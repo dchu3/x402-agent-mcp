@@ -42,11 +42,21 @@ export function toNanoCaip2(network: string): NanoNetwork {
 /**
  * Convert a decimal XNO amount to exact integer raw.
  *
- * Throws on sub-raw precision instead of silently truncating, and never goes
- * through a JS number for string input.
+ * Accepts a decimal XNO string or a bigint of whole XNO only. A JS number is
+ * refused: a float cannot hold 30 decimals, and formatting one leaks binary
+ * noise into the raw amount. Throws on sub-raw precision instead of silently
+ * truncating.
  */
-export function xnoToRaw(amount: string | number): bigint {
-  const raw = typeof amount === "number" ? formatNumber(amount) : String(amount).trim();
+export function xnoToRaw(amount: string | bigint): bigint {
+  if (typeof amount === "bigint") {
+    if (amount < 0n) throw new Error(`XNO amount cannot be negative: ${amount}`);
+    if (amount > MAX_RAW / RAW_PER_XNO) throw new Error(`XNO amount ${amount} exceeds the 128-bit ledger maximum`);
+    return amount * RAW_PER_XNO;
+  }
+  if (typeof amount !== "string") {
+    throw new Error(`XNO amount must be a decimal string or bigint, not ${typeof amount}`);
+  }
+  const raw = amount.trim();
   if (!/^-?\d+(\.\d+)?$/.test(raw)) {
     throw new Error(`Invalid XNO amount: ${amount}`);
   }
@@ -72,10 +82,4 @@ export function rawToXno(raw: bigint | string): string {
   const whole = value / RAW_PER_XNO;
   const fraction = (value % RAW_PER_XNO).toString().padStart(XNO_DECIMALS, "0").replace(/0+$/, "");
   return fraction ? `${whole}.${fraction}` : whole.toString();
-}
-
-function formatNumber(amount: number): string {
-  if (!Number.isFinite(amount)) throw new Error(`Invalid XNO amount: ${amount}`);
-  // Avoid exponent notation for small amounts (e.g. 1e-7).
-  return amount.toFixed(20).replace(/0+$/, "").replace(/\.$/, "");
 }

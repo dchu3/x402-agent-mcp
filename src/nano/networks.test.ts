@@ -24,7 +24,15 @@ describe("raw conversion (1 XNO = 10^30 raw)", () => {
     assert.equal(xnoToRaw("1"), 10n ** 30n);
     assert.equal(xnoToRaw("0.001"), 10n ** 27n);
     assert.equal(xnoToRaw("0.000000000000000000000000000001"), 1n);
-    assert.equal(xnoToRaw(2.5), 25n * 10n ** 29n);
+    assert.equal(xnoToRaw(2n), 2n * 10n ** 30n);
+  });
+  it("refuses a JS number instead of formatting float noise into raw", () => {
+    for (const n of [2.5, 0.1, 1, 0, 1e-7, Number.NaN]) {
+      assert.throws(() => xnoToRaw(n as any), /decimal string or bigint/, String(n));
+    }
+    assert.throws(() => xnoToRaw(undefined as any), /decimal string or bigint/);
+    assert.throws(() => xnoToRaw(-1n), /negative/);
+    assert.throws(() => xnoToRaw(1n << 100n), /128-bit/);
   });
   it("refuses sub-raw precision instead of rounding, but allows trailing zeros", () => {
     assert.throws(() => xnoToRaw("0.0000000000000000000000000000001"), /sub-raw/);
