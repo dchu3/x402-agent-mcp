@@ -8,6 +8,11 @@ import { intentManager } from '../payment-intent/manager.js';
 import type { IntentRejectCode, PaymentIntent } from '../payment-intent/types.js';
 import { boundedText } from './casper-fetch.js';
 
+/** Reporting only: a ledger read failure here must not turn a completed send into an error. */
+function dailyAuthorizedRaw(): string | undefined {
+  try { return nanoBudget.getDailySpent().toString(); } catch { return undefined; }
+}
+
 export async function fetchNano(
   url: string,
   method: string,
@@ -62,7 +67,7 @@ export async function fetchNano(
       // whether or not the server then serves the resource.
       paid: confirmed !== undefined, accepted: confirmed !== undefined && response.status === 200,
       block_hash: confirmed, authorized_raw: authorized().toString(), authorized_xno: rawToXno(authorized()),
-      daily_authorized_raw: nanoBudget.getDailySpent().toString(), payment_receipt: receipt, body: result,
+      daily_authorized_raw: dailyAuthorizedRaw(), payment_receipt: receipt, body: result,
     }) }] };
   } catch {
     // Never echo SDK/RPC errors: the node URL or wallet id may appear in them.

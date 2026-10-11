@@ -26,6 +26,11 @@ export interface PaymentLogEntry {
 
 const LOG_PATH = process.env.PAYMENT_LOG_PATH || "./x402-payments.jsonl";
 
+/** The ledger file this module appends to (native-unit budgets rehydrate from it). */
+export function getLedgerPath(): string {
+  return LOG_PATH;
+}
+
 // Track daily spending in memory
 const dailySpentByChain = new Map<string, number>();
 let dailyDate = new Date().toISOString().slice(0, 10);
