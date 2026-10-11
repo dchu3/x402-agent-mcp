@@ -13,7 +13,7 @@ import { CASPER_CHAIN, toCasperCaip2 } from "../casper/networks.js";
 import { fetchNano } from "./nano-fetch.js";
 import { nanoBudget } from "../nano/budget.js";
 import { selectNanoAccept, assertPayableNanoAccept, nanoAmountRaw, XNO_ASSET } from "../nano/accepts.js";
-import { NANO_CHAIN, XNO_DECIMALS, toNanoCaip2 } from "../nano/networks.js";
+import { NANO_CHAIN, NANO_MAINNET_CAIP2, XNO_DECIMALS, toNanoCaip2 } from "../nano/networks.js";
 import { nanoSenderConfigured, resolveNanoSender } from "../nano/client.js";
 import { caip2Of, isEvmNetwork, isUsdChain } from "../evm/networks.js";
 import { parseChainFromNetwork } from "./probe-utils.js";
@@ -139,7 +139,8 @@ export function registerFetchTool(server: McpServer): void {
       let probedOffer: { scheme?: string; network?: string; asset?: string; amount?: string; payTo?: string } | undefined;
       let casperIntent: PaymentIntent | null = null;
       let casperBlockedCode: IntentRejectCode | undefined;
-      let nanoNetwork = "";
+      // The Nano scheme is pinned to mainnet; offer selection uses the same pin.
+      let nanoNetwork: string = NANO_MAINNET_CAIP2;
       let nanoIntent: PaymentIntent | null = null;
       let nanoBlockedCode: IntentRejectCode | undefined;
 
@@ -294,7 +295,7 @@ export function registerFetchTool(server: McpServer): void {
             // Nano settles in native XNO raw (30 decimals) — the Casper
             // pattern: gate → validate → intent → native-unit budget check.
             if (useChain === NANO_CHAIN) {
-              const nanoAccept = selectNanoAccept(paymentInfo, nanoNetwork);
+              const nanoAccept = selectNanoAccept(paymentInfo, NANO_MAINNET_CAIP2);
               // POLICY GATE: XNO has no USD price at this layer, so amount 0 —
               // raw budgets (nano/budget.ts) remain the spend control and the
               // engine enforces chain/token/service/recipient rules + the
@@ -399,7 +400,7 @@ export function registerFetchTool(server: McpServer): void {
         } catch (err: any) {
           return { content: [{ type: "text" as const, text: JSON.stringify({ error: err.message, url, chain: NANO_CHAIN }) }] };
         }
-        return fetchNano(url, method, args.body, sender, nanoNetwork || "nano:mainnet", nanoIntent, nanoBlockedCode);
+        return fetchNano(url, method, args.body, sender, nanoNetwork, nanoIntent, nanoBlockedCode);
       }
 
       // USD estimate for policy evaluation (informational — the intent binds

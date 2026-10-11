@@ -15,6 +15,8 @@ const { nanoBudget } = await import('../nano/budget.js');
 const { getDailySpent } = await import('../payment-utils.js');
 const { normalizeRecipient } = await import('../policy/recipient.js');
 const { parseChainFromNetwork } = await import('./probe-utils.js');
+const { selectNanoAccept } = await import('../nano/accepts.js');
+const { NANO_MAINNET_CAIP2 } = await import('../nano/networks.js');
 const originalFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = originalFetch; _setNanoSenderForTests(undefined); process.env = { ...env, PAYMENT_LOG_PATH: join(dir, 'ledger.jsonl'), X402_DIRECTORY_PATH: join(dir, 'endpoints.json') }; });
 after(() => { process.env = env; rmSync(dir, { recursive: true, force: true }); });
@@ -107,6 +109,27 @@ it('forced chain nano finds the Nano offer even when accepts[0] is another chain
   };
   const result = JSON.parse((await handler()({ url: 'https://example.invalid', chain: 'nano' })).content[0].text);
   assert.equal(result.paid, true); assert.equal(sends.length, 1);
+});
+
+it('forced chain nano selects the offer with the nano:mainnet pin the scheme uses', async () => {
+  enableNano(); const sends = recordingSender();
+  const seen: any[] = [];
+  const base = { scheme: 'exact', network: 'eip155:8453', asset: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', payTo: '0x' + 'ab'.repeat(20), amount: '10000' };
+  globalThis.fetch = async (input: any, init?: any) => {
+    const headers = new Headers(input instanceof Request ? input.headers : init?.headers);
+    const sig = headers.get('payment-signature');
+    if (sig) { seen.push(JSON.parse(Buffer.from(sig, 'base64').toString())); return new Response('{"ok":true}', { status: 200 }); }
+    const payload = JSON.stringify({ x402Version: 2, resource: { url: 'https://example.invalid', description: '', mimeType: 'text/plain' }, accepts: [base, { ...offer, scheme: 'upto' }, offer] });
+    return new Response(payload, { status: 402, headers: { 'payment-required': Buffer.from(payload).toString('base64') } });
+  };
+  const result = JSON.parse((await handler()({ url: 'https://example.invalid', chain: 'nano' })).content[0].text);
+  assert.equal(result.paid, true); assert.equal(sends.length, 1);
+  assert.equal(seen[0].accepted.network, 'nano:mainnet');
+  assert.equal(seen[0].accepted.scheme, 'exact');
+  // The probe selection and the scheme agree on the same pin.
+  assert.equal(selectNanoAccept({ accepts: [base, offer] }, NANO_MAINNET_CAIP2)?.network, 'nano:mainnet');
+  const src = readFileSync(new URL('./fetch.js', import.meta.url), 'utf8');
+  assert.match(src, /selectNanoAccept\(paymentInfo, NANO_MAINNET_CAIP2\)/, 'forced/auto Nano selection must pass the mainnet pin, not an empty hint');
 });
 
 it('unset Nano budgets refuse before any send', async () => {
