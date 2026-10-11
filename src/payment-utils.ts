@@ -8,7 +8,9 @@ export interface PaymentLogEntry {
   chain: string;
   amount_usdc?: number;
   amount_motes?: string;
-  currency?: "USDC" | "wCSPR";
+  /** Exact integer raw for Nano rows (1 XNO = 10^30 raw). */
+  amount_raw?: string;
+  currency?: "USDC" | "wCSPR" | "XNO";
   tx_hash?: string;
   status: "success" | "failed";
   error?: string;
@@ -45,6 +47,7 @@ function rehydrateFromLedger(): void {
         if (
           entry.status === "success" &&
           entry.chain !== "casper" &&
+          entry.chain !== "nano" &&
           typeof entry.chain === "string" &&
           entry.timestamp.slice(0, 10) === dailyDate
         ) {
@@ -96,7 +99,9 @@ export function checkSpendingLimit(amountUsdc: number): { allowed: boolean; reas
 export function logPayment(entry: PaymentLogEntry): void {
   resetDailyIfNewDay();
 
-  if (entry.status === "success" && entry.chain !== "casper") {
+  // Casper (motes) and Nano (raw) rows are native-unit spend with their own
+  // budgets — they never enter the USD counters.
+  if (entry.status === "success" && entry.chain !== "casper" && entry.chain !== "nano") {
     dailySpentByChain.set(entry.chain, (dailySpentByChain.get(entry.chain) ?? 0) + (entry.amount_usdc ?? 0));
   }
 

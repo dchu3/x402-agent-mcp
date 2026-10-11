@@ -29,6 +29,7 @@ const ALLOWLIST = [
   'tools/fetch.ts',
   'tools/casper-fetch.ts',
   'casper/client.ts',
+  'tools/nano-fetch.ts',
 ];
 
 function listSourceFiles(dir: string): string[] {
@@ -84,5 +85,18 @@ it('the sanctioned call sites are wired exactly where expected', () => {
   for (const forbidden of ['casper/budget.ts', 'casper/accepts.ts', 'casper/client.ts', 'payment-utils.ts']) {
     const content = readFileSync(join(SRC_ROOT, ...forbidden.split('/')), 'utf8');
     assert.ok(!content.includes('payment-intent'), `${forbidden} must stay independent of the intent layer`);
+  }
+});
+
+it('the Nano leg registers intent enforcement before its budget guard', () => {
+  const nanoSrc = readFileSync(join(SRC_ROOT, 'tools', 'nano-fetch.ts'), 'utf8');
+  assert.ok(nanoSrc.includes('intentEnforcement('), 'the Nano leg must register the intent enforcement hook');
+  assert.ok(
+    nanoSrc.indexOf('intentEnforcement(') < nanoSrc.indexOf('guardNanoPayments('),
+    'intent enforcement precedes the Nano budget guard',
+  );
+  for (const independent of ['nano/budget.ts', 'nano/accepts.ts', 'nano/client.ts']) {
+    const content = readFileSync(join(SRC_ROOT, ...independent.split('/')), 'utf8');
+    assert.ok(!content.includes('payment-intent'), `${independent} must stay independent of the intent layer`);
   }
 });
