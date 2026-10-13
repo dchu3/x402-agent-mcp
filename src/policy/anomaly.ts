@@ -89,7 +89,8 @@ export function evaluatePriceAnomaly(
   // 2. The Casper leg is inert (conflict A): amounts are mote-denominated
   // (amount 0 by design at the gate) and casper/budget.ts is its spend
   // authority — the same scope rule the USD-ledger stores document.
-  if (chain === "casper") return { band: "none" };
+  // The Nano leg (raw-denominated, nano/budget.ts) is inert for the same reason.
+  if (chain === "casper" || chain === "nano") return { band: "none" };
   // 3. A non-positive or non-finite amount on a USD chain fails closed.
   if (!Number.isFinite(amount) || amount <= 0) {
     return {

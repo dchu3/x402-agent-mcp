@@ -15,6 +15,7 @@
 import { isAddress } from "viem";
 import bs58 from "bs58";
 import { CHAIN_ALIASES, isEvmNetwork } from "../evm/networks.js";
+import { normalizeNanoAddress } from "../nano/address.js";
 
 /** Canonicalise a recipient for a payment chain; undefined = not a valid
  * address for that chain (never guess, never repair). Total, pure, never
@@ -22,7 +23,8 @@ import { CHAIN_ALIASES, isEvmNetwork } from "../evm/networks.js";
  * 'arbitrum' | 'ethereum') or any 'eip155:<digits>' id → EVM (EIP-55 checked,
  * canonical lowercase — issue #32: the aliases, not just Base); 'solana' →
  * 32-byte base58 (canonical re-encode); 'casper' → '00' + 64 hex (optional
- * 'account-hash-' prefix stripped, canonical lowercase). Anything else
+ * 'account-hash-' prefix stripped, canonical lowercase); 'nano' → checksum-
+ * valid nano_ address (legacy xrb_ rewritten to nano_). Anything else
  * (unknown chain, empty/whitespace raw) ⇒ undefined. */
 export function normalizeRecipient(chain: string, raw: string): string | undefined {
   if (typeof chain !== "string" || typeof raw !== "string") return undefined;
@@ -62,6 +64,10 @@ export function normalizeRecipient(chain: string, raw: string): string | undefin
     const stripped = value.startsWith("account-hash-") ? value.slice("account-hash-".length) : value;
     return /^00[0-9a-fA-F]{64}$/.test(stripped) ? stripped.toLowerCase() : undefined;
   }
+
+  // Nano: a checksum-valid nano_/xrb_ address (src/nano/address.ts); the
+  // canonical form is the nano_ spelling. A wrong checksum is rejected.
+  if (chain === "nano") return normalizeNanoAddress(value);
 
   // Unknown chain — never guess.
   return undefined;

@@ -10,6 +10,11 @@ import { fetchCasper, boundedText } from "./casper-fetch.js";
 import { casperBudget } from "../casper/budget.js";
 import { selectCasperAccept, assertPayableCasperAccept, casperAmountMotes } from "../casper/accepts.js";
 import { CASPER_CHAIN, toCasperCaip2 } from "../casper/networks.js";
+import { fetchNano } from "./nano-fetch.js";
+import { nanoBudget } from "../nano/budget.js";
+import { selectNanoAccept, assertPayableNanoAccept, nanoAmountRaw, XNO_ASSET } from "../nano/accepts.js";
+import { NANO_CHAIN, NANO_MAINNET_CAIP2, XNO_DECIMALS, toNanoCaip2 } from "../nano/networks.js";
+import { nanoSenderConfigured, resolveNanoSender } from "../nano/client.js";
 import { caip2Of, isEvmNetwork, isUsdChain } from "../evm/networks.js";
 import { parseChainFromNetwork } from "./probe-utils.js";
 import { checkSpendingLimit, logPayment, getDailySpent, getMaxPerCall, getMaxDailySpend } from "../payment-utils.js";
@@ -100,12 +105,12 @@ function intentAbortReasons(message: string): Array<{ code: string; message: str
 export function registerFetchTool(server: McpServer): void {
   server.tool(
     "x402_fetch",
-    "Fetch any x402-paid endpoint — handles 402 payment challenge automatically on Base, Polygon, Arbitrum, Solana or Casper. The agent never sees wallets or payment details. Just provide a URL and optional body.",
+    "Fetch any x402-paid endpoint — handles 402 payment challenge automatically on Base, Polygon, Arbitrum, Solana, Casper or Nano. The agent never sees wallets or payment details. Just provide a URL and optional body.",
     {
       url: z.string().describe("Full URL of the x402 endpoint (e.g. https://svm402.com/check — the service's one paid verdict route since its issue-217 cut-over)"),
       method: z.string().optional().describe("HTTP method: GET or POST (default: GET)"),
       body: z.string().optional().describe("JSON body for POST requests (as string)"),
-      chain: z.enum(["base", "solana", "casper", "polygon", "arbitrum"]).optional().describe("Force chain: 'base', 'polygon', 'arbitrum', 'solana' or 'casper'. Auto-detected if omitted."),
+      chain: z.enum(["base", "solana", "casper", "polygon", "arbitrum", "nano"]).optional().describe("Force chain: 'base', 'polygon', 'arbitrum', 'solana', 'casper' or 'nano'. Auto-detected if omitted."),
     },
     async (args) => {
       const url = args.url;
@@ -134,6 +139,10 @@ export function registerFetchTool(server: McpServer): void {
       let probedOffer: { scheme?: string; network?: string; asset?: string; amount?: string; payTo?: string } | undefined;
       let casperIntent: PaymentIntent | null = null;
       let casperBlockedCode: IntentRejectCode | undefined;
+      // The Nano scheme is pinned to mainnet; offer selection uses the same pin.
+      let nanoNetwork: string = NANO_MAINNET_CAIP2;
+      let nanoIntent: PaymentIntent | null = null;
+      let nanoBlockedCode: IntentRejectCode | undefined;
 
       // Forced-chain fix (#25): a forced USD chain (solana or any EVM alias —
       // issue #32 adds polygon/arbitrum, so a forced Polygon call must
@@ -149,7 +158,7 @@ export function registerFetchTool(server: McpServer): void {
       // behaviour are unchanged.
       const forcedChain = isUsdChain(useChain);
 
-      if (!useChain || useChain === CASPER_CHAIN || forcedChain) {
+      if (!useChain || useChain === CASPER_CHAIN || useChain === NANO_CHAIN || forcedChain) {
         try {
           const probeResp = await fetch(url, {
             method,
@@ -197,8 +206,8 @@ export function registerFetchTool(server: McpServer): void {
               probedAmountUsdc = Number(firstAccept.amount) / 1e6;
             }
 
-            if (useChain === CASPER_CHAIN || forcedChain) {
-              // Forced Casper still probes and validates a real offer below;
+            if (useChain === CASPER_CHAIN || useChain === NANO_CHAIN || forcedChain) {
+              // Forced Casper/Nano still probes and validates a real offer below;
               // forced USD chains keep the caller's chain — the probe only
               // observed the offer above (never re-detects, never refutes it).
             } else {
@@ -207,7 +216,7 @@ export function registerFetchTool(server: McpServer): void {
               // src/evm/networks.ts) — never the pre-#32 substring collapse
               // that mapped every eip155:* onto base.
               const detected = parseChainFromNetwork(network);
-              if (detected !== "" && (isUsdChain(detected) || detected === CASPER_CHAIN)) {
+              if (detected !== "" && (isUsdChain(detected) || detected === CASPER_CHAIN || detected === NANO_CHAIN)) {
                 useChain = detected;
               } else {
                 return {
@@ -216,7 +225,7 @@ export function registerFetchTool(server: McpServer): void {
                     text: JSON.stringify({
                       error: "Could not auto-detect chain from 402 response",
                       payment_info: JSON.stringify(paymentInfo).slice(0, 1000),
-                      hint: "Specify chain parameter: 'solana', 'base', 'polygon', 'arbitrum' or 'casper'",
+                      hint: "Specify chain parameter: 'solana', 'base', 'polygon', 'arbitrum', 'casper' or 'nano'",
                     }),
                   }],
                 };
@@ -282,6 +291,51 @@ export function registerFetchTool(server: McpServer): void {
                 }
               }
             }
+
+            // Nano settles in native XNO raw (30 decimals) — the Casper
+            // pattern: gate → validate → intent → native-unit budget check.
+            if (useChain === NANO_CHAIN) {
+              const nanoAccept = selectNanoAccept(paymentInfo, NANO_MAINNET_CAIP2);
+              // POLICY GATE: XNO has no USD price at this layer, so amount 0 —
+              // raw budgets (nano/budget.ts) remain the spend control and the
+              // engine enforces chain/token/service/recipient rules + the
+              // global kill switch. Nano is NOT in the default allowlist.
+              const nanoPolicy = getPolicyEngine().evaluate(
+                buildPolicyContext(url, NANO_CHAIN, XNO_ASSET, 0, { recipient: nanoAccept?.payTo }),
+                { dailySpentUsd: getDailySpent(), perServiceSpentUsd: getPerServiceSpent(serviceHost) },
+              );
+              if (nanoPolicy.decision !== "ALLOW") {
+                return policyRefusal(nanoPolicy, url, NANO_CHAIN, 0);
+              }
+              if (!nanoAccept) throw new Error("No matching exact Nano payment offer");
+              nanoNetwork = toNanoCaip2(nanoAccept.network);
+              try {
+                assertPayableNanoAccept(nanoAccept);
+                const nanoIntentResult = createFromOffer({
+                  decision: nanoPolicy,
+                  url,
+                  chain: NANO_CHAIN,
+                  token: XNO_ASSET,
+                  asset: nanoAccept.asset,
+                  amountAtomic: nanoAmountRaw(nanoAccept).toString(),
+                  decimals: XNO_DECIMALS,
+                  recipient: nanoAccept.payTo,
+                  network: nanoAccept.network,
+                  scheme: nanoAccept.scheme,
+                  amountUsdEstimate: 0,
+                });
+                if (nanoIntentResult.ok === true) nanoIntent = nanoIntentResult.intent;
+                else nanoBlockedCode = nanoIntentResult.code;
+                nanoBudget.check(nanoAmountRaw(nanoAccept));
+              } catch (err: any) {
+                return {
+                  content: [{
+                    type: "text" as const,
+                    text: JSON.stringify({ error: err.message, url, chain: NANO_CHAIN, payment_info: JSON.stringify(paymentInfo).slice(0, 1000) }),
+                  }],
+                };
+              }
+            }
           }
         } catch (err: any) {
           // A forced USD-chain probe failure must not refuse a request the
@@ -330,6 +384,23 @@ export function registerFetchTool(server: McpServer): void {
 
       if (useChain === CASPER_CHAIN) {
         return fetchCasper(url, method, args.body, casperKey!, casperNetwork, casperIntent, casperBlockedCode);
+      }
+      if (useChain === NANO_CHAIN && !nanoSenderConfigured()) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ error: "NANO_RPC_URL, NANO_WALLET_ID and NANO_SOURCE_ACCOUNT not set. Cannot pay on Nano." }),
+          }],
+        };
+      }
+      if (useChain === NANO_CHAIN) {
+        let sender;
+        try {
+          sender = resolveNanoSender();
+        } catch (err: any) {
+          return { content: [{ type: "text" as const, text: JSON.stringify({ error: err.message, url, chain: NANO_CHAIN }) }] };
+        }
+        return fetchNano(url, method, args.body, sender, nanoNetwork, nanoIntent, nanoBlockedCode);
       }
 
       // USD estimate for policy evaluation (informational — the intent binds

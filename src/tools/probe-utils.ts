@@ -1,5 +1,6 @@
 import { CASPER_CHAIN, isCasperNetwork } from "../casper/networks.js";
 import { aliasForCaip2 } from "../evm/networks.js";
+import { NANO_CHAIN, isNanoNetwork } from "../nano/networks.js";
 
 /** Fetch a URL and return its parsed JSON body, or null on any failure
  * (network error, non-2xx, or body that is not valid JSON — e.g. an HTML
@@ -46,6 +47,7 @@ export function parseChainFromNetwork(network: string): string {
   const evmAlias = aliasForCaip2(network);
   if (evmAlias !== "") return evmAlias;
   if (isCasperNetwork(network)) return CASPER_CHAIN;
+  if (isNanoNetwork(network)) return NANO_CHAIN;
   return network;
 }
 

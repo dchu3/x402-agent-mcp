@@ -37,6 +37,7 @@ function rehydrateFromLedger(): void {
         if (
           e.status === "success" &&
           e.chain !== "casper" &&
+          e.chain !== "nano" &&
           typeof e.url === "string" &&
           typeof e.timestamp === "string" &&
           e.timestamp.slice(0, 10) === dailyDate
