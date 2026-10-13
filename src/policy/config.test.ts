@@ -685,17 +685,19 @@ it('malformed liveness blocks fail closed (CONFIG_INVALID) — every validation 
 // ---------------------------------------------------------------------------
 
 it('a trailing-* wildcard paths entry validates clean — the operator config shape that exposed #36', () => {
-  // The LIVE operator shape: svm402.com advertises /price/{address}; the
-  // operator reached for paths: ["/price/*"] and got a silently broken pin.
+  // The LIVE operator shape: since the svm402.com issue-217 cut-over the
+  // retained address-token GET paid route is /holdcheck/{address} (/price and
+  // its retired siblings 410); the operator reaches for paths:
+  // ["/holdcheck/*"] and got a silently broken pin.
   process.env.POLICY_CONFIG_PATH = configFile('liveness-wildcard.json', validFileJson({
-    liveness: { allowlist: [{ base_url: 'https://svm402.com', paths: ['/price/*'] }] },
+    liveness: { allowlist: [{ base_url: 'https://svm402.com', paths: ['/holdcheck/*'] }] },
   }));
   const state = loadPolicyConfig();
   assert.deepEqual(state.configErrors, [], 'the live operator config shape must load with config_valid: true');
   assert.deepEqual(state.config.liveness, {
     require_fresh_402: true,
     max_age_seconds: 3600,
-    allowlist: [{ base_url: 'https://svm402.com', paths: ['/price/*'] }],
+    allowlist: [{ base_url: 'https://svm402.com', paths: ['/holdcheck/*'] }],
   });
 
   // A literal path keeps validating clean, alongside a wildcard.
@@ -732,7 +734,7 @@ it('a config mixing a wildcard with an invalid paths variant lands fail-closed: 
     liveness: {
       require_fresh_402: true,
       allowlist: [
-        { base_url: 'https://svm402.com', paths: ['/price/*'] },
+        { base_url: 'https://svm402.com', paths: ['/holdcheck/*'] },
         { base_url: 'https://bad.example', paths: ['/a/*/b'] },
       ],
     },

@@ -102,7 +102,7 @@ export function registerFetchTool(server: McpServer): void {
     "x402_fetch",
     "Fetch any x402-paid endpoint — handles 402 payment challenge automatically on Base, Polygon, Arbitrum, Solana or Casper. The agent never sees wallets or payment details. Just provide a URL and optional body.",
     {
-      url: z.string().describe("Full URL of the x402 endpoint (e.g. https://svm402.com/analyze)"),
+      url: z.string().describe("Full URL of the x402 endpoint (e.g. https://svm402.com/check — the service's one paid verdict route since its issue-217 cut-over)"),
       method: z.string().optional().describe("HTTP method: GET or POST (default: GET)"),
       body: z.string().optional().describe("JSON body for POST requests (as string)"),
       chain: z.enum(["base", "solana", "casper", "polygon", "arbitrum"]).optional().describe("Force chain: 'base', 'polygon', 'arbitrum', 'solana' or 'casper'. Auto-detected if omitted."),

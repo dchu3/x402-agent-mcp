@@ -503,11 +503,13 @@ x402_health({ url: "https://svm402.com" })
 
 ```
 x402_fetch({
-  url: "https://svm402.com/analyze",
+  url: "https://svm402.com/check",
   method: "POST",
-  body: '{"address": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"}'
+  body: '{"mint": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"}'
 })
 ```
+
+svm402's retired routes (`/analyze`, `/safety/{address}`, `/price/{address}`, `/organic/{address}`, `/wash-delta/{address}`, `/wash-trading/{address}`) answer 410 since the issue-217 cut-over; `POST /check` is the one paid verdict ($0.03, schema `svm402.check.v1`) and `GET /demo/check` is the free preview.
 
 ```
 x402_fetch({
