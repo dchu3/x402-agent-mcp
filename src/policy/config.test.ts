@@ -685,10 +685,11 @@ it('malformed liveness blocks fail closed (CONFIG_INVALID) — every validation 
 // ---------------------------------------------------------------------------
 
 it('a trailing-* wildcard paths entry validates clean — the operator config shape that exposed #36', () => {
-  // The LIVE operator shape: since the svm402.com issue-217 cut-over the
-  // retained address-token GET paid route is /holdcheck/{address} (/price and
-  // its retired siblings 410); the operator reaches for paths:
-  // ["/holdcheck/*"] and got a silently broken pin.
+  // Historical note (issue #50 rewording): this reproduces the LIVE operator
+  // shape from the #36 era — the operator pinned a trailing-`*` wildcard
+  // paths: ["/holdcheck/*"] on their address-token service and got a
+  // silently broken pin. (Which concrete route that service served has since
+  // rotated; the string stays as the synthetic wildcard example here.)
   process.env.POLICY_CONFIG_PATH = configFile('liveness-wildcard.json', validFileJson({
     liveness: { allowlist: [{ base_url: 'https://svm402.com', paths: ['/holdcheck/*'] }] },
   }));
