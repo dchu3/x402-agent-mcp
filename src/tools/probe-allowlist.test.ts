@@ -284,11 +284,11 @@ it('issue #38 regression: root free/404 but the API path challenges ⇒ recorded
 });
 
 it('advertised GET paths are probed ahead of root and win — with placeholders substituted only in the request URL', async () => {
-  // Plan fact 5: svm402.com advertises parametrized GET paths (pre-#217 that
-  // was /price/{address}; since the cut-over the pinned GET paid route is
-  // /holdcheck/{address}) — the clearly-marked placeholder probe is a valid
-  // representative mechanism; the fixture pins the mechanism on a synthetic
-  // host.
+  // Mechanism fixture (issue #50 rewording): this was originally modelled on
+  // a real host's parametrized GET paid paths, but which concrete route a
+  // service serves rotates — so the fixture pins the MECHANISM on a synthetic
+  // host: the clearly-marked placeholder probe is a valid representative on
+  // advertised parametrized GET paths.
   writeDirectory([seedEntry('Svm', 'https://svm.example', {
     source: 'seed',
     endpoints: [{ path: '/price/{address}', method: 'GET', price_usdc: '0.01', description: '' }],

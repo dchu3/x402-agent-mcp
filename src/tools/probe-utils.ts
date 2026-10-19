@@ -163,14 +163,14 @@ export async function findPaymentChallenge(baseUrl: string, timeoutMs: number = 
 // ---------------------------------------------------------------------------
 
 /** The substitute token for parametrized probe candidates (issue #38, P3).
- * MEASURED (plan fact 5): a clearly-marked placeholder is a valid
- * representative probe — /price/x402-probe answers 402 where /price/{address}
- * is the advertised shape. Post-#217 note: address-token routes that validate
- * pre-settle (e.g. svm402.com's retained GET /holdcheck/{address}, or its
- * now-410 /price/{address}) answer 400 for the placeholder token on svm402 —
- * there the operator's directory-row pin carries a REAL example mint instead
- * (https://svm402.com/holdcheck/<EXAMPLE_ADDRESS>); the placeholder stays the
- * generic representative for wildcard/advertised-path probes elsewhere. */
+ * MEASURED: a clearly-marked placeholder is a valid representative probe —
+ * a placeholder probe can answer 402 on an advertised parametrized route.
+ * Note (issue #50): address-token routes that validate the parameter
+ * pre-settle answer 400 for the placeholder token — there the operator's
+ * directory-row pin may carry a REAL example token instead; the placeholder
+ * stays the generic representative for wildcard/advertised-path probes
+ * elsewhere. (Which concrete routes a given service serves rotates, so no
+ * per-service route is named here.) */
 export const PROBE_PLACEHOLDER = "x402-probe";
 
 /** Substitute path/query placeholders in a candidate path with the probe
