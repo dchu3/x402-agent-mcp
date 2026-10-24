@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { wrapFetchWithPayment, x402Client } from "@x402/fetch";
+import { wrapFetchWithPayment, x402Client, type SelectPaymentRequirements, type PaymentRequirements } from "@x402/fetch";
 import { ExactSvmScheme, toClientSvmSigner, SOLANA_MAINNET_CAIP2, DEFAULT_ASSETS as SVM_DEFAULT_ASSETS } from "@x402/svm";
 import { ExactEvmScheme, toClientEvmSigner, DEFAULT_ASSETS as EVM_DEFAULT_ASSETS } from "@x402/evm";
 import { createKeyPairSignerFromBytes } from "@solana/kit";
@@ -26,6 +26,10 @@ import { extractSettlementReceipt, RECEIPT_VERIFIED, RECEIPT_NOTE } from "./rece
 // refuses private/loopback/link-local/unspecified hosts and redirects BEFORE
 // any request (and therefore before any payment attempt).
 import { guardedFetch, isTransportRefusal } from "../transport/guard.js";
+// Issue #61 (C7): the probe-replay transport — the SDK's first (unpaid) request
+// to the same method+url is answered from the probe's own bytes instead of a
+// second network hit, closing the offer-swap window at its root.
+import { replayFirstProbe, recordForReplay, type ProbedResponseRecord } from "../transport/replay.js";
 // Issue #64: deny-by-default caller headers — validated (allowlist, hard deny
 // list, token/CR-LF-NUL/length/count checks) BEFORE any request; values are
 // never logged (names only below).
@@ -234,6 +238,11 @@ export function registerFetchTool(server: McpServer): void {
       let offerRefusals: RejectedOffer[] = [];
       let chosenAcceptRaw: unknown;
       let challengeExtensions: unknown;
+      // Issue #61 (C7): the probe's response, captured for the SDK-side replay
+      // (the SDK's first request is answered from these bytes). Undefined only
+      // when the probe request itself threw (forced chains proceed without it
+      // and the signed leg then goes straight through guardedFetch, as before).
+      let probeRecord: ProbedResponseRecord | undefined;
 
       // Forced-chain fix (#25): a forced USD chain (solana or any EVM alias —
       // issue #32 adds polygon/arbitrum, so a forced Polygon call must
@@ -261,8 +270,17 @@ export function registerFetchTool(server: McpServer): void {
             body: args.body || undefined,
           });
 
+          // Issue #61 (C7): snapshot the probe response (status + headers +
+          // bounded body when the flow reads it) so the SDK's own first request
+          // to the same method+url can be answered from THESE bytes — the same
+          // challenge the flow parses below. The seller cannot then show the
+          // SDK a different requirement than the agent saw at the probe, and
+          // the signed retry becomes the second (not third) request.
+          probeRecord = recordForReplay(probeResp, url, method, "");
+
           if (probeResp.status !== 402 && !forcedChain) {
-            const text = await boundedText(probeResp);
+            probeRecord.bodyText = await boundedText(probeResp);
+            const text = probeRecord.bodyText;
             return {
               content: [{
                 type: "text" as const,
@@ -278,10 +296,20 @@ export function registerFetchTool(server: McpServer): void {
             };
           }
 
+          if (probeResp.status !== 402 && forcedChain) {
+            // Forced chain + settled endpoint: capture the body so the replay
+            // hands the SDK the same bytes once (bounded; no second request).
+            probeRecord.bodyText = await boundedText(probeResp);
+          }
+
           if (probeResp.status === 402) {
             const encoded = probeResp.headers.get("payment-required");
             if (encoded && encoded.length > 65536) throw new Error("Payment header exceeds size limit");
-            const paymentInfo = JSON.parse(encoded ? Buffer.from(encoded, "base64").toString("utf8") : await boundedText(probeResp));
+            const paymentInfo = JSON.parse(
+              encoded
+                ? Buffer.from(encoded, "base64").toString("utf8")
+                : (probeRecord.bodyText = await boundedText(probeResp)),
+            );
             const accepts = paymentInfo.accepts || paymentInfo.accept || [];
             const firstAccept = Array.isArray(accepts) ? accepts[0] : accepts;
             const network = firstAccept?.network || "";
@@ -529,7 +557,34 @@ export function registerFetchTool(server: McpServer): void {
 
       // Step 3: Create x402 client with the right scheme
       try {
-        const client = new x402Client();
+        // Issue #61 (C7): force the SDK's own selection to the agent-chosen
+        // offer. The SDK's default selector takes accepts[0] of whatever its
+        // own filters leave — which can drift from the offer the flow's policy
+        // gate authorised. This selector returns the chosen offer BY IDENTITY
+        // (scheme/network/asset/amount/payTo — indexes shift under the SDK's
+        // filters), and refuses the whole payment when the chosen offer is not
+        // among the SDK's filtered requirements (fail closed: the SDK can
+        // never pay anything but the agent's selection). Both amount fields
+        // are compared as strings (v1 maxAmountRequired / v2 amount).
+        const boundSelector: SelectPaymentRequirements | undefined = selectedOffer === undefined
+          ? undefined
+          : (x402Version: number, requirements: PaymentRequirements[]): PaymentRequirements => {
+            const chosen = selectedOffer as OfferCandidate;
+            const match = requirements.find((requirement) => {
+              const r = requirement as unknown as Record<string, unknown>;
+              const amount = typeof r.amount === "string" ? r.amount : typeof r.maxAmountRequired === "string" ? r.maxAmountRequired : "";
+              return r.scheme === chosen.scheme
+                && r.network === chosen.network
+                && r.asset === chosen.asset
+                && r.payTo === chosen.payTo
+                && amount === chosen.amountAtomic;
+            });
+            if (match === undefined) {
+              throw new Error(`x402_fetch: the agent-selected offer is not among the SDK's filtered requirements for x402Version ${x402Version} — refusing to sign`);
+            }
+            return match;
+          };
+        const client = new x402Client(boundSelector);
         // Issue #55: our own payer address, for the scope boundary's fee-payer
         // rule (the agent never pays fee to itself unless the operator opted in).
         let payerAddress: string | undefined;
@@ -795,7 +850,23 @@ export function registerFetchTool(server: McpServer): void {
               // wrapped fetch for every request it makes). redirect:"manual"
               // rides in the init so the SDK-built Requests carry it and the
               // guard passes them through verbatim; redirects are refused.
-              const paidFetch = wrapFetchWithPayment(guardedFetch, client);
+              // Issue #61 (C7): when the flow SELECTED an offer through the
+              // deterministic selector (or the probe recorded a settled
+              // response), the SDK's first request rides the probe replay —
+              // the same challenge bytes the flow parsed and authorised, and
+              // no second network request. The selected offer already passed
+              // the SDK's own asset table, so the SDK's challenge processing
+              // on those bytes is guaranteed to work. Legacy flows (no bound
+              // offer: unbindable/asset-less/asset-" probes, forced chains
+              // without an offer) keep the pre-#61 behavior: the SDK's request
+              // goes to the network and anything it would try to sign aborts
+              // at the enforcement/blocking hook.
+              const transport = probeRecord === undefined
+                ? guardedFetch
+                : selectedOffer !== undefined || probeRecord.status !== 402
+                  ? replayFirstProbe(probeRecord, guardedFetch)
+                  : guardedFetch;
+              const paidFetch = wrapFetchWithPayment(transport, client);
               return paidFetch(url, {
                 method,
                 headers: requestHeaders(),
