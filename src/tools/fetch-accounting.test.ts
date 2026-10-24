@@ -31,11 +31,10 @@ const { registerFetchTool } = await import('./fetch.js');
 const { getDailySpent } = await import('../payment-utils.js') as typeof import('../payment-utils.js');
 const budgetStore = await import('../policy/budget-store.js') as typeof import('../policy/budget-store.js');
 const anomalyStore = await import('../policy/anomaly-store.js') as typeof import('../policy/anomaly-store.js');
-// Issue #53 helpers (accounting.ts). The specifier is deliberately a variable:
-// this file must COMPILE and RUN before the fix exists (the RED step), so the
-// missing module surfaces as failing assertions, not as a compile error.
+// Issue #53 helpers (accounting.ts) — typed import now that the module
+// exists; the variable specifier was only needed at the RED step.
 const ACCOUNTING_PATH = './accounting.js';
-const accounting: any = await import(ACCOUNTING_PATH).catch(() => undefined);
+const accounting = await import(ACCOUNTING_PATH) as typeof import('./accounting.js');
 
 const originalFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = originalFetch; process.env = { ...env, PAYMENT_LOG_PATH: join(dir, 'ledger.jsonl'), X402_DIRECTORY_PATH: join(dir, 'endpoints.json') }; });

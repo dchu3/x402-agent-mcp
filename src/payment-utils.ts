@@ -20,6 +20,13 @@ export interface PaymentLogEntry {
   // catch rows) rehydrate and read exactly as before.
   http_status?: number;
   attempted_amount_usdc?: number;
+  // Issue #53: the exact audit trail of the SIGNED amount on success rows —
+  // the intent's atomic amount as a decimal string, its decimals, and the
+  // offer's asset when known. `amount_usdc` remains the USD number the caps
+  // read (single narrowing at the ledger boundary, usdFromAtomic).
+  amount_atomic?: string;
+  decimals?: number;
+  asset?: string;
 }
 
 const LOG_PATH = process.env.PAYMENT_LOG_PATH || "./x402-payments.jsonl";

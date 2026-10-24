@@ -5,9 +5,9 @@
 //
 // - PAYMENT_LOG_PATH captured at module load (tests use fresh query-busted
 //   imports with the env preset).
-// - Lazy one-shot rehydration with the flag set before any I/O — never a
-//   double-read, even if the read throws. Corrupted ledger lines are skipped —
-//   logging is best-effort, so is reading it back.
+// - Rehydration is byte-mark based: rows of the ledger beyond the mark are
+//   integrated exactly once, corrupted ledger lines are skipped — logging is
+//   best-effort, so is reading it back.
 // - hostnameOf() lowercased-host helper; unparseable ledger URLs excluded.
 //
 // Scope rule (symmetric with the USD ledger stores): Casper entries are
@@ -17,8 +17,8 @@
 //
 // Baselines are NOT day-scoped (deliberate): the window is the last N settled
 // amounts for the host, not today's — a service priced ~$0.01 every day is
-// still anomalous at $1 the next day. The one-shot rehydration therefore also
-// has no day boundary.
+// still anomalous at $1 the next day. The byte-mark rehydration has no day
+// boundary either.
 //
 // Seeding (seedFromDirectory): when a host has NO settled baseline yet, the
 // advertised directory price seeds a one-sample baseline that is RETURNED to
@@ -34,7 +34,7 @@
 // must stay consistent with what logPayment already wrote, so a later opt-in
 // rehydrates the full history (the ledger is the source of truth).
 
-import { existsSync, readFileSync } from "fs";
+import { existsSync, readFileSync, statSync } from "fs";
 import { loadPolicyConfig } from "./config.js";
 import { emptyBaseline, updateBaseline } from "./anomaly.js";
 import { advertisedPriceUsd } from "../directory.js";
@@ -45,14 +45,31 @@ const PAYMENT_LOG_PATH = process.env.PAYMENT_LOG_PATH || "./x402-payments.jsonl"
 /** Per-host settled-amount baselines (lowercased hostname → last-N amounts). */
 const baselines = new Map<string, PriceBaseline>();
 
-let rehydrated = false;
+/** Bytes of PAYMENT_LOG_PATH already integrated into `baselines` — either by
+ * a rehydration read or by a recordSettledAmount call whose own ledger row
+ * (logPayment writes it right before that call — same #45 guard) the read
+ * itself integrated. Rehydration reads only bytes beyond this mark, so a
+ * fresh process rebuilds the whole history from the ledger (restart parity)
+ * while a running process NEVER re-counts the rows its own settlements
+ * flushed (the #53 body-shape matrix caught the once-flag variant
+ * double-counting a process's first settlement when nothing had read the
+ * ledger before the read happened). A replaced/rolled-over ledger (shorter
+ * than the mark) re-reads whole. */
+let integratedBytes = 0;
 
-function rehydrateFromLedger(window: number): void {
-  if (rehydrated) return;
-  rehydrated = true; // set before any I/O — never double-read, even if read throws
-  if (!existsSync(PAYMENT_LOG_PATH)) return;
+/** Integrate ledger rows beyond the mark into `baselines`. Returns the LAST
+ * row it integrated, or null when nothing new was read — recordSettledAmount
+ * uses it to recognise the row of its own settlement (flushed by logPayment
+ * immediately before the call) and skip re-adding it. */
+function rehydrateFromLedger(window: number): { url: string; amount: number } | null {
+  if (!existsSync(PAYMENT_LOG_PATH)) return null;
   try {
-    for (const line of readFileSync(PAYMENT_LOG_PATH, "utf-8").split("\n")) {
+    const buf = readFileSync(PAYMENT_LOG_PATH);
+    if (buf.length === integratedBytes) return null; // nothing new on disk
+    const start = integratedBytes <= buf.length ? integratedBytes : 0; // replaced ⇒ re-read whole
+    const text = buf.subarray(start).toString("utf-8"); // start is a line boundary
+    let last: { url: string; amount: number } | null = null;
+    for (const line of text.split("\n")) {
       try {
         const e = JSON.parse(line) as { status?: string; chain?: string; url?: string; amount_usdc?: number };
         if (e.status === "success" && e.chain !== "casper" && typeof e.url === "string") {
@@ -63,14 +80,27 @@ function rehydrateFromLedger(window: number): void {
           const host = hostnameOf(e.url);
           if (host !== null) {
             baselines.set(host, updateBaseline(baselines.get(host) ?? emptyBaseline(), amount, window));
+            last = { url: e.url, amount };
           }
         }
       } catch {
-        // Corrupted ledger lines are skipped — logging is best-effort, so is reading it back
+        // Corrupted ledger lines are skipped — logging is best-effort, so is
+        // reading it back; a mid-line slice at the rehydration boundary is
+        // skipped harmlessly (these bytes were already integrated).
       }
     }
+    // The read window closes at the BYTE level: every byte seen — including
+    // skipped/corrupted lines and the final (empty) split piece — is now
+    // integrated exactly once. Counting the newline bytes per piece instead
+    // mis-counted the terminator of the final split piece by one, pushing the
+    // mark past the file and making every next read start over at 0 — each
+    // read re-integrating the whole history again (observed as quadratic
+    // sample growth in the #57 fetch tests).
+    integratedBytes = buf.length;
+    return last;
   } catch (err) {
     console.error(`[x402] Failed to rehydrate price baselines from ledger: ${err}`);
+    return null;
   }
 }
 
@@ -127,8 +157,18 @@ export function recordSettledAmount(url: string, amountUsdc: number): void {
   const host = hostnameOf(url);
   if (host === null) return;
   const window = effectiveAnomaly().window;
-  rehydrateFromLedger(window);
-  baselines.set(host, updateBaseline(baselines.get(host) ?? emptyBaseline(), amountUsdc, window));
+  // Integrate rows newer than the mark first: a fresh process picks up its
+  // full here — INCLUDING the row of this very settlement (logPayment flushed
+  // it right before this call), whose (url, amount) match identifies it, so
+  // the in-memory add below is skipped for it and the baseline never
+  // double-counts.
+  const lastIntegrated = rehydrateFromLedger(window);
+  const justIntegratedOwnRow = lastIntegrated !== null
+    && lastIntegrated.url === url
+    && lastIntegrated.amount === amountUsdc;
+  if (!justIntegratedOwnRow) {
+    baselines.set(host, updateBaseline(baselines.get(host) ?? emptyBaseline(), amountUsdc, window));
+  }
 }
 
 /** The stored baseline for one host (case-insensitive) — rehydrating first.

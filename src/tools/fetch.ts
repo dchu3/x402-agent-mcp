@@ -17,6 +17,7 @@ import { getPolicyEngine, buildPolicyContext, livenessVerdictForUrl } from "../p
 import { getPerServiceSpent, recordServicePayment } from "../policy/budget-store.js";
 import { getAnomalyInputs, recordSettledAmount } from "../policy/anomaly-store.js";
 import { extractSettlementReceipt, RECEIPT_VERIFIED, RECEIPT_NOTE } from "./receipt-utils.js";
+import { usdFromAtomic, sellerReportedCostUsd, parseBoundedBody } from "./accounting.js";
 import { createFromOffer, intentManager } from "../payment-intent/manager.js";
 import { executeGuarded } from "../payment-intent/executor.js";
 import type { IntentRejectCode, PaymentIntent } from "../payment-intent/types.js";
@@ -446,6 +447,27 @@ export function registerFetchTool(server: McpServer): void {
           };
         }
 
+        // Issue #53: the USD value of the SIGNED candidate amount — derived
+        // from the intent's bound atomic amount with integer arithmetic and a
+        // single narrowing to `number` (usdFromAtomic), never from the probe
+        // estimate and never from the response. `amountUsdc` above remains the
+        // policy engine's estimate input; this is the money.
+        // Fail-closed: an unconvertible amount is treated as unpayable (the
+        // recorded amount then reads 0 with the raw atomic fields on the row
+        // for audit — never a made-up value); for an intent created by
+        // createFromOffer (validated digits + decimals) this is unreachable.
+        const signedAmountUsdc = intent !== null ? usdFromAtomic(intent.amountAtomic, intent.decimals) : undefined;
+        if (intent !== null && signedAmountUsdc === undefined) {
+          return intentRefusal(url, useChain, amountUsdc, [
+            { code: "INTENT_UNAUTHORISED", message: "the signed amount could not be converted to USD for spend accounting — refusing before signing (fail closed)" },
+            { code: "AMOUNT_UNBINDABLE", message: "atomic amount of the bound intent is not convertible even though the intent itself is valid" },
+          ]);
+        }
+
+        // Issue #53/#54: flips inside the enforcement hook right after the
+        // intent is consumed — the only point where a signature may exist.
+        let payloadSigned = false;
+
         // Step 4: Make the paid request — only through the guarded executor,
         // which validates/begins the intent and registers the enforcement (or
         // blocking) hook on the client before any payload can be signed.
@@ -455,6 +477,11 @@ export function registerFetchTool(server: McpServer): void {
           manager: intentManager,
           client,
           label: "x402_fetch",
+          // Issue #53/#54: the "was anything signed?" signal — fires inside
+          // the enforcement hook after the intent is consumed, the only point
+          // where a signature may exist. Never fires on an abort or through
+          // the blocking hook (nothing was signed in either case).
+          onPayloadSigned: () => { payloadSigned = true; },
           // Issue #34 (L9): signing-time liveness recheck. Re-derives the
           // verdict from the CACHED directory + config + the real clock — no
           // new network I/O — at payload creation, inside the enforcement
@@ -490,12 +517,7 @@ export function registerFetchTool(server: McpServer): void {
         const resp = guarded.result;
 
         const text = await resp.text();
-        let bodyResult: unknown;
-        try {
-          bodyResult = JSON.parse(text);
-        } catch {
-          bodyResult = text.substring(0, 5000);
-        }
+        const bodyResult = parseBoundedBody(text);
 
         const { receipt: paymentReceipt, txHash } = extractSettlementReceipt(resp.headers);
 
@@ -503,12 +525,36 @@ export function registerFetchTool(server: McpServer): void {
         // ledger rehydration filters by): only a 200 counts as spend.
         const isSuccessfulPayment = resp.status === 200;
 
-        // Extract actual cost from response body if available
-        let actualCost = amountUsdc;
-        if (bodyResult && typeof bodyResult === "object") {
-          const meta = (bodyResult as any).meta;
-          if (meta?.cost?.usd) actualCost = meta.cost.usd;
-        }
+        // Issue #53: the recorded amount comes from the SIGNED payment only —
+        // the intent amount via usdFromAtomic above — never from the seller's
+        // body and never from the probe estimate. The seller-reported cost is
+        // carried information-only below (bounded, type-checked, and
+        // structurally barred from every accounting/decision call).
+        //
+        // Accounting rule: payloadSigned === false means nothing was signed
+        // or sent — record 0 (a 200 from a free endpoint is not spend).
+        // A signed-but-never-sent payload still counts (over-count is the
+        // fail-closed direction). Counting signed-but-UNSERVED payments is
+        // issue #54 req 2 — deliberately NOT decided here.
+        const signedRecordedUsdc = payloadSigned ? (signedAmountUsdc ?? 0) : 0;
+        const recordedAmountUsdc = isSuccessfulPayment ? signedRecordedUsdc : 0; // the row's amount_usdc
+        // The price the flow attempted: the signed amount when a payload was
+        // signed, else the probe estimate (used for nothing but display and
+        // the #45 attempted_amount_usdc row field).
+        const attemptedAmountUsdc = payloadSigned ? (signedAmountUsdc ?? 0) : amountUsdc;
+        const sellerReportedCost = sellerReportedCostUsd(bodyResult);
+
+        // Exact audit trail of the SIGNED payment on settled rows (#53). An
+        // unsigned 200 (nothing signed — a free endpoint) must not dress up
+        // as a paid settlement, so the trail only prints when a payload was
+        // actually signed.
+        const intentTrail = payloadSigned && intent !== null
+          ? {
+              amount_atomic: intent.amountAtomic,
+              decimals: intent.decimals,
+              ...(intent.asset !== "" ? { asset: intent.asset } : {}),
+            }
+          : {};
 
         // Issue #45: a refused (non-200) paid fetch must still leave a
         // self-describing ledger row. The reason is in hand right here — the
@@ -529,7 +575,7 @@ export function registerFetchTool(server: McpServer): void {
           ? {}
           : {
               amount_usdc: 0,
-              attempted_amount_usdc: actualCost,
+              attempted_amount_usdc: attemptedAmountUsdc,
               http_status: resp.status,
               error:
                 typeof bodyResult === "object" && bodyResult !== null &&
@@ -543,7 +589,7 @@ export function registerFetchTool(server: McpServer): void {
           url,
           method,
           chain: useChain,
-          ...(isSuccessfulPayment ? { amount_usdc: actualCost } : failureRowFields),
+          ...(isSuccessfulPayment ? { amount_usdc: recordedAmountUsdc, ...intentTrail } : failureRowFields),
           tx_hash: txHash,
           status: isSuccessfulPayment ? "success" : "failed",
         });
@@ -558,14 +604,15 @@ export function registerFetchTool(server: McpServer): void {
         // the ledger drops it — per-service caps would silently loosen after
         // a restart (in-process vs post-restart spend divergence).
         if (isSuccessfulPayment) {
-          recordServicePayment(url, actualCost);
+          recordServicePayment(url, recordedAmountUsdc);
           // Issue #30: the settled amount feeds the per-service price baseline
           // (rule 4.6) — recorded ONLY on a successful settlement, next to
           // recordServicePayment under the SAME guard logPayment counts by, so
           // a denied or failed payment can never poison the baseline and the
           // ledger rehydrates identical values after a restart. Never logged on
-          // the failure path.
-          recordSettledAmount(url, actualCost);
+          // the failure path. Post-#53: the recorded amount is the SIGNED
+          // amount; an unsigned pass-through (a free 200) records 0.
+          recordSettledAmount(url, recordedAmountUsdc);
         }
 
         return {
@@ -576,7 +623,8 @@ export function registerFetchTool(server: McpServer): void {
               url,
               chain: useChain,
               paid: resp.status === 200,
-              cost_usdc: actualCost,
+              cost_usdc: recordedAmountUsdc,
+              ...(sellerReportedCost !== undefined ? { seller_reported_cost: sellerReportedCost } : {}),
               daily_spent_usdc: parseFloat(getDailySpent().toFixed(4)),
               payment_receipt: paymentReceipt,
               receipt_verified: RECEIPT_VERIFIED,
