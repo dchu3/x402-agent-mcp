@@ -1,8 +1,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { wrapFetchWithPayment, x402Client, type SelectPaymentRequirements, type PaymentRequirements } from "@x402/fetch";
-import { ExactSvmScheme, toClientSvmSigner, SOLANA_MAINNET_CAIP2, DEFAULT_ASSETS as SVM_DEFAULT_ASSETS } from "@x402/svm";
-import { ExactEvmScheme, toClientEvmSigner, DEFAULT_ASSETS as EVM_DEFAULT_ASSETS } from "@x402/evm";
+import { ExactSvmScheme, toClientSvmSigner, SOLANA_MAINNET_CAIP2 } from "@x402/svm";
+import { ExactEvmScheme, toClientEvmSigner } from "@x402/evm";
 import { createKeyPairSignerFromBytes } from "@solana/kit";
 import bs58 from "bs58";
 import { privateKeyToAccount } from "viem/accounts";
@@ -41,8 +41,12 @@ import { untrustedText, stripUntrusted, PROBE_UNTRUSTED_MAX, CHALLENGE_UNTRUSTED
 import { usdFromAtomic, sellerReportedCostUsd, parseBoundedBody } from "./accounting.js";
 import { createFromOffer, intentManager } from "../payment-intent/manager.js";
 import { executeGuarded } from "../payment-intent/executor.js";
-// Issue #61: deterministic offer selection — the payable offer is chosen by
-// integer atomic ranking over ALL accepts (never simply accepts[0]).
+// Issue #62: the per-network asset table — the offer's asset id resolves to a
+// real symbol + decimals + USD price (exact integer conversion via
+// usdFromAtomic); unlisted assets are refused with a stable code BEFORE any
+// pricing, binding or signing. Injected into selectOffer so the selector
+// stays pure (src/assets.ts is the single table; no fixed-6 float anywhere).
+import { priceAtomicAsUsd, resolveAsset } from "../assets.js";
 import { DEFAULT_CHAIN_ORDER, selectOffer, type OfferCandidate, type RejectedOffer } from "./offer-selection.js";
 // Issue #55: the challenge-scope boundary — the contract an offer/challenge
 // must satisfy before the intent binds it (config from env + call-site keys;
@@ -80,24 +84,6 @@ function scopeRefusalMessage(code: ScopeRefusalCode): string {
     case "MEMO_INVALID": return "the challenge's memo is not printable ASCII within the byte cap";
     case "BLOCK_HINT_INVALID": return "the challenge's block hint is malformed";
   }
-}
-
-/** The SDK's own default-asset universe across both default tables — the
- * same set the SDK's spend controls accept, so the selector's asset filter
- * matches the signing gate's behavior exactly (no new asset is introduced). */
-function sdkDefaultAssetIds(): string[] {
-  const ids = new Set<string>();
-  for (const table of [EVM_DEFAULT_ASSETS, SVM_DEFAULT_ASSETS]) {
-    for (const entries of Object.values(table as Record<string, unknown>)) {
-      if (!Array.isArray(entries)) continue;
-      for (const entry of entries) {
-        if (entry && typeof entry === "object" && typeof (entry as any).asset === "string" && (entry as any).asset !== "") {
-          ids.add((entry as { asset: string }).asset);
-        }
-      }
-    }
-  }
-  return [...ids];
 }
 
 function policyRefusal(
@@ -220,6 +206,12 @@ export function registerFetchTool(server: McpServer): void {
       // Step 1: Probe to detect chain from 402 response
       let useChain = (args.chain || "").toLowerCase();
       let probedAmountUsdc = 0; // captured from 402 response
+      // Issue #62: the asset table's resolution of the chosen offer — the real
+      // symbol (policy vocabulary) and decimals (exact USD conversion). Used
+      // ONLY when an asset was table-priced; the legacy fallback paths keep
+      // today's literals ('USDC' / 6) and estimate.
+      let probedSymbol: string | undefined;
+      let probedDecimals: number | undefined;
       let casperNetwork = process.env.CASPER_NETWORK || "";
       // Issue #25: the concrete probe offer, retained so the payment intent
       // can bind exactly what policy evaluated (the USD estimate alone is not
@@ -324,23 +316,37 @@ export function registerFetchTool(server: McpServer): void {
               payTo: firstAccept?.payTo,
             };
 
-            // Capture amount for spending limit check
-            if (firstAccept?.amount) {
+            // Issue #25+#62: the USD estimate for a LEGACY (asset-less) offer
+            // keeps the pre-#62 conversion exactly (Number(amount)/1e6) — the
+            // table cannot key on an offer that names no asset, and the
+            // policy gate's estimate context for those calls is unchanged.
+            // For offers that DO name an asset, this stays 0: the table
+            // prices the CHOSEN offer in the selection block below (and the
+            // asset boundary refuses anything it cannot price) — the money
+            // binding is never an estimate (the intent binds amountAtomic
+            // and the settlement is usdFromAtomic at the signed decimals).
+            // No fixed-6 float feeds a table-priced offer's gates.
+            if (firstAccept?.amount && (firstAccept?.asset ?? "") === "") {
               probedAmountUsdc = Number(firstAccept.amount) / 1e6;
             }
 
             // Issue #61: deterministic offer selection across ALL accepts.
             // The chosen offer is the cheapest payable one: a key on its
-            // chain, on the policy network/asset allowlists (the SAME config
-            // load the Step 3.5 gate reads — read-only; never widened), and
-            // the same policy gate, evaluated per candidate here. A forced
-            // chain constrains the selection to the caller's chain (the
-            // caller's chain is never replaced). Everything below reads the
-            // same single probe observation; nothing seller-visible widened.
-            // On NO_PAYABLE_OFFER the flow falls back to accepts[0] exactly
-            // as the pre-#61 flow did (the unpayable offers stay unpayable).
+            // chain, on the policy network allowlist (the SAME config load
+            // the Step 3.5 gate reads — read-only; never widened), priced
+            // through the per-network ASSET TABLE (issue #62: ranking by
+            // real-symbol/real-decimals USD — never the raw atomic string,
+            // never a fixed-6 float; unlisted offers are REPORTED refusals),
+            // and the same policy gate, evaluated per candidate here with
+            // the TABLE's symbol. A forced chain constrains the selection to
+            // the caller's chain (the caller's chain is never replaced).
+            // Everything below reads the same single probe observation;
+            // nothing seller-visible widened. On NO_PAYABLE_OFFER the flow
+            // falls back to accepts[0] exactly as the pre-#61 flow did (the
+            // unpayable offers stay unpayable).
             if (Array.isArray(accepts) && useChain !== CASPER_CHAIN) {
               const policyState = loadPolicyConfig();
+              const assetExtensions = policyState.config.assets.extensions;
               const selection = selectOffer({
                 accepts,
                 keysLoaded: { solana: !!solanaKey, evm: !!evmKey },
@@ -349,10 +355,22 @@ export function registerFetchTool(server: McpServer): void {
                   : policyState.configErrors.length > 0
                     ? []
                     : policyState.config.networks.allowed,
-                allowedAssets: sdkDefaultAssetIds(),
+                // Issue #62: the table decides, not the SDK's implicitly
+                // allowed default-asset universe (spend controls at Step 3
+                // enforce an OUTER bound now; the table is the source of
+                // truth).
+                usdOf: (assetId, networkCaip2, atomicAmount) => {
+                  const priced = priceAtomicAsUsd(networkCaip2, assetId, atomicAmount, assetExtensions);
+                  if (priced.ok === true) return priced;
+                  return priced.code === "ASSET_NOT_LISTED"
+                    ? { ok: false, code: "asset_not_listed" }
+                    : { ok: false, code: "asset_no_usd_rate" };
+                },
                 policyFor: (c) => {
+                  // Issue #62: the policy gate reads the TABLE's real symbol
+                  // (tokens.allowed means what the table says), priced USD.
                   const evaluation = getPolicyEngine().evaluate(
-                    buildPolicyContext(url, c.chain, "USDC", c.usd, { recipient: c.payTo }),
+                    buildPolicyContext(url, c.chain, c.symbol, c.usd, { recipient: c.payTo }),
                     { dailySpentUsd: getDailySpent(), perServiceSpentUsd: getPerServiceSpent(serviceHost) + reservedUsd(`service:${serviceHost}`) },
                     getAnomalyInputs(url),
                   );
@@ -463,10 +481,17 @@ export function registerFetchTool(server: McpServer): void {
                     decision: casperPolicy,
                     url,
                     chain: CASPER_CHAIN,
-                    token: "wCSPR",
+                    // Issue #62: the Casper entry resolves through the SAME
+                    // per-network asset table (the shipped wCSPR rows carry
+                    // the 9-decimal mote shape; operator extensions may
+                    // relabel them, their word wins). A drifted table keeps
+                    // the constants as the fallback so the intent remains
+                    // bindable — assertPayableCasperAccept still pins the
+                    // canonical wCSPR package hash above.
+                    token: resolveAsset(casperNetwork, casperAccept.asset)?.symbol ?? "wCSPR",
                     asset: casperAccept.asset,
                     amountAtomic: casperAmountMotes(casperAccept).toString(),
-                    decimals: 9,
+                    decimals: resolveAsset(casperNetwork, casperAccept.asset)?.decimals ?? 9,
                     recipient: casperAccept.payTo,
                     network: casperNetwork,
                     scheme: casperAccept.scheme,
@@ -548,6 +573,46 @@ export function registerFetchTool(server: McpServer): void {
 
       if (useChain === CASPER_CHAIN) {
         return fetchCasper(url, method, args.body, casperKey!, casperNetwork, casperIntent, casperBlockedCode);
+      }
+
+      // Issue #62: the ASSET-TABLE boundary. An offer's asset id must resolve
+      // through the per-network asset table (symbol + decimals + USD-peg or
+      // rate) BEFORE any client construction, challenge scope, intent binding
+      // or signing. There is no assumed unit and no assumed peg: an unlisted
+      // asset is refused with the STABLE code ASSET_NOT_LISTED; a listed
+      // asset the table prices nothing on the USD leg with ASSET_NO_USD_RATE.
+      // The operator's assets.extensions (config-validated, fail closed) are
+      // in scope here too. Legacy offers that never produced an asset (an
+      // unpayable/unbindable probe) keep today's behavior — nothing to
+      // resolve, nothing to refuse here.
+      if (probedOffer?.asset) {
+        const assetPricing = priceAtomicAsUsd(
+          probedOffer.network ?? "",
+          probedOffer.asset,
+          probedOffer.amount ?? "",
+          loadPolicyConfig().config.assets.extensions,
+        );
+        if (assetPricing.ok === false) {
+          const assetReason = assetPricing.code === "ASSET_NOT_LISTED"
+            ? `asset id <${stripUntrusted(probedOffer.asset ?? "", 64)}> is not listed for network <${stripUntrusted(probedOffer.network ?? "", 64)}> — refusing before any pricing, binding or signing; the asset table never assumes a unit or rate (operator extensions: policy config assets.extensions)`
+            : `asset <${stripUntrusted(probedOffer.asset ?? "", 64)}> is listed but priced nothing on the USD leg (no usdPeg and no positive usdRate) — spend caps need a USD value, so refusing (fail closed)`;
+          console.error(`[x402_fetch] asset-table refusal ${assetPricing.code} for ${stripUntrusted(probedOffer.asset ?? "", 64)}`);
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                error: `Payment refused at the asset boundary (${assetPricing.code})`,
+                url,
+                chain: useChain,
+                network: stripUntrusted(probedOffer.network ?? "", 64),
+                reasons: [{ code: assetPricing.code, message: assetReason }],
+              }),
+            }],
+          };
+        }
+        probedAmountUsdc = assetPricing.usd;
+        probedSymbol = assetPricing.symbol;
+        probedDecimals = assetPricing.decimals;
       }
 
       // USD estimate for policy evaluation (informational — the intent binds
@@ -636,7 +701,10 @@ export function registerFetchTool(server: McpServer): void {
         // advertised directory price — built OUTSIDE the engine so the pure
         // core never touches the ledger or the directory.
         const policyResult = getPolicyEngine().evaluate(
-          buildPolicyContext(url, useChain, "USDC", amountUsdc, { recipient: probedOffer?.payTo }),
+          // Issue #62: the token label is the ASSET TABLE's real symbol (the
+          // priced entry), never the legacy literal — tokens.allowed means
+          // what the table says.
+          buildPolicyContext(url, useChain, probedSymbol ?? "USDC", amountUsdc, { recipient: probedOffer?.payTo, ...(probedSymbol === undefined ? {} : { currency: probedSymbol }) }),
           // Issue #54 (req 1): outstanding reservations hold budget that is
           // not in the ledger yet — the per-service context must include this
           // host's holds or overlapping calls read a stale picture.
@@ -710,10 +778,14 @@ export function registerFetchTool(server: McpServer): void {
             decision: policyResult,
             url,
             chain: useChain,
-            token: "USDC",
+            // Issue #62: the intent binds the TABLE's resolved symbol and
+            // decimals for the chosen asset (never the legacy literals) — so
+            // matchRequirements compares against what was actually priced and
+            // the ledger row carries the signed asset's own shape.
+            token: probedSymbol ?? "USDC",
             asset: probedOffer.asset ?? "",
             amountAtomic: probedOffer.amount ?? "",
-            decimals: 6,
+            decimals: probedDecimals ?? 6,
             recipient: probedOffer.payTo ?? "",
             network: probedOffer.network ?? "",
             scheme: probedOffer.scheme ?? "",

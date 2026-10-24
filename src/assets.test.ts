@@ -253,13 +253,14 @@ it('config: assets.extensions[] entries validate fail-closed; a priced entry app
 it('selection: with a 9-decimal offer numerically cheaper as a raw atomic string, ranking picks the USD-cheaper offer', async () => {
   const sel = (await import('./tools/offer-selection.js')) as any;
   const payTo = bs58.encode(Buffer.alloc(32, 0x21));
-  // A: 9-decimal extension asset priced at $4.50 — its ATOMIC string
-  // (900000000) is numerically SMALLER than B's (1000000000), and a fixed-6
-  // float rank would also pick it (900 < 1000). Table-USD ranking must pick
-  // B ($1.00).
+  // A: 9-decimal extension asset priced at ≈$1500 (0.999999999 units ×
+  // usdRate 1500) — its ATOMIC string (999999999) is numerically SMALLER
+  // than B's (1000000000), and a fixed-6 float rank would also pick it
+  // (≈1000 < 1000). Table-USD ranking must pick B ($1000 vs ≈$1500).
+  const ext = [{ network: SOLANA_MAINNET_CAIP2, asset: NINE_DP_ASSET, symbol: 'WUSD9', decimals: 9, usdRate: 1500 }];
   const accepts = [
     {
-      scheme: 'exact', network: SOLANA_MAINNET_CAIP2, asset: NINE_DP_ASSET, amount: '900000000',
+      scheme: 'exact', network: SOLANA_MAINNET_CAIP2, asset: NINE_DP_ASSET, amount: '999999999',
       payTo, maxTimeoutSeconds: 60, extra: { name: 'WUSD9' },
     },
     {
@@ -268,7 +269,7 @@ it('selection: with a 9-decimal offer numerically cheaper as a raw atomic string
     },
   ];
   const usdOf = (asset: string, network: string, atomic: string) =>
-    ASSETS.priceAtomicAsUsd(network, asset, atomic, nineDpExtension as never);
+    ASSETS.priceAtomicAsUsd(network, asset, atomic, ext as never);
   const result = sel.selectOffer({
     accepts,
     keysLoaded: { solana: true, evm: true },
@@ -281,7 +282,7 @@ it('selection: with a 9-decimal offer numerically cheaper as a raw atomic string
   const chosen = (result as { ok: boolean; chosen?: { asset: string; usd: number } }).chosen;
   assert.ok(result.ok === true && chosen, 'a payable offer is selected');
   assert.equal(chosen!.asset, USDC_MAINNET_SOL, 'the USD-cheaper offer wins — ranking never runs on the raw atomic string or a fixed-6 float');
-  assert.equal(chosen!.usd, 1.0, 'the ranking input is the table-priced USD value');
+  assert.equal(chosen!.usd, 1000.0, 'the ranking input is the table-priced USD value');
 });
 
 // ---------------------------------------------------------------------------
@@ -367,7 +368,7 @@ function installMock(handlers: { rpc?: (body: string) => Response } = {}): void 
     if (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost') {
       return await realFetch(input as any, init as any);
     }
-    if (handlers.rpc && urlStr.startsWith(RPC_SIM_URL)) return handlers.rpc((JSON.stringify((init as any)?.body ?? '')) as string);
+    if (handlers.rpc && urlStr.startsWith(RPC_SIM_URL)) return handlers.rpc(((init as any)?.body ?? '') as string);
     throw new Error(`unexpected network touch in this test: ${urlStr}`);
   }) as unknown as typeof fetch;
 }

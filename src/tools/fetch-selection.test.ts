@@ -290,6 +290,11 @@ it('selector: the cheapest payable offer wins by integer atomic ranking', () => 
       payTo: BASE_PAYTO,
       scheme: 'exact',
       usd: 0.01,
+      // Issue #62: the candidate now carries the asset table's symbol and
+      // decimals — the legacy path (no pricer injected) keeps the pre-#62
+      // literals ('USDC' / 6) byte-identically.
+      symbol: 'USDC',
+      decimals: 6,
     },
   );
 });
