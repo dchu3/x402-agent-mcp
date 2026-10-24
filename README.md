@@ -397,6 +397,8 @@ npm run build
 
 ### 2. Configure
 
+> **Before your first paid call:** the default payment policy is permissive — any x402 endpoint is payable up to the global caps. Set `MAX_PAYMENT_PER_CALL` and `MAX_DAILY_SPEND` explicitly before going live, and make your first paid calls with a throwaway key on a chain you can afford. See [Spending Limits & Payment Logging](#spending-limits--payment-logging) for the knobs and their exact semantics.
+
 ```bash
 # .env
 SOLANA_PRIVATE_KEY=your-base58-solana-key
