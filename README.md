@@ -432,6 +432,34 @@ X402_EXTRA_HEADER_ALLOWLIST=x-client-id
 # X402_ALLOW_PRIVATE_HOSTS=127.0.0.1:8921,localhost:8922
 ```
 
+### Challenge signing scope and the paid leg's own bounds (issues #55 / #61 / #56)
+
+#### What a challenge may make these wallets sign (issue #55)
+
+A seller's 402 challenge is untrusted data that becomes a signature. Before anything is signed, the flow scopes the challenge and binds the result into the payment intent; the payment hook verifies the bound fields at signing. Every rule **refuses, never clamps or repairs**:
+
+- **`extensions`** — every extension key must be allowlisted in `X402_ALLOWED_EXTENSIONS` (default `bazaar`, the x402 discovery extension). *Compatibility note: the default allowlist is set to match the first-party sellers listed in the endpoint directory.* An allowed extension's key set is bound into the intent and compared exactly at signing; setting the variable **replaces** the default list.
+- **Validity window** — the challenge's `maxTimeoutSeconds` must be a positive number and at most `X402_MAX_CHALLENGE_TIMEOUT_SECONDS` (default **300 s**). Longer windows are refused (`VALIDITY_WINDOW_TOO_LONG`), never trimmed.
+- **`extra` fields** — only the SDK's known-safe signing fields (`name`, `version`, `feePayer`, `memo`, `lastValidBlockHeight`) plus anything operators explicitly allow via `X402_ALLOWED_EXTRA_KEYS` are ever in scope; unknown keys are refused, never forwarded to a signer.
+- **Fee payer rule** — a challenge whose `extra.feePayer` names **this agent's own address** would make the agent pay the seller's gas: refused by default. `X402_ALLOW_SELF_FEE_PAYER=1` opts in; `X402_FEE_PAYER_ALLOWLIST` pins the fee-payer addresses a challenge may name. The chosen fee payer is bound into the intent either way and compared exactly.
+- **`memo`** — printable ASCII only, capped at `X402_MAX_MEMO_BYTES` (default 64), bound into the intent.
+- **EIP-712 domain fields** (`name`, `version`) — bound for exact equality, so a seller cannot retarget the signed domain at signing time. **Block hints** (`lastValidBlockHeight`, `recentBlockhash`) are shape-checked only and never bound: they are volatile per block, and pinning them would refuse honest replays.
+
+Scope refusals (`EXTENSION_NOT_ALLOWED`, `VALIDITY_WINDOW_*`, `FEE_PAYER_REFUSED`, `MEMO_INVALID`, `BLOCK_HINT_INVALID`, `TRANSFER_METHOD_NOT_ALLOWED`) surface as fixed structured refusals with the field label — seller text goes to the local debug log only. Legacy challenge shapes (no `extra`, no `extensions`, no window) are unaffected and skip the new checks byte-for-byte.
+
+#### One unpaid request, one offer, one paid request (issue #61)
+
+The flow removes both places the SDK could previously drift from what the agent authorised:
+
+- **The agent selects the offer, not the SDK.** `x402_fetch` parses **all** offers of a challenge, ranks them cheap-first in integer atomic units, breaks ties by the configured chain order and seller order, and refuses unpayable candidates with fixed tokens (`no_key`, `network_not_allowed`, `asset_not_allowed`, `policy_refused` — surfaced in `offer_refusals`). The chosen offer rides the output as `selected_offer` `{chain, network, amount_atomic, amount_usdc}`, and the SDK's payment-requirements selector is bound to that exact offer: if the SDK's own filters ever drop it, the whole payment is refused (fail closed) — the SDK cannot pay anything but the agent's selection. When nothing qualifies, the tool refuses with `NO_PAYABLE_OFFER`.
+- **The probe's response is replayed as the SDK's request.** The free probe's bytes are reused for the SDK's first (unpaid) request, so a charging endpoint sees **exactly two** requests: the unpaid probe and the signed paid leg. A seller can no longer serve a different requirement to a mid-flow unpaid request than it served to the agent, and there is no extra unmonitored network leg.
+- Signed-but-unexecuted states keep the same guarantees: the pre-signature gate still validates the bound intent exactly (`INTENT_OFFER_MISMATCH:<field>` / `INTENT_EXPIRED`), and the signature itself can only ever carry the probe's offer.
+
+#### The paid leg's own bounds (issue #56)
+
+- The paid response body is **read bounded (1 MiB)**. A seller streaming a huge body cannot dictate the agent's memory: over the cap the attempt ends with an honest zero-spend failed ledger row naming the cap (`Payment response exceeds size limit`), and no retry happens against a seller that just did that.
+- The paid request carries **`X402_PAID_TIMEOUT_MS` (default 30 000 ms)** — the same bound the probe already had. A seller that never answers produces the fixed `PAID_TIMEOUT` structured refusal (never a hang, never a raw `AbortError`), with a zero-spend failed ledger row.
+
 ## Quick Start
 
 ### 1. Install
