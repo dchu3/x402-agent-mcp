@@ -1,0 +1,62 @@
+# CI for x402-agent-mcp (issue #57).
+# - Matrix on Node 20 + 22 (engines floor is node >=20).
+# - Deps installed with --ignore-scripts: no lifecycle script is needed to
+#   build/test this stdio MCP server, so install-time code never runs in CI.
+# - Third-party actions are pinned by commit SHA (tag noted in a comment).
+# - The audit gate runs at `critical`: the current production tree passes it;
+#   remaining advisories (zod <4.6.6, nested inside @x402/core where we do not
+#   override) are documented in the README Development section.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: build + test (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22]
+    steps:
+      - name: Check out
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Set up Node
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - name: Install dependencies (lifecycle scripts disabled)
+        run: npm ci --ignore-scripts
+      - name: Build
+        run: npm run build
+      - name: Test (Node-20-safe runner)
+        run: npm test
+      - name: Validate policy example against the real config loader
+        run: node scripts/validate-policy-example.mjs
+      - name: Audit production dependencies (fail on new critical)
+        run: npm audit --omit=dev --audit-level=critical
+
+  secret-scan:
+    name: secret scan (never sources .env)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out (full history, so the base ref exists)
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+      - name: Scan the PR / push range with the pre-push gate
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          BASE="${BASE:-origin/master}"
+          bash scripts/pre-push-security-scan.sh "$BASE" HEAD

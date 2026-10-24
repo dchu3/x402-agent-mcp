@@ -7,15 +7,18 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "test": "node -e \"require('fs').rmSync('dist-test',{recursive:true,force:true})\" && tsc -p tsconfig.test.json && node --test \"dist-test/**/*.test.js\""
+    "test": "node -e \"require('fs').rmSync('dist-test',{recursive:true,force:true})\" && tsc -p tsconfig.test.json && node scripts/run-tests.mjs"
+  },
+  "engines": {
+    "node": ">=20",
+    "npm": ">=9"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.1",
-    "@x402/fetch": "^2.26.0",
-    "@x402/svm": "^2.26.0",
-    "@x402/evm": "^2.26.0",
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "@x402/fetch": "2.26.0",
+    "@x402/svm": "2.26.0",
+    "@x402/evm": "2.26.0",
     "@make-software/casper-x402": "1.0.0",
-    "@solana/web3.js": "^1.95.0",
     "@solana/kit": "^5.5.1",
     "casper-js-sdk": "5.0.12",
     "bs58": "^4.0.1",

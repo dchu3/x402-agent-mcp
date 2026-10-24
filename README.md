@@ -586,6 +586,69 @@ import { registerCrawlX402ScanTool } from "./tools/crawl-directory.js";
 // Or call the MCP via stdio — see usage examples above
 ```
 
+## Development
+
+Prerequisites: Node ≥ 20 (declared in `engines`) and npm ≥ 9.
+
+```bash
+git clone https://github.com/dchu3/x402-agent-mcp.git
+cd x402-agent-mcp
+npm install
+npm run build
+npm test
+```
+
+### Test suite
+
+`npm test` compiles `src/**` to `dist-test/` and runs the suite with
+`scripts/run-tests.mjs`, which lists the `*.test.js` files explicitly. The
+direct `node --test "dist-test/**/*.test.js"` (glob) form only expands from
+Node ≥ 21, so on Node 20 it matches no files — the explicit list runs
+identically on Node 20 and newer.
+
+### CI
+
+`.github/workflows/ci.yml` builds and tests on Node 20 and 22, installs with
+`npm ci --ignore-scripts` (no install-time lifecycle script is needed by the
+suite, so install scripts never run in CI), validates the policy example, and
+gates the production dependency tree with `npm audit --omit=dev
+--audit-level=critical`. The current tree passes the gate; the remaining
+findings are `high`-severity `zod < 4.6.6` advisories on the nested `zod@3.x`
+copies owned by `@x402/core` / `@x402/evm`'s own dependency ranges. Fixing
+those needs an `overrides` entry for `@x402/core` (bumping the Casper
+leg's `@x402/core` from 2.15.0), which is a payment-transport change tracked
+separately — see the issue #57 follow-up. Every `pull_request` and push to
+`master` also runs the secret scan below over the full PR range.
+
+### Pre-push security scan
+
+`scripts/pre-push-security-scan.sh <base-ref> [<head-ref>]` blocks a push when
+the diff introduces secret-shaped material (raw key material, GitHub/AWS token
+shapes, PEM blocks, secret-shaped assignments, absolute home-dir paths,
+`.env`-like files). The scan never reads or executes `.env` or any repo file —
+operator-specific patterns arrive only as data:
+
+```bash
+# wallet patterns that must never appear in a pushed diff — one per line,
+# in a file OUTSIDE the repository (placeholder shown)
+X402_SCAN_WALLET_PATTERNS_FILE=/path/outside/repo/wallet-patterns.txt
+# …or whitespace-separated in the environment (placeholders shown)
+X402_KNOWN_WALLETS="<wallet-address-one> <wallet-address-two>"
+```
+
+The same values can be passed as arguments: `--patterns-file <path>` and a
+repeatable `--known-wallet <pattern>`. Blocked real-name regexes come from
+`$BLOCKED_NAME_PATTERNS` (environment only; the scan fails closed to an inert
+placeholder when unset).
+
+Install as a pre-push hook:
+
+```bash
+printf '#!/bin/sh\nbash scripts/pre-push-security-scan.sh origin/master HEAD\n' \
+  > .git/hooks/pre-push
+chmod +x .git/hooks/pre-push
+```
+
 ## Roadmap
 
 Explicitly deferred — tracked here so the boundary is visible, not forgotten:
