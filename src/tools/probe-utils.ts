@@ -1,5 +1,11 @@
 import { CASPER_CHAIN, isCasperNetwork } from "../casper/networks.js";
 import { aliasForCaip2 } from "../evm/networks.js";
+// Issue #58: every fetch site in this shared probe surface goes through the
+// one transport guard — private/loopback/link-local hosts are refused before
+// any request and redirects are refused (REDIRECT_REFUSED), never followed.
+// x402_crawl_directory and x402_probe_allowlist probe through these helpers,
+// so the guard covers them without a second fetch path.
+import { guardedFetch, isTransportRefusal } from "../transport/guard.js";
 
 /** Fetch a URL and return its parsed JSON body, or null on any failure
  * (network error, non-2xx, or body that is not valid JSON — e.g. an HTML
@@ -8,7 +14,7 @@ export async function fetchJson(url: string, timeoutMs: number = 10000): Promise
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
-    const resp = await fetch(url, {
+    const resp = await guardedFetch(url, {
       signal: controller.signal,
       headers: { Accept: "application/json" },
     });
@@ -67,7 +73,7 @@ export async function fetchRootPaymentChallenge(url: string, timeoutMs: number =
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
-    const resp = await fetch(url, { signal: controller.signal });
+    const resp = await guardedFetch(url, { signal: controller.signal });
     clearTimeout(timeout);
     return decodePaymentRequiredHeader(resp.headers.get("payment-required"));
   } catch {
@@ -96,9 +102,10 @@ export interface LivenessProbeResult {
  *   - any other answered response, or a 402 whose header does not decode ⇒
  *     no_402
  *   - a thrown/aborted request (timeout, network failure) ⇒ error (never live)
- * Redirects are never followed (redirect: "error"), only the response header
- * is read, and nothing is ever paid or authenticated — one shared HTTP stack
- * (this module), no second client. */
+ * Redirects are never followed (redirect: "manual" — a 3xx is refused
+ * REDIRECT_REFUSED by the transport guard, issue #58), only the response
+ * header is read, and nothing is ever paid or authenticated — one shared HTTP
+ * stack (this module), no second client. */
 export async function probePaymentChallenge(url: string, timeoutMs: number = 10000): Promise<LivenessProbeResult> {
   const started = Date.now();
   try {
@@ -106,7 +113,7 @@ export async function probePaymentChallenge(url: string, timeoutMs: number = 100
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
     let resp: Response;
     try {
-      resp = await fetch(url, { signal: controller.signal, redirect: "error" });
+      resp = await guardedFetch(url, { signal: controller.signal });
     } finally {
       clearTimeout(timeout);
     }
@@ -119,6 +126,12 @@ export async function probePaymentChallenge(url: string, timeoutMs: number = 100
     }
     return { kind: "live_402", challenge, latency_ms: Date.now() - started };
   } catch (err: any) {
+    // Issue #58: a transport guard refusal reports as a stable error outcome
+    // ("PRIVATE_HOST_REFUSED: …" / "REDIRECT_REFUSED: …") — never live, never
+    // followed. The refusal detail already carries the stable code.
+    if (isTransportRefusal(err)) {
+      return { kind: "error", latency_ms: Date.now() - started, error: err.message };
+    }
     return { kind: "error", latency_ms: Date.now() - started, error: String(err?.message ?? err).slice(0, 200) };
   }
 }

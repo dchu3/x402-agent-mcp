@@ -20,6 +20,12 @@ import { getPerServiceSpent, recordServicePayment } from "../policy/budget-store
 import { releaseReservation, reserveSpend, reservedUsd, settleReservation } from "../reservations.js";
 import { getAnomalyInputs, recordSettledAmount } from "../policy/anomaly-store.js";
 import { extractSettlementReceipt, RECEIPT_VERIFIED, RECEIPT_NOTE } from "./receipt-utils.js";
+// Issue #58 (req 1/4/5): every fetch this tool makes goes through the one
+// shared transport guard — the 402 probe, the SDK's first request and the
+// signed paid leg all ride guardedFetch (via wrapFetchWithPayment), which
+// refuses private/loopback/link-local/unspecified hosts and redirects BEFORE
+// any request (and therefore before any payment attempt).
+import { guardedFetch, isTransportRefusal } from "../transport/guard.js";
 import { usdFromAtomic, sellerReportedCostUsd, parseBoundedBody } from "./accounting.js";
 import { createFromOffer, intentManager } from "../payment-intent/manager.js";
 import { executeGuarded } from "../payment-intent/executor.js";
@@ -155,10 +161,12 @@ export function registerFetchTool(server: McpServer): void {
 
       if (!useChain || useChain === CASPER_CHAIN || forcedChain) {
         try {
-          const probeResp = await fetch(url, {
+          // Issue #58: the probe is a guardedFetch — SSRF guard first, and a 3xx
+          // is refused (REDIRECT_REFUSED) instead of followed or surfaced as an
+          // indistinct TypeError.
+          const probeResp = await guardedFetch(url, {
             method,
             signal: AbortSignal.timeout(30000),
-            redirect: "error",
             headers: args.body ? { "Content-Type": "application/json" } : {},
             body: args.body || undefined,
           });
@@ -288,6 +296,18 @@ export function registerFetchTool(server: McpServer): void {
             }
           }
         } catch (err: any) {
+          // Issue #58 (req 4/5): a transport guard refusal is returned as a
+          // stable structured refusal BEFORE any payment attempt — including
+          // on a forced-chain call, where an SSRF refusal is not a "probe
+          // failure" the pre-#25 pass-through would ignore.
+          if (isTransportRefusal(err)) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: JSON.stringify({ error: err.code, detail: err.detail }),
+              }],
+            };
+          }
           // A forced USD-chain probe failure must not refuse a request the
           // pre-#25 forced flow never probed: no offer is bound, and any
           // actual charge below still aborts at the signing boundary (the
@@ -537,11 +557,17 @@ export function registerFetchTool(server: McpServer): void {
               return { ok: verdict.ok, reason: verdict.reason };
             },
             run: async () => {
-              const paidFetch = wrapFetchWithPayment(fetch, client);
+              // Issue #58: the SDK's own first request AND the signed paid leg
+              // both go through guardedFetch (wrapFetchWithPayment calls its
+              // wrapped fetch for every request it makes). redirect:"manual"
+              // rides in the init so the SDK-built Requests carry it and the
+              // guard passes them through verbatim; redirects are refused.
+              const paidFetch = wrapFetchWithPayment(guardedFetch, client);
               return paidFetch(url, {
                 method,
                 headers: args.body ? { "Content-Type": "application/json" } : {},
                 body: args.body || undefined,
+                redirect: "manual",
               });
             },
           });
@@ -698,6 +724,19 @@ export function registerFetchTool(server: McpServer): void {
           status: "failed",
           error: err.message,
         });
+
+        // Issue #58: a transport guard refusal (private host / redirect /
+        // scheme) is a stable structured refusal — never folded into the
+        // generic payment-failure text. The guard refuses BEFORE any request,
+        // so nothing was paid.
+        if (isTransportRefusal(err)) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({ error: err.code, detail: err.detail }),
+            }],
+          };
+        }
 
         // Issue #25: an intent-boundary abort means signing was refused before
         // any payload existed — surface the structured refusal, never the raw

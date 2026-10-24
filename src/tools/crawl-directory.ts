@@ -1,7 +1,12 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { addToDirectory } from "../directory.js";
+import { guardedFetch } from "../transport/guard.js";
 import { fetchJson, findPaymentChallenge, isX402Manifest, chainsFromManifest } from "./probe-utils.js";
+// Issue #58: the scraper's own fetch goes through the one shared transport
+// guard, and every host probed below is probed through the guarded shared
+// probe utils — so a third-party page can neither redirect the crawler nor
+// make it probe private/scraped-redirect targets.
 
 interface CrawledService {
   url: string;
@@ -134,7 +139,11 @@ async function fetchListingHtml(pageUrl: string): Promise<string> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 15000);
   try {
-    const resp = await fetch(pageUrl, { signal: controller.signal });
+    // Issue #58: guardedFetch — SSRF guard first; a 3xx is refused
+    // (REDIRECT_REFUSED) instead of followed (the pre-#58 crawler followed
+    // redirects by default). A guard refusal surfaces as a TransportRefusal
+    // and is caught by the source loop — it names the stable code.
+    const resp = await guardedFetch(pageUrl, { signal: controller.signal });
     // fetch resolves on ANY status. A 404/redirect-to-error page returns HTML
     // with no service URLs — fail loudly with the HTTP status instead of
     // silently scraping an error page.

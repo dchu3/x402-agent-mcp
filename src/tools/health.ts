@@ -1,6 +1,11 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { loadDirectory } from "../directory.js";
+// Issue #58: both health fetches go through the one shared transport guard —
+// private/loopback/link-local hosts are refused before any request, and a 3xx
+// is refused (REDIRECT_REFUSED) instead of followed (health used default
+// redirect handling and followed redirects before this change).
+import { guardedFetch, isTransportRefusal } from "../transport/guard.js";
 
 export function registerHealthCheckTool(server: McpServer): void {
   server.tool(
@@ -45,7 +50,7 @@ export function registerHealthCheckTool(server: McpServer): void {
         const startedAt = Date.now();
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 10000);
-        const resp = await fetch(targetUrl, { signal: controller.signal });
+        const resp = await guardedFetch(targetUrl, { signal: controller.signal });
         clearTimeout(timeout);
 
         let x402Enabled = resp.status === 402;
@@ -62,7 +67,7 @@ export function registerHealthCheckTool(server: McpServer): void {
             const wellKnownUrl = new URL("/.well-known/x402", targetUrl).toString();
             const wkController = new AbortController();
             const wkTimeout = setTimeout(() => wkController.abort(), 10000);
-            const wkResp = await fetch(wellKnownUrl, { signal: wkController.signal });
+            const wkResp = await guardedFetch(wellKnownUrl, { signal: wkController.signal });
             clearTimeout(wkTimeout);
             if (wkResp.ok) {
               const body: any = await wkResp.json().catch(() => null);
@@ -98,6 +103,16 @@ export function registerHealthCheckTool(server: McpServer): void {
           }],
         };
       } catch (err: any) {
+        // Issue #58: a transport guard refusal is the stable structured
+        // refusal — refused BEFORE any request was sent.
+        if (isTransportRefusal(err)) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({ error: err.code, detail: err.detail }),
+            }],
+          };
+        }
         return {
           content: [{
             type: "text" as const,
