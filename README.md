@@ -502,14 +502,10 @@ x402_health({ url: "https://svm402.com" })
 ### Fetch an x402 endpoint
 
 ```
-x402_fetch({
-  url: "https://svm402.com/check",
-  method: "POST",
-  body: '{"mint": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"}'
-})
+x402_fetch({ url: "https://svm402.com/v1/ping" })
 ```
 
-svm402's retired routes (`/analyze`, `/safety/{address}`, `/price/{address}`, `/organic/{address}`, `/wash-delta/{address}`, `/wash-trading/{address}`) answer 410 since the issue-217 cut-over; `POST /check` is the one paid verdict ($0.03, schema `svm402.check.v1`) and `GET /demo/check` is the free preview.
+Paid routes and prices rotate; the seller's `GET /.well-known/x402` manifest is the current machine-readable list of live routes and prices — confirm the route there first, then point `x402_fetch` at a path you just learned from that manifest rather than one copied from older docs:
 
 ```
 x402_fetch({
