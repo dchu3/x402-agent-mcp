@@ -496,9 +496,21 @@ export function registerFetchTool(server: McpServer): void {
                 policyFor: (c) => {
                   // Issue #62: the policy gate reads the TABLE's real symbol
                   // (tokens.allowed means what the table says), priced USD.
+                  // Issue #59 (D7): each CANDIDATE is evaluated against its
+                  // OWN spend bucket — a devnet candidate reads the devnet
+                  // daily total and its devnet-prefixed reservations, every
+                  // other candidate the mainnet totals — the same bucket rule
+                  // Step 3.5 enforces for the chosen offer below, so the
+                  // selection verdict and the Step 3.5 verdict agree for the
+                  // same offer (getDailySpent(undefined) reads the mainnet
+                  // whole-map total, which excludes the devnet bucket).
+                  const candidateBucket = spendBucketForNetwork(c.network);
+                  const candidateServiceScope = candidateBucket
+                    ? `net:${candidateBucket}:service:${serviceHost}`
+                    : `service:${serviceHost}`;
                   const evaluation = getPolicyEngine().evaluate(
                     buildPolicyContext(url, c.chain, c.symbol, c.usd, { recipient: c.payTo }),
-                    { dailySpentUsd: getDailySpent(), perServiceSpentUsd: getPerServiceSpent(serviceHost) + reservedUsd(`service:${serviceHost}`) },
+                    { dailySpentUsd: getDailySpent(spendBucketForNetwork(c.network)), perServiceSpentUsd: getPerServiceSpent(serviceHost) + reservedUsd(candidateServiceScope) },
                     getAnomalyInputs(url),
                   );
                   return evaluation.decision === "ALLOW" ? "ALLOW" : "REFUSE";
@@ -935,10 +947,13 @@ export function registerFetchTool(server: McpServer): void {
           // Issue #54 (req 1): outstanding reservations hold budget that is
           // not in the ledger yet — the per-service context must include this
           // host's holds or overlapping calls read a stale picture.
-          // Issue #59 (D7): the bucket scoping — a devnet leg reads the
-          // DEVNET daily bucket and its devnet-prefixed service scope, never
-          // the mainnet totals.
-          { dailySpentUsd: getDailySpent(), perServiceSpentUsd: getPerServiceSpent(serviceHost) + reservedUsd(serviceScope) },
+          // Issue #59 (D7): the bucket scoping — the gate's daily total is
+          // `dailySpentOfBucket` (computed above): the DEVNET bucket's own
+          // total (getDailySpent(spendBucket)) for a devnet leg, the mainnet
+          // whole-map total (which NEVER includes the devnet bucket) for
+          // every other leg — the per-service context's holds stay scoped to
+          // the devnet-prefixed service scope exactly as computed above.
+          { dailySpentUsd: dailySpentOfBucket, perServiceSpentUsd: getPerServiceSpent(serviceHost) + reservedUsd(serviceScope) },
           getAnomalyInputs(url),
         );
         if (policyResult.decision !== "ALLOW") {
