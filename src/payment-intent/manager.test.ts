@@ -374,7 +374,7 @@ it('binding: extension keys are sorted at creation so the paramsHash is order-in
 it('deterministic hashing: same scope ⇒ same paramsHash; any scope change ⇒ different hash', () => {
   const bound = created(offer({ ...SOLANA_INTENT_PATCH, ...SCOPE_ARGS }));
   assert.equal(created(offer({ ...SOLANA_INTENT_PATCH, ...SCOPE_ARGS })).paramsHash, bound.paramsHash);
-  const variants: Array<Array<Record<string, unknown>>> = [
+  const variants: Array<Record<string, unknown>> = [
     { extensionKeys: ['bazaar', 'zeta', 'third'] },
     { extensionKeys: ['bazaar'] },
     { evmDomainName: 'Tampered' },
@@ -383,7 +383,7 @@ it('deterministic hashing: same scope ⇒ same paramsHash; any scope change ⇒ 
     { memo: 'receipt-y' },
     { maxTimeoutSeconds: 61 },
   ];
-  for (const [patch] of variants) {
+  for (const patch of variants) {
     const other = created(offer({ ...SOLANA_INTENT_PATCH, ...SCOPE_ARGS, ...patch }));
     assert.notEqual(other.paramsHash, bound.paramsHash, `a ${Object.keys(patch)[0]} change must change the hash`);
   }
@@ -428,22 +428,32 @@ it('shape: wrong-typed scope fields fail closed as MALFORMED (never tolerated, n
 
 it('comparator: the paid challenge must carry the bound scope — validity, extension key set, domain, fee payer, memo', () => {
   const intent = created(offer({ ...SOLANA_INTENT_PATCH, ...SCOPE_ARGS }));
-  const good = req({
+  const goodExtra = { name: 'USDC', version: '2', feePayer: 'FakeFeePayerAccount', memo: 'receipt-x' };
+  const goodBase = {
     network: SOLANA_INTENT_PATCH.network,
     asset: SOLANA_INTENT_PATCH.asset,
     maxTimeoutSeconds: 60,
-    extra: { name: 'USDC', version: '2', feePayer: 'FakeFeePayerAccount', memo: 'receipt-x' },
-  });
+    extra: goodExtra,
+  };
+  const good = req(goodBase);
   const challenge = { extensions: { bazaar: {}, zeta: {} } };
   assert.deepEqual(matchesRequirements(intent, good, challenge.extensions), { match: true });
-  const cases: Array<[unknown, string]> = [
-    [req({ maxTimeoutSeconds: 61, extra: good.extra }), 'validity'],
-    [req({ extra: { another: 'field', ...good.extra } }), 'evmDomain'],
-    [req({ extra: { name: 'Tampered', version: '2', feePayer: 'FakeFeePayerAccount', memo: 'receipt-x' } }), 'evmDomain'],
-    [req({ extra: { name: 'USDC', version: '3', feePayer: 'FakeFeePayerAccount', memo: 'receipt-x' } }), 'evmDomain'],
-    [req({ maxTimeoutSeconds: 60, extra: undefined }), 'evmDomain'],
-    [req({ extra: { name: 'USDC', version: '2', feePayer: 'FakeOtherAccount', memo: 'receipt-x' } }), 'feePayer'],
-    [req({ extra: { name: 'USDC', version: '2', feePayer: 'FakeFeePayerAccount', memo: 'other' } }), 'memo'],
+  // Keys the comparator does not bind (the scope boundary's business at
+  // binding time) do not break an otherwise exact match.
+  assert.deepEqual(
+    matchesRequirements(intent, req({ ...goodBase, extra: { another: 'field', ...goodExtra } }), challenge.extensions),
+    { match: true },
+  );
+  const cases: Array<[Record<string, unknown>, string]> = [
+    [req({ ...goodBase, maxTimeoutSeconds: 61 }), 'validity'],
+    [req({ network: goodBase.network, asset: goodBase.asset, extra: goodExtra }), 'validity'],
+    [req({ ...goodBase, extra: { version: '2', feePayer: 'FakeFeePayerAccount', memo: 'receipt-x' } }), 'evmDomain'],
+    [req({ ...goodBase, extra: { ...goodExtra, name: 'Tampered' } }), 'evmDomain'],
+    [req({ ...goodBase, extra: { ...goodExtra, version: '3' } }), 'evmDomain'],
+    [req({ ...goodBase, extra: { name: 'USDC', feePayer: 'FakeFeePayerAccount', memo: 'receipt-x' } }), 'evmDomain'],
+    [req({ network: goodBase.network, asset: goodBase.asset, maxTimeoutSeconds: 60 }), 'evmDomain'],
+    [req({ ...goodBase, extra: { ...goodExtra, feePayer: 'FakeOtherAccount' } }), 'feePayer'],
+    [req({ ...goodBase, extra: { ...goodExtra, memo: 'other' } }), 'memo'],
   ];
   for (const [badRequirements, field] of cases) {
     const m = matchesRequirements(intent, badRequirements, challenge.extensions);
