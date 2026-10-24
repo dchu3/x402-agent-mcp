@@ -12,8 +12,8 @@ import { registerCheckPaymentTool } from "./tools/check-payment.js";
 import { registerProbeAllowlistTool } from "./tools/probe-allowlist.js";
 // Issue #59 (req 8 — C9 visibility): the run's EXPLICIT network mode + the
 // mode's Solana RPC host render at startup (the RPC HOST only — never a full
-// URL, one could carry credentials).
-import { resolveNetworkMode, solanaRpcUrlForMode } from "./networks.js";
+// URL, one can carry credentials; a non-URL value must never crash startup).
+import { resolveNetworkMode, solanaRpcHostForMode } from "./networks.js";
 import { assetTableSummary } from "./assets.js";
 import { VERSION } from "./version.js";
 
@@ -42,7 +42,7 @@ registerFetchTool(server);
 const networkModeState = resolveNetworkMode();
 const networkModeForLog = networkModeState.mode ?? "(unset)";
 const solanaRpcHost = networkModeState.mode
-  ? new URL(solanaRpcUrlForMode(networkModeState.mode)).hostname
+  ? solanaRpcHostForMode(networkModeState.mode)
   : "";
 const assetTable = assetTableSummary();
 console.error(

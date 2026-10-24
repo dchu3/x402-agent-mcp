@@ -118,6 +118,19 @@ export function solanaRpcUrlForMode(mode: NetworkMode, env: NodeJS.ProcessEnv = 
   return env.SOLANA_RPC_URL || SOLANA_MAINNET_RPC_FALLBACK;
 }
 
+/** Issue #59 (req 8): the startup log's RPC-HOST label. The hostname of the
+ * mode's Solana RPC — host ONLY, never the full URL (an RPC URL may carry
+ * credentials in its userinfo). A non-URL operator value must never take the
+ * server down at module load: any parse failure renders the FIXED
+ * "(unparseable)" marker and never echoes the value back. */
+export function solanaRpcHostForMode(mode: NetworkMode, env: NodeJS.ProcessEnv = process.env): string {
+  try {
+    return new URL(solanaRpcUrlForMode(mode, env)).hostname;
+  } catch {
+    return "(unparseable)";
+  }
+}
+
 /** Issue #59 (req 3) + plan D6: the Casper leg must agree with the mode.
  * - An explicit mode resolves the env's Casper network (the 'casper'/'casper-test'
  *   names or the exact CAIP-2 ids) and REFUSES a disagreement;

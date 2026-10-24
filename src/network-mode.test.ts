@@ -285,6 +285,29 @@ it('mode gate: a key loaded + X402_NETWORK_MODE unset refuses before probing; a 
   assert.equal(freeParsed.error, undefined, 'a free tool works with the mode unset (immunity)');
 });
 
+// Issue #59 (req 8) + the unparseable-RPC guard: the startup log's RPC label
+// is the HOST ONLY, and a non-URL operator value renders the fixed
+// "(unparseable)" marker instead of throwing at module load (never echoing
+// the value, never any credential material).
+it('startup RPC-host label: host only (credentials stripped); a non-URL value renders the fixed (unparseable) marker, never a throw', () => {
+  // A credential-carrying RPC URL renders the host ONLY — never the userinfo.
+  assert.equal(NET.solanaRpcHostForMode('mainnet', { SOLANA_RPC_URL: 'https://operator:sekret@rpc-cred.example.com:8899/' } as unknown as NodeJS.ProcessEnv), 'rpc-cred.example.com');
+  const label = NET.solanaRpcHostForMode('mainnet', { SOLANA_RPC_URL: 'https://operator:sekret@rpc-cred.example.com:8899/' } as unknown as NodeJS.ProcessEnv);
+  assert.ok(!label.includes('operator') && !label.includes('sekret'), 'the label must not echo credential material');
+
+  // The documented default RPCs parse (the log renders them as hosts).
+  assert.equal(NET.solanaRpcHostForMode('mainnet', {} as unknown as NodeJS.ProcessEnv), 'api.mainnet-beta.solana.com');
+  assert.equal(NET.solanaRpcHostForMode('devnet', {} as unknown as NodeJS.ProcessEnv), 'api.devnet.solana.com', 'the devnet fallback (the SDK\'s public devnet RPC) parses');
+
+  // A non-URL operator value NEVER takes the server down at module load and
+  // NEVER echoes the value back: only the fixed marker leaves.
+  for (const garbage of ['not a url at all', 'http://', 'https://[bad', '\u0000weird']) {
+    const rendered = NET.solanaRpcHostForMode('devnet', { SOLANA_DEVNET_RPC_URL: garbage } as unknown as NodeJS.ProcessEnv);
+    assert.equal(rendered, '(unparseable)', `a non-URL ${JSON.stringify(garbage)} renders the fixed marker (got: ${rendered})`);
+    assert.ok(!rendered.includes('url at all') && !rendered.includes('weird'), 'the unparseable value is never echoed');
+  }
+});
+
 // Cross-mode refusals (req 4): an offer whose network is not the mode's is
 // refused before any signing, with zero payment headers.
 it('mainnet mode refuses a DEVNET offer before signing (same asset id, different genesis)', async () => {
