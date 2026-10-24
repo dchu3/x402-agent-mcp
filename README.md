@@ -393,6 +393,45 @@ Independent on-chain verification is roadmap work — it requires a chain client
 
 The other trust boundaries are explicit: the discovery fetcher refuses private/loopback/link-local addresses before any request and never follows redirects (see `x402_discover_url`), payment paths refuse redirects and size-bound all response bodies and payment headers, the directory is written atomically with corrupt-file quarantine rather than silent overwrite, and **directory membership is not treated as proof of liveness** (issue #34): `x402_search` ranks by the recorded 402 probes and the payment gate fails closed (`ENDPOINT_NOT_LIVE`) on endpoints off the liveness pin set or with a missing/stale/failed probe.
 
+### One shared transport guard (issue #58)
+
+Every outbound fetch this server makes — the `x402_fetch` 402 probe, the SDK's first request and the signed paid leg, `x402_health`, `x402_discover_url` (including its page fetch), `x402_crawl_directory` and the shared probe utils — rides the single guard in `src/transport/guard.ts`. Before any request (and therefore before any payment attempt), it refuses:
+
+- **private, loopback, link-local and unspecified address ranges** (IPv4 and IPv6) — stable code `PRIVATE_HOST_REFUSED`;
+- **redirect responses** (`3xx`) — stable code `REDIRECT_REFUSED` (redirects are never followed);
+- **plain `http://` to public hosts** — stable code `HTTP_NOT_ALLOWED` (https only), plus `URL_INVALID` for malformed URLs.
+
+Guard refusals surface as `{"error": "<CODE>", "detail": "..."}` with fixed detail text — never a raw stack or seller echo. Hostnames that do not resolve are not specially refused; they simply fail as ordinary fetch errors.
+
+For loopback development (running a mock seller beside the MCP), `X402_ALLOW_PRIVATE_HOSTS` allows specific `host:port` pairs (e.g. `127.0.0.1:8921,localhost:8922`) through the private-host guard. It read from the process environment only — a tool caller can never extend it — and https-only is not relaxed: localhost is exempted only from the private-address refusal.
+
+### Seller text is untrusted data (issue #63)
+
+Anything an endpoint, directory or crawl writes is **untrusted data for an AI agent, not instructions**. Tool descriptions say so, and the tools confine that text to named `untrusted` fields:
+
+- `untrusted.body` — a response body surfaced by `x402_fetch` (free responses and non-200 paid responses);
+- `untrusted.challenge` — a payment requirement blob the tool could not parse/bind (where the old `payment_info` echo used to be);
+- `untrusted.description` — `x402_search` row descriptions and endpoint hints (the plain row keeps structural fields only; crawled rows additionally carry `source: "discovery"` versus `"seed"`).
+
+Each is `{ text, truncated, original_bytes }`: control characters and ANSI escape sequences are stripped (tab/newline kept), the text is capped (`X402_MAX_UNTRUSTED_CHARS`, default 100 000 chars for bodies, 1 000 for challenge blobs, 2 000 for directory text — a lower env value wins), and truncation is marked with the original size. The tools' own status/error fields carry fixed text only (e.g. `x402 payment failed`, `Failed to probe endpoint`) — raw failure detail goes to the local debug log, not to the model.
+
+### Caller request headers, deny by default (issue #64)
+
+`x402_fetch` accepts an optional `headers: { name: value }` map for sellers that need a caller identifier to link the unpaid and paid requests. It is deny-by-default:
+
+- only names listed in `X402_EXTRA_HEADER_ALLOWLIST` (comma-separated, case-insensitive, **empty by default**) are ever sent;
+- a hard deny list configuration cannot override — `Authorization`, `Cookie`, `Proxy-Authorization`, `Host`, `Content-Length`, `Transfer-Encoding`, `Connection` (plus hop-by-hop `Keep-Alive`, `TE`, `Trailer`, `Upgrade`) and anything starting `payment-` / `x-payment` (the SDK owns payment headers) — refused **even when allowlisted**;
+- names must be RFC 7230 tokens, values must not contain CR/LF/NUL and are capped at 1 024 characters, at most 16 headers, no case-duplicate names;
+- a refusal (`{"error": "HEADER_REFUSED", "detail": ...}`) happens **before any request or payment attempt**;
+- accepted headers ride all three legs identically (free probe, SDK first request, signed paid leg); header **values are never logged and never written to the payment ledger** (log lines carry names only).
+
+```bash
+# .env — allow exactly these extra header names on x402_fetch (deny-by-default):
+X402_EXTRA_HEADER_ALLOWLIST=x-client-id
+# Loopback mock sellers for development (env-only; tool callers cannot add):
+# X402_ALLOW_PRIVATE_HOSTS=127.0.0.1:8921,localhost:8922
+```
+
 ## Quick Start
 
 ### 1. Install
