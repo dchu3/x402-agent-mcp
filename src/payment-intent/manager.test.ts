@@ -318,3 +318,158 @@ it('comparator: a verbatim unrecognised CAIP-2 (auto-detected, policy-opted-in) 
   assert.equal(m.match, false);
   assert.ok(!m.match && m.field === 'network');
 });
+
+// ---------------------------------------------------------------------------
+// Challenge-scope binding (issue #55, plan C3).
+//
+// RED by design: PaymentIntent does not carry the scope fields yet, so
+// these asserts fail to compile (`validitySeconds`, `extensionKeys`,
+// `evmDomainName`, `evmDomainVersion`, `solanaFeePayer`, `memo` are not
+// properties, and the comparator does not take a third argument) — that is
+// the stated failure: the intent record does not bind the challenge scope
+// yet, and the paramsHash ignores it.
+// ---------------------------------------------------------------------------
+
+const SOLANA_INTENT_PATCH = {
+  chain: 'solana',
+  network: 'solana:5eykt4UsFv8P8NJdTREpY1vzBCKp7DvX',
+  asset: 'FakeSolanaUsdcMint',
+};
+
+const SCOPE_ARGS = {
+  maxTimeoutSeconds: 60,
+  extensionKeys: ['bazaar', 'zeta'],
+  evmDomainName: 'USDC',
+  evmDomainVersion: '2',
+  solanaFeePayer: 'FakeFeePayerAccount',
+  memo: 'receipt-x',
+};
+
+it('binding: the offer validity window binds as validitySeconds; offers without one stay legacy (0, never clamped)', () => {
+  const bound = created(offer({ ...SOLANA_INTENT_PATCH, ...SCOPE_ARGS }));
+  assert.equal(bound.validitySeconds, 60);
+  assert.deepEqual(bound.extensionKeys, ['bazaar', 'zeta']);
+  assert.equal(bound.evmDomainName, 'USDC');
+  assert.equal(bound.evmDomainVersion, '2');
+  assert.equal(bound.solanaFeePayer, 'FakeFeePayerAccount');
+  assert.equal(bound.memo, 'receipt-x');
+  // A pre-#55 offer (no scope arguments) keeps the zero values: the
+  // comparator then skips the new checks exactly as today.
+  const legacy = created();
+  assert.equal(legacy.validitySeconds, 0);
+  assert.deepEqual(legacy.extensionKeys, []);
+  assert.ok(!('evmDomainName' in legacy));
+  assert.ok(!('evmDomainVersion' in legacy));
+  assert.ok(!('solanaFeePayer' in legacy));
+  assert.ok(!('memo' in legacy));
+});
+
+it('binding: extension keys are sorted at creation so the paramsHash is order-independent', () => {
+  const a = created(offer({ ...SOLANA_INTENT_PATCH, extensionKeys: ['zeta', 'bazaar'] }));
+  const b = created(offer({ ...SOLANA_INTENT_PATCH, extensionKeys: ['bazaar', 'zeta'] }));
+  assert.deepEqual(a.extensionKeys, ['bazaar', 'zeta']);
+  assert.equal(a.paramsHash, b.paramsHash);
+});
+
+it('deterministic hashing: same scope ⇒ same paramsHash; any scope change ⇒ different hash', () => {
+  const bound = created(offer({ ...SOLANA_INTENT_PATCH, ...SCOPE_ARGS }));
+  assert.equal(created(offer({ ...SOLANA_INTENT_PATCH, ...SCOPE_ARGS })).paramsHash, bound.paramsHash);
+  const variants: Array<Record<string, unknown>> = [
+    { extensionKeys: ['bazaar', 'zeta', 'third'] },
+    { extensionKeys: ['bazaar'] },
+    { evmDomainName: 'Tampered' },
+    { evmDomainVersion: '3' },
+    { solanaFeePayer: 'FakeOtherAccount' },
+    { memo: 'receipt-y' },
+    { maxTimeoutSeconds: 61 },
+  ];
+  for (const patch of variants) {
+    const other = created(offer({ ...SOLANA_INTENT_PATCH, ...SCOPE_ARGS, ...patch }));
+    assert.notEqual(other.paramsHash, bound.paramsHash, `a ${Object.keys(patch)[0]} change must change the hash`);
+  }
+});
+
+it('tampering a scope field after issuance ⇒ PARAM_MISMATCH (the hash covers the scope)', () => {
+  for (const [field, value] of [
+    ['validitySeconds', 61],
+    ['extensionKeys', ['bazaar']],
+    ['evmDomainName', 'Tampered'],
+    ['evmDomainVersion', '9'],
+    ['solanaFeePayer', 'FakeOtherAccount'],
+    ['memo', 'tampered'],
+  ] as const) {
+    const intent = created(offer({ ...SOLANA_INTENT_PATCH, ...SCOPE_ARGS }));
+    (intent as any)[field] = value;
+    const v = validate(intent, NOW);
+    assert.equal(v.valid, false, `tampered ${field} must not validate`);
+    assert.ok(!v.valid && v.code === 'PARAM_MISMATCH');
+  }
+});
+
+it('shape: wrong-typed scope fields fail closed as MALFORMED (never tolerated, never repaired)', () => {
+  for (const [field, bad] of [
+    ['validitySeconds', '60'],
+    ['validitySeconds', NaN],
+    ['validitySeconds', null],
+    ['extensionKeys', 'bazaar'],
+    ['extensionKeys', [1]],
+    ['evmDomainName', 42],
+    ['evmDomainVersion', 42],
+    ['solanaFeePayer', 42],
+    ['memo', 42],
+  ] as const) {
+    const intent = created(offer({ ...SOLANA_INTENT_PATCH, ...SCOPE_ARGS }));
+    (intent as any)[field] = bad;
+    const v = validate(intent, NOW);
+    assert.equal(v.valid, false, `wrong-typed ${field} must be MALFORMED`);
+    assert.ok(!v.valid && v.code === 'MALFORMED');
+  }
+});
+
+it('comparator: the paid challenge must carry the bound scope — validity, extension key set, domain, fee payer, memo', () => {
+  const intent = created(offer({ ...SOLANA_INTENT_PATCH, ...SCOPE_ARGS }));
+  const goodExtra = { name: 'USDC', version: '2', feePayer: 'FakeFeePayerAccount', memo: 'receipt-x' };
+  const goodBase = {
+    network: SOLANA_INTENT_PATCH.network,
+    asset: SOLANA_INTENT_PATCH.asset,
+    maxTimeoutSeconds: 60,
+    extra: goodExtra,
+  };
+  const good = req(goodBase);
+  const challenge = { extensions: { bazaar: {}, zeta: {} } };
+  assert.deepEqual(matchesRequirements(intent, good, challenge.extensions), { match: true });
+  // Keys the comparator does not bind (the scope boundary's business at
+  // binding time) do not break an otherwise exact match.
+  assert.deepEqual(
+    matchesRequirements(intent, req({ ...goodBase, extra: { another: 'field', ...goodExtra } }), challenge.extensions),
+    { match: true },
+  );
+  const cases: Array<[Record<string, unknown>, string]> = [
+    [req({ ...goodBase, maxTimeoutSeconds: 61 }), 'validity'],
+    [req({ network: goodBase.network, asset: goodBase.asset, extra: goodExtra }), 'validity'],
+    [req({ ...goodBase, extra: { version: '2', feePayer: 'FakeFeePayerAccount', memo: 'receipt-x' } }), 'evmDomain'],
+    [req({ ...goodBase, extra: { ...goodExtra, name: 'Tampered' } }), 'evmDomain'],
+    [req({ ...goodBase, extra: { ...goodExtra, version: '3' } }), 'evmDomain'],
+    [req({ ...goodBase, extra: { name: 'USDC', feePayer: 'FakeFeePayerAccount', memo: 'receipt-x' } }), 'evmDomain'],
+    [req({ network: goodBase.network, asset: goodBase.asset, maxTimeoutSeconds: 60 }), 'evmDomain'],
+    [req({ ...goodBase, extra: { ...goodExtra, feePayer: 'FakeOtherAccount' } }), 'feePayer'],
+    [req({ ...goodBase, extra: { ...goodExtra, memo: 'other' } }), 'memo'],
+  ];
+  for (const [badRequirements, field] of cases) {
+    const m = matchesRequirements(intent, badRequirements, challenge.extensions);
+    assert.equal(m.match, false, `a challenge without the bound ${field} must abort: ${JSON.stringify(badRequirements)}`);
+    assert.ok(!m.match && m.field === field);
+  }
+  for (const extensions of [undefined, {}, { bazaar: {} }, { bazaar: {}, other: {} }]) {
+    const m = matchesRequirements(intent, good, extensions);
+    assert.equal(m.match, false, `the extension key set must match exactly (got ${JSON.stringify(extensions ?? null)})`);
+    assert.ok(!m.match && m.field === 'extensions');
+  }
+});
+
+it('comparator: legacy intents (validitySeconds 0, no extension keys) skip the new comparisons exactly as today', () => {
+  const intent = created();
+  assert.deepEqual(matchesRequirements(intent, req()), { match: true });
+  // ...and a challenge extension set is irrelevant for a legacy intent.
+  assert.deepEqual(matchesRequirements(intent, req(), { extensions: { anything: {} } }), { match: true });
+});

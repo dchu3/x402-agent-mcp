@@ -49,7 +49,10 @@ export function _resetRegistryForTests(): void {
 
 /** The ONLY fields inside paramsHash, in fixed literal order — the canonical
  * serialiser builds the JSON string explicitly so it never depends on object
- * key order of an arbitrary object. */
+ * key order of an arbitrary object. Issue #55: the challenge scope is part
+ * of the binding (the agent hashes everything it will sign against).
+ * Optional scope fields canonicalise to `null` when absent, so a JSON
+ * round-trip (which drops `undefined` properties) cannot change the string. */
 const BINDING_KEYS = [
   'serviceId', 'serviceUrl', 'chain', 'network', 'token', 'asset', 'amountAtomic', 'recipient', 'scheme',
 ] as const;
@@ -59,7 +62,23 @@ function sha256hex(value: string): string {
 }
 
 export function canonicalParamsJson(i: PaymentIntent): string {
-  return `{${BINDING_KEYS.map((k) => `${JSON.stringify(k)}:${JSON.stringify(i[k])}`).join(',')}}`;
+  return JSON.stringify({
+    serviceId: i.serviceId,
+    serviceUrl: i.serviceUrl,
+    chain: i.chain,
+    network: i.network,
+    token: i.token,
+    asset: i.asset,
+    amountAtomic: i.amountAtomic,
+    recipient: i.recipient,
+    scheme: i.scheme,
+    validitySeconds: i.validitySeconds,
+    extensionKeys: i.extensionKeys,
+    evmDomainName: i.evmDomainName ?? null,
+    evmDomainVersion: i.evmDomainVersion ?? null,
+    solanaFeePayer: i.solanaFeePayer ?? null,
+    memo: i.memo ?? null,
+  });
 }
 
 export function paramsHashOf(i: PaymentIntent): string {
@@ -67,14 +86,34 @@ export function paramsHashOf(i: PaymentIntent): string {
 }
 
 /** Every field, fixed order — used to deep-compare a presented intent against
- * the frozen registry record (tampering ANY field changes this string). */
-const ALL_KEYS = [
-  ...BINDING_KEYS, 'id', 'decimals', 'amountUsdEstimate', 'policyDecision', 'policyDecisionId',
-  'paramsHash', 'createdAt', 'expiresAt',
-] as const;
-
+ * the frozen registry record (tampering ANY field changes this string).
+ * Same optional-scope canonicalisation as canonicalParamsJson. */
 function canonicalIntentJson(i: PaymentIntent): string {
-  return `{${ALL_KEYS.map((k) => `${JSON.stringify(k)}:${JSON.stringify(i[k])}`).join(',')}}`;
+  return JSON.stringify({
+    serviceId: i.serviceId,
+    serviceUrl: i.serviceUrl,
+    chain: i.chain,
+    network: i.network,
+    token: i.token,
+    asset: i.asset,
+    amountAtomic: i.amountAtomic,
+    recipient: i.recipient,
+    scheme: i.scheme,
+    validitySeconds: i.validitySeconds,
+    extensionKeys: i.extensionKeys,
+    evmDomainName: i.evmDomainName ?? null,
+    evmDomainVersion: i.evmDomainVersion ?? null,
+    solanaFeePayer: i.solanaFeePayer ?? null,
+    memo: i.memo ?? null,
+    id: i.id,
+    decimals: i.decimals,
+    amountUsdEstimate: i.amountUsdEstimate,
+    policyDecision: i.policyDecision,
+    policyDecisionId: i.policyDecisionId,
+    paramsHash: i.paramsHash,
+    createdAt: i.createdAt,
+    expiresAt: i.expiresAt,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -93,6 +132,15 @@ function isShapeValid(i: unknown): i is PaymentIntent {
   if (typeof o.decimals !== 'number' || !Number.isInteger(o.decimals)) return false;
   if (typeof o.amountUsdEstimate !== 'number' || !Number.isFinite(o.amountUsdEstimate)) return false;
   if (!/^[0-9]+$/.test(o.amountAtomic as string)) return false;
+  // Issue #55 — challenge-scope fields: fail closed on wrong types so a
+  // scope value can never be smuggled in with an unusable shape.
+  if (typeof o.validitySeconds !== 'number' || !Number.isFinite(o.validitySeconds)) return false;
+  if (!Array.isArray(o.extensionKeys)) return false;
+  for (const key of o.extensionKeys) if (typeof key !== 'string') return false;
+  for (const k of ['evmDomainName', 'evmDomainVersion', 'solanaFeePayer', 'memo']) {
+    const v = o[k];
+    if (v !== undefined && typeof v !== 'string') return false;
+  }
   return true;
 }
 
@@ -119,6 +167,21 @@ export interface CreateFromOfferArgs {
   scheme?: string;
   /** Informational USD estimate as evaluated by policy — never the binding. */
   amountUsdEstimate?: number;
+  /** Issue #55 — challenge scope to bind (from the scope boundary or the
+   * raw challenge for legacy offers). Absent/invalid ⇒ legacy values, so
+   * the comparator skips the new checks exactly as before #55. */
+  /** The offer's max timeout in seconds; 0/absent/invalid binds 0. */
+  maxTimeoutSeconds?: number;
+  /** The sorted challenge extension key set; absent binds []. */
+  extensionKeys?: string[];
+  /** The offer's extra.name / extra.version (EIP-712 domain), bound for
+   * exact equality when present. */
+  evmDomainName?: string;
+  evmDomainVersion?: string;
+  /** The offer's extra.feePayer / extra.memo (SVM), bound for exact
+   * equality when present. */
+  solanaFeePayer?: string;
+  memo?: string;
   /** Defaults to X402_INTENT_TTL_MS env, then INTENT_DEFAULT_TTL_MS. */
   ttlMs?: number;
   /** Injectable clock for deterministic tests. */
@@ -168,6 +231,21 @@ export function createFromOffer(args: CreateFromOfferArgs): CreateResult {
     if (typeof args.decimals !== 'number' || !Number.isInteger(args.decimals) || args.decimals < 0) {
       return { ok: false, code: 'MALFORMED', message: 'decimals must be a non-negative integer' };
     }
+    // Issue #55 — the challenge-scope arguments fail closed on wrong types.
+    // Absent stays legacy (0 / no keys) so pre-#55 callers are untouched.
+    if (args.maxTimeoutSeconds !== undefined
+      && (typeof args.maxTimeoutSeconds !== 'number' || !Number.isFinite(args.maxTimeoutSeconds) || args.maxTimeoutSeconds <= 0)) {
+      return { ok: false, code: 'MALFORMED', message: 'maxTimeoutSeconds must be a positive finite number of seconds' };
+    }
+    if (args.extensionKeys !== undefined
+      && (!Array.isArray(args.extensionKeys) || args.extensionKeys.some((k) => typeof k !== 'string'))) {
+      return { ok: false, code: 'MALFORMED', message: 'extensionKeys must be an array of strings' };
+    }
+    for (const [key, value] of [['evmDomainName', args.evmDomainName], ['evmDomainVersion', args.evmDomainVersion], ['solanaFeePayer', args.solanaFeePayer], ['memo', args.memo]] as const) {
+      if (value !== undefined && (typeof value !== 'string' || value === '')) {
+        return { ok: false, code: 'MALFORMED', message: `${key} must be a non-empty string when present` };
+      }
+    }
 
     const now = args.now ?? Date.now();
     const ttl = resolveTtlMs(args.ttlMs);
@@ -189,6 +267,18 @@ export function createFromOffer(args: CreateFromOfferArgs): CreateResult {
       amountUsdEstimate: typeof args.amountUsdEstimate === 'number' && Number.isFinite(args.amountUsdEstimate) ? args.amountUsdEstimate : 0,
       recipient: args.recipient,
       scheme: args.scheme ?? '',
+      // Issue #55 — the challenge scope binds here (never clamped: what the
+      // caller passes is what the intent records; the scope boundary has
+      // already refused out-of-scope challenges upstream).
+      validitySeconds:
+        typeof args.maxTimeoutSeconds === 'number' && Number.isFinite(args.maxTimeoutSeconds) && args.maxTimeoutSeconds > 0
+          ? args.maxTimeoutSeconds
+          : 0,
+      extensionKeys: args.extensionKeys === undefined ? [] : [...new Set(args.extensionKeys)].sort(),
+      ...(args.evmDomainName === undefined ? {} : { evmDomainName: args.evmDomainName }),
+      ...(args.evmDomainVersion === undefined ? {} : { evmDomainVersion: args.evmDomainVersion }),
+      ...(args.solanaFeePayer === undefined ? {} : { solanaFeePayer: args.solanaFeePayer }),
+      ...(args.memo === undefined ? {} : { memo: args.memo }),
       policyDecision: 'ALLOW',
       policyDecisionId: '',
       paramsHash: '',
@@ -288,8 +378,14 @@ function sameNetwork(intent: PaymentIntent, network: unknown): boolean {
 /** Compare the SDK-selected requirements against the authorised intent.
  * Missing requirement fields, empty asset, absent/absent asset, or any value
  * difference ⇒ {match:false, field} (abort). Casper networks are normalised
- * via toCasperCaip2; base/solana compare as exact CAIP-2 strings. */
-export function matchesRequirements(intent: PaymentIntent, requirements: unknown): RequirementMatch {
+ * via toCasperCaip2; base/solana compare as exact CAIP-2 strings.
+ *
+ * Issue #55: the challenge scope binds where the offer bound it.
+ * `challengeExtensions` is the PAID leg's challenge `extensions` value (the
+ * SDK hands the hook the parsed challenge); its key set must equal the
+ * bound one. Legacy intents (validitySeconds 0 / no bound keys) skip these
+ * checks, so pre-#55 behavior is byte-for-byte preserved. */
+export function matchesRequirements(intent: PaymentIntent, requirements: unknown, challengeExtensions?: unknown): RequirementMatch {
   const r = (typeof requirements === 'object' && requirements !== null ? requirements : {}) as Record<string, unknown>;
   if (nonEmptyString(r.scheme) !== intent.scheme) return { match: false, field: 'scheme' };
   if (!sameNetwork(intent, r.network)) return { match: false, field: 'network' };
@@ -299,6 +395,28 @@ export function matchesRequirements(intent: PaymentIntent, requirements: unknown
   if (amount === null || amount !== intent.amountAtomic) return { match: false, field: 'amount' };
   const payTo = nonEmptyString(r.payTo);
   if (payTo === null || payTo !== intent.recipient) return { match: false, field: 'payTo' };
+  // Issue #55 — the challenge scope binds where the offer bound it. Skip
+  // rules for values the intent did not bind (legacy/pre-#55 offers) so
+  // their behavior is unchanged.
+  if (intent.validitySeconds > 0) {
+    const timeout = typeof r.maxTimeoutSeconds === 'number' ? r.maxTimeoutSeconds : NaN;
+    if (timeout !== intent.validitySeconds) return { match: false, field: 'validity' };
+  }
+  if (intent.extensionKeys.length > 0) {
+    const challengeKeys = (typeof challengeExtensions === 'object' && challengeExtensions !== null && !Array.isArray(challengeExtensions))
+      ? Object.keys(challengeExtensions).sort()
+      : [];
+    if (JSON.stringify(challengeKeys) !== JSON.stringify(intent.extensionKeys)) {
+      return { match: false, field: 'extensions' };
+    }
+  }
+  const extra = (r.extra !== undefined && typeof r.extra === 'object' && r.extra !== null && !Array.isArray(r.extra))
+    ? r.extra as Record<string, unknown>
+    : {} as Record<string, unknown>;
+  if (intent.evmDomainName !== undefined && extra.name !== intent.evmDomainName) return { match: false, field: 'evmDomain' };
+  if (intent.evmDomainVersion !== undefined && extra.version !== intent.evmDomainVersion) return { match: false, field: 'evmDomain' };
+  if (intent.solanaFeePayer !== undefined && extra.feePayer !== intent.solanaFeePayer) return { match: false, field: 'feePayer' };
+  if (intent.memo !== undefined && extra.memo !== intent.memo) return { match: false, field: 'memo' };
   return { match: true };
 }
 
@@ -311,7 +429,7 @@ export interface IntentManager {
   validate(intent: unknown, now?: number): IntentValidation;
   beginAttempt(intent: unknown, now?: number): IntentValidation;
   consume(intent: unknown): IntentValidation;
-  matchesRequirements(intent: PaymentIntent, requirements: unknown): RequirementMatch;
+  matchesRequirements(intent: PaymentIntent, requirements: unknown, challengeExtensions?: unknown): RequirementMatch;
 }
 
 /** The module-level manager over the process-local registry. */

@@ -48,7 +48,10 @@ export function intentEnforcement({ intent, manager, executorLabel, onPayloadSig
   return async (context) => {
     const v = manager.validate(intent);
     if (v.valid === false) return { abort: true as const, reason: `INTENT_${v.code}` };
-    const m = manager.matchesRequirements(intent, context.selectedRequirements);
+    // Issue #55: the paid leg's challenge extensions are compared against
+    // the bound extension key set (undefined when absent — legacy intents
+    // and extension-free challenges compare as before).
+    const m = manager.matchesRequirements(intent, context.selectedRequirements, (context.paymentRequired as { extensions?: unknown } | undefined)?.extensions);
     if (m.match === false) return { abort: true as const, reason: `INTENT_OFFER_MISMATCH:${m.field}` };
     const c = manager.consume(intent);
     if (c.valid === false) return { abort: true as const, reason: `INTENT_${c.code}` };

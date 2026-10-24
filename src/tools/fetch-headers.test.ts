@@ -119,16 +119,17 @@ const MARKER = `x402-hdr-value-${Math.random().toString(36).slice(2)}`;
 // allowlist + hard deny list + validation) makes them pass.
 // ---------------------------------------------------------------------------
 
-it('an allowlisted header reaches the probe, the SDK-first request and the signed paid leg with the SAME value (issue #64 req 1)', async () => {
+it('an allowlisted header reaches the probe and the signed paid leg with the SAME value (issue #64 req 1)', async () => {
   process.env.X402_EXTRA_HEADER_ALLOWLIST = 'x-client-id';
   const s = await seller();
   const result = JSON.parse((await handler()({ url: s.url, headers: { 'x-client-id': MARKER } })).content[0].text);
   assert.equal(result.status, 200, 'the paid flow must complete against the loopback seller');
   assert.equal(result.paid, true);
-  assert.equal(s.recorded.length, 3, 'probe + SDK-first + signed paid leg (exactly three legs)');
+  // Issue #61: the SDK's first request rides the probe replay — the network
+  // legs are probe + signed paid leg, both carrying the caller header.
+  assert.equal(s.recorded.length, 2, 'probe + signed paid leg (exactly two legs; no unpaid SDK leg touches the network)');
   assert.equal(s.recorded[0].headers['x-client-id'], MARKER, 'the free probe carries the caller header');
-  assert.equal(s.recorded[1].headers['x-client-id'], MARKER, 'the SDK-first request carries the caller header');
-  assert.equal(s.recorded[2].headers['x-client-id'], MARKER, 'the signed paid leg carries the caller header');
+  assert.equal(s.recorded[1].headers['x-client-id'], MARKER, 'the signed paid leg carries the caller header');
 });
 
 it('a header NOT on the allowlist is refused before any request (issue #64 req 2)', async () => {
@@ -233,18 +234,19 @@ it('with NO allowlist and NO headers argument, behaviour is unchanged (issue #64
   const result = JSON.parse((await handler()({ url: s.url })).content[0].text);
   assert.equal(result.status, 200);
   assert.equal(result.paid, true);
-  assert.equal(s.recorded.length, 3);
+  assert.equal(s.recorded.length, 2, 'issue #61: probe + signed paid leg (the SDK\'s first request rides the replay)');
   assert.ok(s.recorded.every((r) => r.headers['x-client-id'] === undefined), 'no extra header is ever invented');
 });
 
-it('boundary: a 1024-char value (exactly at the cap) is delivered on all three legs', async () => {
+it('boundary: a 1024-char value (exactly at the cap) is delivered on both network legs', async () => {
   process.env.X402_EXTRA_HEADER_ALLOWLIST = 'x-client-id';
   const s = await seller();
   const value = 'b'.repeat(1024);
   const result = JSON.parse((await handler()({ url: s.url, headers: { 'x-client-id': value } })).content[0].text);
   assert.equal(result.status, 200);
-  assert.equal(s.recorded.length, 3);
+  // Issue #61: two network legs (probe + signed) — the SDK's first request
+  // never leaves the process (the probe replay).
+  assert.equal(s.recorded.length, 2);
   assert.equal(s.recorded[0].headers['x-client-id'], value);
   assert.equal(s.recorded[1].headers['x-client-id'], value);
-  assert.equal(s.recorded[2].headers['x-client-id'], value);
 });

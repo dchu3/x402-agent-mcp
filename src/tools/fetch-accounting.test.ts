@@ -76,9 +76,11 @@ function noSignatureHeader(input: unknown, init: unknown): boolean {
   return !headers.has('payment-signature');
 }
 
-/** Drive the real signed flow: probe (402 challenge) → paid attempt (402
- * challenge) → signed retry (the seller's response). Returns the parsed tool
- * output and the mock's request counters. */
+/** Drive the real signed flow: probe (402 challenge) → signed retry (the
+ * seller's response). Under the #61 probe replay the SDK's first request is
+ * answered from the probe's bytes (no unpaid network leg), so the mock sees
+ * exactly two contacts: the probe, then the signed paid leg. Returns the
+ * parsed tool output and the mock's request counters. */
 async function runSignedFlow(url: string, sellerBody: string, sellerStatus = 200) {
   let probes = 0, paidAttempts = 0, signedRetries = 0;
   globalThis.fetch = (async (input: unknown, init: unknown) => {
@@ -86,7 +88,7 @@ async function runSignedFlow(url: string, sellerBody: string, sellerStatus = 200
     assert.equal(u, url, 'no other endpoint call may happen');
     if (noSignatureHeader(input, init)) {
       if (probes === 0) { probes++; return chargeableBaseChallenge(url); }
-      paidAttempts++;
+      paidAttempts++; // unreachable under the replay (a safety net, kept for mock-shape parity with fetch.test.ts)
       return chargeableBaseChallenge(url);
     }
     signedRetries++;
@@ -132,10 +134,11 @@ for (const shape of SHAPES) {
 
     const { parsed, probes, paidAttempts, signedRetries } = await runSignedFlow(url, shape.body);
 
-    // Exactly one paid request reaches the mock: one probe, one paid attempt,
-    // one signed retry — no accounting-driven retry.
+    // Exactly one paid request reaches the mock: one probe, one signed retry
+    // — under the #61 probe replay the SDK's first request is answered from
+    // the probe's bytes and never touches the network.
     assert.equal(probes, 1);
-    assert.equal(paidAttempts, 1);
+    assert.equal(paidAttempts, 0, 'issue #61: the SDK\'s first request rides the probe replay — no unpaid network leg');
     assert.equal(signedRetries, 1, 'exactly one paid (signed) request per tool call');
 
     assert.equal(parsed.status, 200);

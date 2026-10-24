@@ -38,6 +38,32 @@ export interface PaymentIntent {
   recipient: string;
   /** 'exact'. */
   scheme: string;
+  /** Issue #55 — challenge scope, bound at issuance (from the scope
+   * boundary's computed scope). Values here are compared at the payment
+   * hook against the SDK-selected requirement/challenge, so what was
+   * signed is bound to what the challenge offered:
+   * - validitySeconds: the offer's `maxTimeoutSeconds`. 0 (never clamped)
+   *   when the offer did not carry one; a legacy marker — the hook
+   *   comparator skips the check when 0. */
+  validitySeconds: number;
+  /** Sorted `extensions` keys of the challenge that was probed. Empty =
+   * legacy (no extension set was bound); the comparator then skips the
+   * check, exactly as before #55. */
+  extensionKeys: string[];
+  /** EVM exact scheme — the offer's `extra.name` (the EIP-712 domain
+   * name), bound for exact equality when present. */
+  evmDomainName?: string;
+  /** EVM exact scheme — the offer's `extra.version` (the EIP-712 domain
+   * version), bound for exact equality when present. */
+  evmDomainVersion?: string;
+  /** SVM exact scheme — the offer's `extra.feePayer`, bound for exact
+   * equality when present (the scope boundary already refused a self
+   * fee payer / an operator-unlisted payer). */
+  solanaFeePayer?: string;
+  /** SVM exact scheme — the offer's `extra.memo`, bound for exact
+   * equality when present (byte-capped printable ASCII at the scope
+   * boundary; a memo swap can alter the signed transaction's memo). */
+  memo?: string;
   /** Only ALLOW can create an executable intent. */
   policyDecision: 'ALLOW';
   /** sha256(decision + ':' + paramsHash) — derived because the policy engine

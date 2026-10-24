@@ -321,31 +321,43 @@ function noSignatureHeader(input: unknown, init: unknown): boolean {
   return headers.has('payment-signature');
 }
 
-it('intent boundary: price raised between probe and paid challenge ⇒ abort before signing, structured refusal, no ledger success', async () => {
+it('intent boundary: price raised for the SIGNED leg is never paid above the probe\'s offer (the probe\'s challenge is the only signable thing)', async () => {
   process.env.MAX_PAYMENT_PER_CALL = '50';
   process.env.MAX_DAILY_SPEND = '50';
+  process.env.SOLANA_RPC_URL = RPC_SIM_URL;
   const url = 'https://price-raised-test.invalid/api';
-  let calls = 0;
+  let calls = 0, rpcCalls = 0;
   globalThis.fetch = (async (input: unknown, init: unknown) => {
+    const urlStr = input instanceof Request ? input.url : String(input);
+    if (urlStr.startsWith(RPC_SIM_URL)) {
+      rpcCalls++;
+      return rpcSimResponse(await requestBodyText(input, init));
+    }
     calls++;
-    assert.equal(noSignatureHeader(input, init), false, 'a signature must never exist for a mismatched offer');
-    if (calls === 1) return bindableSolanaChallenge('10000', url); // probe: $0.01 offer
-    return bindableSolanaChallenge('20000', url);                  // paid leg: price doubled
+    if (calls === 1) return chargeableSolanaChallengeWith(url, '10000'); // probe: $0.01 offer
+    return chargeableSolanaChallengeWith(url, '20000');                  // the SIGNED leg: the seller raises the price
   }) as any;
   const before = ledgerLines();
   const result = await handler()({ url });
   const parsed = JSON.parse(result.content[0].text);
-  assert.equal(calls, 2, 'probe + one paid attempt — the abort happens before any signed retry');
-  assert.equal(parsed.policy_decision, 'ALLOW', 'policy allowed; the intent boundary is what refused');
-  assert.deepEqual(parsed.reasons.map((r: any) => r.code), ['INTENT_UNAUTHORISED', 'OFFER_MISMATCH']);
-  assert.match(parsed.error, /payment-intent boundary/);
-  assert.match(parsed.reasons[1].message, /amount/, 'the drifted field is named');
-  for (const key of ['error', 'url', 'chain', 'estimated_cost_usdc', 'daily_spent_usdc', 'max_per_call', 'max_daily']) {
-    assert.ok(key in parsed, `refusal keeps the #19 key ${key}`);
-  }
+  // Issue #61: the SDK's first request rides the probe replay, so a raised
+  // challenge can only be served to the leg that ALREADY carries the signed
+  // probe-offer payment — there is no pre-signature observation left to
+  // mismatch (the pre-#61 OFFER_MISMATCH abort is structurally unreachable
+  // here). The raised-price leg settles as a FAILED attempt: nothing above
+  // the probe's offer was ever authorised, signed or counted.
+  assert.equal(calls, 2, 'probe + the SIGNED paid leg — the SDK\'s first request rides the replay, no unpaid leg touches the network');
+  assert.equal(rpcCalls, 1, 'payload creation ran (the authorised offer was signed)');
+  assert.equal(parsed.status, 402, 'the raised challenge surfaces as a failed settlement');
+  assert.equal(parsed.paid, false);
+  assert.equal(parsed.cost_usdc, 0, 'zero settled spend — the raised price was never paid');
+  assert.equal((parsed.selected_offer ?? {}).amount_atomic, '10000', 'the probe\'s offer stays the selection and the signed amount');
   const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
-  assert.ok(!entries.some((e: any) => e.url === url && e.status === 'success'), 'no ledger success for an aborted payment');
-  assert.equal(entries.find((e: any) => e.url === url)?.status, 'failed', 'the aborted attempt is audited like any other failure');
+  assert.ok(!entries.some((e: any) => e.url === url && e.status === 'success'), 'no ledger success for a raised-price attempt');
+  const failedRow = entries.find((e: any) => e.url === url);
+  assert.equal(failedRow?.status, 'failed', 'the failed attempt is audited like any other failure');
+  assert.equal(failedRow?.http_status, 402);
+  assert.equal(failedRow?.attempted_amount_usdc, 0.01, 'the audit trail names the probe\'s price as the attempted amount');
 });
 
 it('intent boundary: an offer with an unbindable amount/asset can never be paid (INTENT_UNAUTHORISED — amendment 1)', async () => {
@@ -429,25 +441,60 @@ it('intent boundary: Casper payTo swapped between probe and payment ⇒ aborted 
   assert.equal(casperBudget.getDailySpent(), before, 'the intent hook runs BEFORE guardCasperPayments: no budget reserve happened');
 });
 
-it('intent boundary integration: an intent that expires before payload creation is refused at signing (INTENT_EXPIRED)', async () => {
+it('intent boundary integration: the intent TTL is enforced before any payload creation and the probe replay leaves no second challenge to race it', async () => {
   process.env.MAX_PAYMENT_PER_CALL = '50';
   process.env.MAX_DAILY_SPEND = '50';
-  process.env.X402_INTENT_TTL_MS = '1'; // 1 ms TTL — deterministic expiry once the paid leg arrives later
+  process.env.SOLANA_RPC_URL = RPC_SIM_URL;
   const url = 'https://intent-expiry-test.invalid/api';
   let calls = 0;
   globalThis.fetch = (async (input: unknown, init: unknown) => {
+    const urlStr = input instanceof Request ? input.url : String(input);
+    if (urlStr.startsWith(RPC_SIM_URL)) return rpcSimResponse(await requestBodyText(input, init));
     calls++;
-    assert.equal(noSignatureHeader(input, init), false, 'an expired intent must never produce a signature');
-    if (calls > 1) await new Promise((r) => setTimeout(r, 10)); // let the TTL elapse before the paid challenge arrives
-    return bindableSolanaChallenge('10000', url);
+    if (noSignatureHeader(input, init)) return new Response('{"result":"ok"}', { status: 200 }); // the signed retry settles
+    return chargeableSolanaChallenge(url); // probe; the SDK's first request rides the replay, never a network leg
   }) as any;
   const before = ledgerLines();
   const result = await handler()({ url });
   const parsed = JSON.parse(result.content[0].text);
-  assert.equal(calls, 2, 'probe + one paid attempt — expiry aborts inside the SDK hook');
-  assert.deepEqual(parsed.reasons.map((r: any) => r.code), ['INTENT_UNAUTHORISED', 'EXPIRED']);
-  const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
-  assert.ok(!entries.some((e: any) => e.url === url && e.status === 'success'), 'no ledger success for an expired intent');
+  assert.equal(calls, 2, 'probe + the SIGNED paid leg — the SDK\'s first request rides the replay');
+  // Issue #61: the SDK's first request rides the probe replay — there is no
+  // seller-side observation between the gate and payload creation left for a
+  // TTL to race (the pre-#61 harness slept on the now-eliminated leg). The
+  // TTL itself stays enforced before any payload creation: the executor's
+  // validate+beginAttempt refuse an elapsed window BEFORE run() and the
+  // enforcement hook aborts INTENT_EXPIRED at payload time (executor.test.ts,
+  // deterministic injected clocks). The proof here is deterministic at the
+  // manager layer with an injected clock:
+  assert.equal(parsed.status, 200);
+  assert.equal(parsed.paid, true, 'payload creation within the TTL completes the payment exactly as before');
+  assert.equal(parsed.cost_usdc, 0.01);
+  const { createFromOffer, validate, _resetRegistryForTests } = await import('../payment-intent/manager.js');
+  _resetRegistryForTests();
+  const T0 = 1_760_000_000_000; // fixed clock for deterministic expiry proof
+  const allowDecision = { decision: 'ALLOW', reasons: [], limits: { trustLevel: 'UNKNOWN', maxPerRequest: 0.5, maxDaily: 10 } };
+  const expiry = createFromOffer({
+    decision: allowDecision as any,
+    url,
+    chain: 'solana',
+    token: 'USDC',
+    asset: BINDABLE_SOLANA_ASSET,
+    amountAtomic: '10000',
+    decimals: 6,
+    recipient: 'SoLWallet',
+    network: SOLANA_CAIP2,
+    scheme: 'exact',
+    amountUsdEstimate: 0.01,
+    ttlMs: 1,
+    now: T0,
+  });
+  assert.ok(expiry.ok, 'the intent binds under the same TTL config');
+  const vFresh = validate((expiry as any).intent, T0);
+  assert.ok(vFresh.valid, 'a freshly created intent validates (TTL not elapsed) — the fetch-level flow signs exactly this way');
+  const vExpired = validate((expiry as any).intent, T0 + 2);
+  const expiredCheck = vExpired as { valid: boolean; code?: string };
+  assert.ok(!expiredCheck.valid && expiredCheck.code === 'EXPIRED', 'the TTL logic refuses an elapsed window — the executor refuses such intents BEFORE any payload creation');
+  _resetRegistryForTests();
 });
 
 // ---------------------------------------------------------------------------
@@ -554,7 +601,7 @@ it('forced chain solana: a well-formed bindable offer binds an intent and the pa
   const result = await handler()({ url, chain: 'solana' });
   const parsed = JSON.parse(result.content[0].text);
   assert.equal(probes, 1, 'a forced base/solana chain must still run the single free probe to observe the offer');
-  assert.equal(paidAttempts, 1);
+  assert.equal(paidAttempts, 0, 'issue #61: the SDK\'s first request rides the probe replay — it never touches the network');
   assert.equal(rpcCalls, 1, 'payload creation ran — the intent bound the offer instead of blocking it');
   assert.equal(signedRetries, 1, 'the payment was signed and retried — the regression refused exactly here');
   assert.equal(parsed.status, 200);
@@ -588,7 +635,7 @@ it('forced chain base: a well-formed bindable EVM offer binds an intent and the 
   const result = await handler()({ url, chain: 'base' });
   const parsed = JSON.parse(result.content[0].text);
   assert.equal(probes, 1, 'forced base must observe the offer through the same single probe');
-  assert.equal(paidAttempts, 1);
+  assert.equal(paidAttempts, 0, 'issue #61: the SDK\'s first request rides the probe replay — it never touches the network');
   assert.equal(signedRetries, 1, 'the payment was signed — the forced-chain boundary did not refuse it');
   assert.equal(parsed.status, 200);
   assert.equal(parsed.paid, true);
@@ -686,7 +733,7 @@ it('auto-detect control: chain omitted still binds from the probe offer and comp
   const result = await handler()({ url }); // no chain — the auto-detect path drove this suite from the start
   const parsed = JSON.parse(result.content[0].text);
   assert.equal(probes, 1);
-  assert.equal(paidAttempts, 1);
+  assert.equal(paidAttempts, 0, 'issue #61: the SDK\'s first request rides the probe replay — it never touches the network');
   assert.equal(rpcCalls, 1);
   assert.equal(signedRetries, 1, 'auto-detect still signs and completes exactly as before');
   assert.equal(parsed.status, 200);
@@ -711,7 +758,11 @@ it('forced chain solana: an endpoint that does not charge (probe answers 200) pa
   const before = ledgerLines();
   const result = await handler()({ url, chain: 'solana' });
   const parsed = JSON.parse(result.content[0].text);
-  assert.equal(calls, 2, 'probe + paid fetch — a free endpoint under a forced chain is never refused');
+  // Issue #61: the settled (non-402) probe response is REPLAYED to the SDK's
+  // first request, so a free endpoint under a forced chain is one network
+  // request end-to-end; the SDK's response is the recorded 200 (no payload
+  // creation, no signature) — never refused.
+  assert.equal(calls, 1, 'the probe response itself settles the request — exactly one network contact');
   assert.equal(parsed.status, 200);
   assert.equal(parsed.paid, true);
   assert.equal(parsed.policy_decision, undefined, 'ALLOW adds no policy keys to the success output');
@@ -787,7 +838,7 @@ it('recipient allowlist: the matching probed recipient pays exactly as before (n
   const result = await handler()({ url, chain: 'solana' });
   const parsed = JSON.parse(result.content[0].text);
   assert.equal(probes, 1);
-  assert.equal(paidAttempts, 1);
+  assert.equal(paidAttempts, 0, 'issue #61: the SDK\'s first request rides the probe replay — it never touches the network');
   assert.equal(rpcCalls, 1);
   assert.equal(signedRetries, 1, 'the listed recipient must still be signed and paid');
   assert.equal(parsed.status, 200);
@@ -848,11 +899,13 @@ const ANOMALY_ENABLED = {
 };
 
 /** Grow the host's in-process baseline through REAL SIGNED settlements (probe
- * 402 → paid attempt 402 → signed retry 200). Post-#53 a bare pass-through
- * 200-after-probe records 0 spend (nothing was signed), so baseline samples
- * must come from bindable, signed settlements — the atomic amount of the i-th
- * probe/attempt pair is probeAmounts[i]. No ledger pre-writing, no
- * rehydration-timing dependence. */
+ * 402 → signed retry 200 — two network contacts per settlement under the #61
+ * probe replay: the SDK's first request is answered from the probe's bytes so
+ * the paid-attempt leg never reaches the network). Post-#53 a bare
+ * pass-through 200-after-probe records 0 spend (nothing was signed), so
+ * baseline samples must come from bindable, signed settlements — the atomic
+ * amount of the i-th probe (the only contact that serves a challenge) is
+ * probeAmounts[i]. No ledger pre-writing, no rehydration-timing dependence. */
 async function growBaseline(url: string, probeAmounts: string[]) {
   process.env.SOLANA_RPC_URL = RPC_SIM_URL; // only the mint-metadata fetch is simulated
   let unsignedChallenges = 0;
@@ -864,9 +917,9 @@ async function growBaseline(url: string, probeAmounts: string[]) {
     if (noSignatureHeader(input, init)) {
       return new Response('{"result":"ok"}', { status: 200 }); // the signed retry settles
     }
-    const amount = probeAmounts[unsignedChallenges >> 1] ?? probeAmounts[probeAmounts.length - 1];
+    const amount = probeAmounts[unsignedChallenges] ?? probeAmounts[probeAmounts.length - 1];
     unsignedChallenges++;
-    return chargeableSolanaChallengeWith(url, amount); // the probe AND the paid attempt bind the same offer
+    return chargeableSolanaChallengeWith(url, amount); // the probe binds the offer; the SDK's first request rides the #61 replay
   }) as any;
   for (let i = 0; i < probeAmounts.length; i++) {
     const r = await handler()({ url });
@@ -1086,7 +1139,7 @@ it('multi-EVM: opted-in polygon pays end-to-end — the registered scheme is eip
   const result = await handler()({ url });
   const parsed = JSON.parse(result.content[0].text);
   assert.equal(probes, 1, 'auto-detect ran the single free probe');
-  assert.equal(paidAttempts, 1);
+  assert.equal(paidAttempts, 0, 'issue #61: the SDK\'s first request rides the probe replay — it never touches the network');
   assert.equal(signedRetries, 1, 'the payment was signed on polygon and retried');
   assert.deepEqual(signedNetworks, [POLYGON_CAIP2], 'the SIGNED payload binds eip155:137 — not base');
   assert.equal(parsed.status, 200);
@@ -1123,7 +1176,7 @@ it('multi-EVM: forced chain polygon still probes-and-observes the offer (the #25
   const result = await handler()({ url, chain: 'polygon' });
   const parsed = JSON.parse(result.content[0].text);
   assert.equal(probes, 1, 'a forced polygon chain must still run the single free probe');
-  assert.equal(paidAttempts, 1);
+  assert.equal(paidAttempts, 0, 'issue #61: the SDK\'s first request rides the probe replay — it never touches the network');
   assert.equal(signedRetries, 1, 'the payment was signed and completed — the new aliases enjoy the same forced-chain semantics');
   assert.equal(parsed.status, 200);
   assert.equal(parsed.paid, true);
@@ -1271,7 +1324,7 @@ it('liveness gate: a pinned row with a FRESH live_402 record pays end-to-end (ga
   const result = await handler()({ url });
   const parsed = JSON.parse(result.content[0].text);
   assert.equal(probes, 1);
-  assert.equal(paidAttempts, 1);
+  assert.equal(paidAttempts, 0, 'issue #61: the SDK\'s first request rides the probe replay — it never touches the network');
   assert.equal(rpcCalls, 1, 'payload creation ran — the liveness recheck passed at signing time');
   assert.equal(signedRetries, 1, 'the payment was signed and settled');
   assert.equal(parsed.status, 200);
@@ -1365,12 +1418,20 @@ it('explicit allowlist: [] (strict mode) DENIES every off-list host with ENDPOIN
   assert.deepEqual(ledgerLines(), before);
 });
 
-it('signing-time recheck (L9): a record that goes stale between the gate and the signature aborts INTENT_ENDPOINT_NOT_LIVE — no signature exists', async () => {
+it('signing-time recheck (L9): the record must be live when payload creation runs — a stale record refuses before the payment machinery engages', async () => {
   process.env.MAX_PAYMENT_PER_CALL = '50';
   process.env.MAX_DAILY_SPEND = '50';
   process.env.SOLANA_RPC_URL = RPC_SIM_URL;
   const host = 'recheck-stale.invalid';
-  writeLivenessDirectory([seedLiveEntry(`https://${host}`, 60_000)]); // fresh at gate time
+  // Record ALREADY stale (2h old) under the 3600 s default: the verdict is
+  // refused at the FIRST derivation. Issue #61: the replay removes the
+  // seller-side window between the gate and payload creation (the pre-#61
+  // harness flipped the record inside the now-eliminated SDK-unpaid leg), so
+  // the deterministic fetch-level assertion is: a not-live endpoint refuses
+  // ENDPOINT_NOT_LIVE and payload creation (with its RPC touch) never runs.
+  // The recheck itself (the same derivation, re-run at payload time inside
+  // the enforcement hook) stays wired and is proven at the executor layer.
+  writeLivenessDirectory([seedLiveEntry(`https://${host}`, 7_200_000)]);
   const url = `https://${host}/api`;
   let calls = 0;
   let signatureSeen = false;
@@ -1382,27 +1443,20 @@ it('signing-time recheck (L9): a record that goes stale between the gate and the
       return rpcSimResponse(await requestBodyText(input, init));
     }
     if (noSignatureHeader(input, init)) signatureSeen = true;
-    if (calls === 1) return chargeableSolanaChallenge(url); // probe — gate will ALLOW (fresh record)
-    // Paid leg: the record ages out BETWEEN the gate and the signature.
-    writeLivenessDirectory([seedLiveEntry(`https://${host}`, 7_200_000)]);
-    return chargeableSolanaChallenge(url);
+    return chargeableSolanaChallenge(url); // bindable, but the flow must refuse before any payment machinery
   }) as any;
   let rpcCallsMarker = 0;
   const before = ledgerLines();
   const result = await handler()({ url });
   const parsed = JSON.parse(result.content[0].text);
-  assert.equal(calls, 2, 'probe + one paid attempt — the abort lands before any signed retry');
+  assert.equal(calls, 1, 'only the probe may run — the refused endpoint never reaches the payment layer');
   assert.equal(signatureSeen, false, 'no signature was ever created');
   assert.equal(rpcCallsMarker, 0, 'payload creation (and its RPC touch) never ran');
-  assert.equal(parsed.policy_decision, 'ALLOW', 'policy allowed at the gate — the RECHECK is what refused at signing');
-  assert.deepEqual(parsed.reasons.map((r: any) => r.code), ['INTENT_UNAUTHORISED', 'ENDPOINT_NOT_LIVE']);
-  assert.match(parsed.error, /payment-intent boundary/);
-  for (const key of ['error', 'url', 'chain', 'estimated_cost_usdc', 'daily_spent_usdc', 'max_per_call', 'max_daily']) {
-    assert.ok(key in parsed, `refusal keeps the #19 key ${key}`);
-  }
+  assert.equal(parsed.policy_decision, 'DENY', 'the not-live verdict refuses before the payment layer');
+  assert.deepEqual(parsed.reasons.map((r: any) => r.code), ['ENDPOINT_NOT_LIVE']);
+  assert.match(parsed.reasons[0].message, /max_age_seconds/, 'the refusal names the staleness bound');
   const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
-  assert.ok(!entries.some((e: any) => e.url === url && e.status === 'success'), 'no ledger success for an aborted payment');
-  assert.equal(entries.find((e: any) => e.url === url)?.status, 'failed', 'the aborted attempt is audited like any other failure');
+  assert.ok(!entries.some((e: any) => e.url === url && e.status === 'success'), 'no ledger success for a not-live endpoint');
 });
 
 // ---------------------------------------------------------------------------
