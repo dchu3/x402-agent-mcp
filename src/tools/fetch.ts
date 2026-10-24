@@ -29,7 +29,7 @@ import { guardedFetch, isTransportRefusal } from "../transport/guard.js";
 // Issue #61 (C7): the probe-replay transport — the SDK's first (unpaid) request
 // to the same method+url is answered from the probe's own bytes instead of a
 // second network hit, closing the offer-swap window at its root.
-import { replayFirstProbe, recordForReplay, type ProbedResponseRecord } from "../transport/replay.js";
+import { replayFirstProbe, recordForReplay, paidTimeoutMs, type ProbedResponseRecord } from "../transport/replay.js";
 // Issue #64: deny-by-default caller headers — validated (allowlist, hard deny
 // list, token/CR-LF-NUL/length/count checks) BEFORE any request; values are
 // never logged (names only below).
@@ -867,11 +867,18 @@ export function registerFetchTool(server: McpServer): void {
                   ? replayFirstProbe(probeRecord, guardedFetch)
                   : guardedFetch;
               const paidFetch = wrapFetchWithPayment(transport, client);
+              // Issue #56: the paid request carries the flow's own timeout
+              // (AbortSignal.timeout) — a seller that never answers cannot
+              // hang the flow past X402_PAID_TIMEOUT_MS (default 30000 ms,
+              // parsed fail-closed by replay.paidTimeoutMs). The signal is
+              // set on the init, so it rides the Request object the SDK
+              // builds (and its retry clone).
               return paidFetch(url, {
                 method,
                 headers: requestHeaders(),
                 body: args.body || undefined,
                 redirect: "manual",
+                signal: AbortSignal.timeout(paidTimeoutMs(process.env)),
               });
             },
           });
@@ -884,7 +891,12 @@ export function registerFetchTool(server: McpServer): void {
           }
           const resp = guarded.result;
 
-          const text = await resp.text();
+          // Issue #56: the paid response body is read bounded (1 MiB) — a
+          // seller streaming a huge body can no longer dictate the agent's
+          // memory. Over the bound the read throws; the catch below audits
+          // it as any other failure (a zero-spend failed row naming the
+          // cap). No paid retry happens after this point.
+          const text = await boundedText(resp, 1_048_576);
           const bodyResult = parseBoundedBody(text);
 
           const { receipt: paymentReceipt, txHash } = extractSettlementReceipt(resp.headers);
@@ -1067,6 +1079,28 @@ export function registerFetchTool(server: McpServer): void {
         const abortReasons = intentAbortReasons(String(err?.message ?? err));
         if (abortReasons) {
           return intentRefusal(url, useChain, amountUsdc, abortReasons);
+        }
+
+        // Issue #56: the paid request ran out of its own timeout bound. A
+        // fixed PAID_TIMEOUT refusal — never the raw AbortError text — while
+        // the failed row above keeps the zero-spend audit trail. Either
+        // DOMException name can arrive here (AbortSignal.timeout names it
+        // TimeoutError; an implementation may surface AbortError); on this
+        // seam every abort is the flow's own paid-leg bound.
+        const abortName = (err as { name?: unknown } | undefined)?.name;
+        if (abortName === "TimeoutError" || abortName === "AbortError") {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                error: "PAID_TIMEOUT",
+                url,
+                chain: useChain,
+                estimated_cost_usdc: amountUsdc,
+                reasons: [{ code: "PAID_TIMEOUT", message: "the seller did not answer the paid request within the timeout bound" }],
+              }),
+            }],
+          };
         }
 
         // Issue #63 (req 3+4): the tool's own error stays FIXED text — no

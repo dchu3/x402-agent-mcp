@@ -71,3 +71,26 @@ export function replayFirstProbe(
     return next(input, init);
   };
 }
+
+/** Issue #56: the paid request must not hang forever on a silent seller.
+ * Default 30000 ms — the probe already carries a 30 s timeout; the paid leg
+ * now carries the same bound unless X402_PAID_TIMEOUT_MS is set. */
+export const DEFAULT_PAID_TIMEOUT_MS = 30_000;
+
+/** Parse X402_PAID_TIMEOUT_MS fail-closed: absent/blank ⇒ the documented
+ * default; whole-digit positive integers pass through verbatim; anything
+ * else (signs, decimals, exponents, junk, values beyond a safe integer)
+ * throws a RangeError — never clamped, never silently defaulted. */
+export function paidTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.X402_PAID_TIMEOUT_MS;
+  if (raw === undefined || raw.trim() === "") return DEFAULT_PAID_TIMEOUT_MS;
+  const trimmed = raw.trim();
+  if (!/^[0-9]+$/.test(trimmed)) {
+    throw new RangeError(`X402_PAID_TIMEOUT_MS must be a positive integer number of milliseconds, got: ${trimmed.slice(0, 32)}`);
+  }
+  const value = Number(trimmed);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new RangeError(`X402_PAID_TIMEOUT_MS must be a positive integer number of milliseconds, got: ${trimmed.slice(0, 32)}`);
+  }
+  return value;
+}
