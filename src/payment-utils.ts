@@ -1,4 +1,7 @@
 import { appendFileSync, existsSync, readFileSync } from "fs";
+// Issue #59 (D7): the DEVNET CAIP-2 (public protocol identifier) marks the
+// devnet ledger rows and the devnet spend bucket.
+import { SOLANA_DEVNET_CAIP2 } from "@x402/svm";
 // Issue #54 (req 3): the ledger path resolver shared by every ledger
 // reader/writer (see the capture comment below).
 import { prepareLedgerDir, resolveLedger } from "./ledger-path.js";
@@ -29,6 +32,12 @@ export interface PaymentLogEntry {
   amount_atomic?: string;
   decimals?: number;
   asset?: string;
+  // Issue #59 (req 7 + D7): the exact CAIP-2 network the row settled on — a
+  // DEVNET row's marker: its spend bucket is the network id itself, never the
+  // chain vocabulary ("solana") that would merge it into the mainnet total.
+  // Optional: rows written before #59 rehydrate into their chain's mainnet
+  // bucket exactly as before (rehydrate tests pin this).
+  network?: string;
 }
 
 // Issue #54 (req 3): the ledger location resolves through src/ledger-path.ts
@@ -50,6 +59,31 @@ let dailyDate = new Date().toISOString().slice(0, 10);
 // budget check.
 let rehydrated = false;
 
+/** Issue #59 (D7): the SPEND BUCKET of a ledger row. A DEVNET row's bucket
+ * is its exact network id — separate from every mainnet chain bucket, and the
+ * only new bucket the daily gate can see. A mainnet row (or any old row
+ * without `network`) reads into its chain-vocabulary bucket exactly as
+ * before. Rows whose network cannot be a devnet id fall back to the chain.
+ * The per-service tracker (policy/budget-store.ts) keeps its host key — the
+ * devnet boundary is the DAILY and reservation accounting, per D7. */
+function spendBucketOf(entry: { chain: string; network?: string }): string {
+  return entry.network === SOLANA_DEVNET_CAIP2 ? SOLANA_DEVNET_CAIP2 : entry.chain;
+}
+
+/** Issue #59/D7: the spend bucket for a NETWORK being paid on. Exactly the
+ * devnet id returns the devnet bucket (a distinct key); everything else (the
+ * mainnet networks, legacy asset-less offers) pays the mainnet buckets —
+ * undefined at the global gate, exactly today's call. */
+export function spendBucketForNetwork(network: string | undefined): string | undefined {
+  return network === SOLANA_DEVNET_CAIP2 ? network : undefined;
+}
+
+/** Devnet's own daily total (issue #59/D7). The devnet bucket is read
+ * through the same map; it is never part of getDailySpent()'s sum. */
+export function getDevnetDailySpent(): number {
+  return getDailySpent(SOLANA_DEVNET_CAIP2);
+}
+
 function rehydrateFromLedger(): void {
   if (rehydrated) return;
   rehydrated = true; // set before any I/O — never double-read, even if read throws
@@ -66,7 +100,11 @@ function rehydrateFromLedger(): void {
         typeof entry.chain === "string" &&
         entry.timestamp.slice(0, 10) === dailyDate
       ) {
-        dailySpentByChain.set(entry.chain, (dailySpentByChain.get(entry.chain) ?? 0) + (entry.amount_usdc ?? 0));
+        // Issue #59 (D7): DEVNET rows bucket under their exact network id; old
+        // rows (no `network` field) and every mainnet row read as the chain's
+        // mainnet bucket — rehydration behavior unchanged.
+        const bucket = spendBucketOf(entry);
+        dailySpentByChain.set(bucket, (dailySpentByChain.get(bucket) ?? 0) + (entry.amount_usdc ?? 0));
       }
     } catch {
       // Corrupted ledger lines are skipped — logging is best-effort, so is reading it back
@@ -166,11 +204,14 @@ export function getMaxPerCallAtomic(decimals: number): bigint | undefined {
   return BigInt(whole) * (10n ** BigInt(decimals)) + atomicFraction;
 }
 
-export function checkSpendingLimit(amountUsdc: number): { allowed: boolean; reason?: string } {
+export function checkSpendingLimit(amountUsdc: number, spendBucket?: string): { allowed: boolean; reason?: string } {
   rehydrateFromLedger();
   resetDailyIfNewDay();
 
-  const dailySpent = getDailySpent();
+  // Issue #59 (D7): a DEVNET call reads the DEVNET bucket — its per-call and
+  // daily caps are its own account, never the mainnet total. Every other
+  // call (the mainnet networks, legacy paths) reads today's whole-map total.
+  const dailySpent = spendBucket ? getDailySpent(spendBucket) : getDailySpent();
   const maxPerCall = getMaxPerCall();
   if (amountUsdc > maxPerCall) {
     return { allowed: false, reason: `Payment $${amountUsdc} exceeds MAX_PAYMENT_PER_CALL $${maxPerCall}` };
@@ -199,7 +240,10 @@ export function logPayment(entry: PaymentLogEntry): void {
   rehydrateFromLedger();
 
   if (entry.status === "success" && entry.chain !== "casper") {
-    dailySpentByChain.set(entry.chain, (dailySpentByChain.get(entry.chain) ?? 0) + (entry.amount_usdc ?? 0));
+    // Issue #59 (D7): the same bucket rule as rehydration — a devnet write
+    // lands in the devnet bucket immediately, never in the chain's total.
+    const bucket = spendBucketOf(entry);
+    dailySpentByChain.set(bucket, (dailySpentByChain.get(bucket) ?? 0) + (entry.amount_usdc ?? 0));
   }
 
   try {
@@ -217,5 +261,10 @@ export function logPayment(entry: PaymentLogEntry): void {
 export function getDailySpent(chain?: string): number {
   rehydrateFromLedger();
   resetDailyIfNewDay();
-  return chain ? dailySpentByChain.get(chain) ?? 0 : [...dailySpentByChain.values()].reduce((sum, amount) => sum + amount, 0);
+  // Issue #59 (D7): the whole-map SUM — the mainnet daily total the caps
+  // read — EXCLUDES the devnet bucket (a devnet payment never moves it). The
+  // explicit-bucket read (getDevnetDailySpent) is unaffected.
+  return chain
+    ? dailySpentByChain.get(chain) ?? 0
+    : [...dailySpentByChain.entries()].filter(([bucket]) => bucket !== SOLANA_DEVNET_CAIP2).reduce((sum, [, val]) => sum + val, 0);
 }

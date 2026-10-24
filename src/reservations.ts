@@ -23,12 +23,18 @@
 // Caps come from MAX_DAILY_SPEND / MAX_PAYMENT_PER_CALL read LIVE per call
 // (never cached at module load), exactly like checkSpendingLimit.
 
-import { getDailySpent, getMaxDailySpend, getMaxPerCall } from "./payment-utils.js";
+import { getDailySpent, getDevnetDailySpent, getMaxDailySpend, getMaxPerCall } from "./payment-utils.js";
 
 export interface ReservationInput {
   amountUsd: number;
   /** Extra scopes besides the always-on 'global' scope (e.g. 'service:host'). */
   scopes?: string[];
+  /** Issue #59 (D7): the spend BUCKET this hold belongs to. A devnet
+   * registration passes the exact devnet network id — its hold and its daily
+   * read live in the devnet bucket (`net:<id>` scope / the devnet daily map
+   * key) and never touch the mainnet 'global' bucket or total. Absent (every
+   * mainnet leg and all pre-#59 callers) → exactly today's 'global' rule. */
+  networkBucket?: string;
 }
 
 export type ReservationResult = { ok: true; id: string } | { ok: false; reason: string };
@@ -62,18 +68,24 @@ export function reserveSpend(input: ReservationInput): ReservationResult {
   if (amountUsd > maxPerCall) {
     return { ok: false, reason: `reserve $${amountUsd} exceeds MAX_PAYMENT_PER_CALL $${maxPerCall}` };
   }
-  // Dedupe while keeping order; 'global' always participates.
-  const seen = new Set<string>(["global"]);
-  const scopes: string[] = ["global"];
+  // Dedupe while keeping order; the DAILY bucket scope participates: 'global'
+  // for mainnet legs (issue #59/D7: a devnet hold carries the devnet bucket
+  // scope ONLY — it must never reserve against the mainnet total).
+  const dailyScope = input.networkBucket ? `net:${input.networkBucket}` : "global";
+  const seen = new Set<string>([dailyScope]);
+  const scopes: string[] = [dailyScope];
   for (const s of input.scopes ?? []) {
     if (!seen.has(s)) {
       seen.add(s);
       scopes.push(s);
     }
   }
-  const reservedGlobal = reservedUsd("global");
+  const reservedGlobal = reservedUsd(dailyScope);
   const maxDaily = getMaxDailySpend();
-  const spent = getDailySpent();
+  // Issue #59 (D7): a DEVNET reservation reads the devnet daily bucket's
+  // total against the same MAX_DAILY_SPEND cap; a mainnet reservation reads
+  // today's mainnet total (the devnet bucket is excluded from it).
+  const spent = input.networkBucket ? getDevnetDailySpent() : getDailySpent();
   if (spent + reservedGlobal + amountUsd > maxDaily + FLOAT_EPSILON_USD) {
     return {
       ok: false,

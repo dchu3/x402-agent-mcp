@@ -12,10 +12,12 @@ import { selectCasperAccept, assertPayableCasperAccept, casperAmountMotes } from
 import { CASPER_CHAIN, toCasperCaip2 } from "../casper/networks.js";
 import { caip2Of, isEvmNetwork, isUsdChain, normalizeCaip2Evm } from "../evm/networks.js";
 import { parseChainFromNetwork } from "./probe-utils.js";
-import { checkSpendingLimit, logPayment, getDailySpent, getMaxPerCall, getMaxPerCallAtomic, getMaxDailySpend } from "../payment-utils.js";
 // Issue #59: the EXPLICIT network mode + the mode's registration/RPC.
 import { casperNetworkResolved, modeAllowsNetwork, resolveNetworkMode, solanaNetworkForMode, solanaRpcUrlForMode } from "../networks.js";
 import type { NetworkMode } from "../networks.js";
+import { checkSpendingLimit, logPayment, getDailySpent, spendBucketForNetwork, getMaxPerCall, getMaxPerCallAtomic, getMaxDailySpend } from "../payment-utils.js";
+// Issue #59 (D7): the DEVNET CAIP-2 decides the spend bucket of a leg.
+import { SOLANA_DEVNET_CAIP2 } from "@x402/svm";
 import { getPolicyEngine, buildPolicyContext, livenessVerdictForUrl, loadPolicyConfig } from "../policy/config.js";
 import { getPerServiceSpent, recordServicePayment } from "../policy/budget-store.js";
 import type { OperatorAssetEntry } from "../policy/types.js";
@@ -759,6 +761,14 @@ export function registerFetchTool(server: McpServer): void {
       // can render intent refusals with the same estimated_cost_usdc key.
       const amountUsdc = probedAmountUsdc || 0.01;
 
+      // Issue #59 (D7): the spend bucket of this leg. Exactly the DEVNET
+      // network pays and accounts in its own bucket (the daily gate, the
+      // spending-limit check and the reservations all read the devnet
+      // bucket); every mainnet leg keeps today's global/mainnet buckets.
+      const spendBucket = spendBucketForNetwork(probedOffer?.network);
+      const serviceScope = spendBucket ? `net:${spendBucket}:service:${serviceHost}` : `service:${serviceHost}`;
+      const dailySpentOfBucket = spendBucket ? getDailySpent(spendBucket) : getDailySpent();
+
       // Step 3: Create x402 client with the right scheme
       try {
         // Issue #61 (C7): force the SDK's own selection to the agent-chosen
@@ -882,7 +892,10 @@ export function registerFetchTool(server: McpServer): void {
           // Issue #54 (req 1): outstanding reservations hold budget that is
           // not in the ledger yet — the per-service context must include this
           // host's holds or overlapping calls read a stale picture.
-          { dailySpentUsd: getDailySpent(), perServiceSpentUsd: getPerServiceSpent(serviceHost) + reservedUsd(`service:${serviceHost}`) },
+          // Issue #59 (D7): the bucket scoping — a devnet leg reads the
+          // DEVNET daily bucket and its devnet-prefixed service scope, never
+          // the mainnet totals.
+          { dailySpentUsd: getDailySpent(), perServiceSpentUsd: getPerServiceSpent(serviceHost) + reservedUsd(serviceScope) },
           getAnomalyInputs(url),
         );
         if (policyResult.decision !== "ALLOW") {
@@ -989,7 +1002,10 @@ export function registerFetchTool(server: McpServer): void {
         // Belt-and-braces INSIDE the payment layer (operator decision #5):
         // payment-utils.checkSpendingLimit stays in place — the policy engine
         // is the outer gate, not a replacement.
-        const limitCheck = checkSpendingLimit(amountUsdc);
+        // Issue #59 (D7): the spending-limit check reads this leg's bucket —
+        // the devnet bucket is a separate account (getDailySpent's mainnet
+        // sum excludes it).
+        const limitCheck = checkSpendingLimit(amountUsdc, spendBucket);
         if (!limitCheck.allowed) {
           return {
             content: [{
@@ -1039,7 +1055,10 @@ export function registerFetchTool(server: McpServer): void {
         // because the response was slow — only signing, or its absence, resolves it.
         const reservation = reserveSpend({
           amountUsd: signedAmountUsdc ?? amountUsdc,
-          scopes: [`service:${serviceHost}`],
+          scopes: [serviceScope],
+          // Issue #59 (D7): a devnet hold lives in the devnet bucket (its
+          // own daily read, its own scope) — never the mainnet 'global'.
+          ...(spendBucket ? { networkBucket: spendBucket } : {}),
         });
         if (reservation.ok === false) {
           return {
@@ -1215,6 +1234,9 @@ export function registerFetchTool(server: McpServer): void {
             url,
             method,
             chain: useChain,
+            // Issue #59 (req 7+D7): the exact network the row settles on — the
+            // devnet rows are bucketed by it, never into the mainnet totals.
+            ...(probedOffer?.network ? { network: probedOffer.network } : {}),
             ...(isSuccessfulPayment ? { amount_usdc: recordedAmountUsdc, ...intentTrail } : failureRowFields),
             tx_hash: txHash,
             status: isSuccessfulPayment ? "success" : "failed",
@@ -1301,6 +1323,10 @@ export function registerFetchTool(server: McpServer): void {
           url,
           method,
           chain: useChain,
+          // Issue #59: the exact network of the attempted leg (failed rows
+          // carry it too — the audit trail is complete; only SUCCESS devnet
+          // rows feed the devnet bucket).
+          ...(probedOffer?.network ? { network: probedOffer.network } : {}),
           amount_usdc: 0,
           status: "failed",
           error: err.message,
