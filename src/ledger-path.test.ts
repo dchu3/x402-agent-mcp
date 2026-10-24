@@ -37,7 +37,7 @@ function tempDir(prefix: string): string {
 function resolveLedger(): { primary: string; legacyReadOnly?: string } {
   assert.ok(ledgerPath && typeof ledgerPath.resolveLedger === 'function',
     'src/ledger-path.ts must exist and export resolveLedger (issue #54 RED step)');
-  return resolveLedger();
+  return ledgerPath.resolveLedger();
 }
 
 function entry(changes: Partial<PaymentLogEntry> = {}): PaymentLogEntry {
@@ -64,10 +64,20 @@ it('an unset PAYMENT_LOG_PATH resolves under the state directory (X402_STATE_DIR
 it('the default state directory is ~/.x402-agent-mcp when X402_STATE_DIR is unset', () => {
   delete process.env.PAYMENT_LOG_PATH;
   delete process.env.X402_STATE_DIR;
-  const { primary, legacyReadOnly } = resolveLedger();
-  assert.equal(primary, join(homedir(), '.x402-agent-mcp', 'x402-payments.jsonl'));
-  // No legacy ledger exists in the runner's cwd here — nothing to read.
-  assert.equal(legacyReadOnly, undefined);
+  // Some checkouts carry a dev ledger in the runner's working directory — the
+  // cwd must be free of anything the legacy probe could see for this scenario
+  // to be about the DEFAULT state dir only (hermetic cwd).
+  const cwd = tempDir('x402-lp-default-');
+  const originalCwd = process.cwd();
+  process.chdir(cwd);
+  try {
+    const { primary, legacyReadOnly } = resolveLedger();
+    assert.equal(primary, join(homedir(), '.x402-agent-mcp', 'x402-payments.jsonl'));
+    // No legacy ledger exists in this (empty temp) cwd — nothing to read.
+    assert.equal(legacyReadOnly, undefined);
+  } finally {
+    process.chdir(originalCwd);
+  }
 });
 
 it('the legacy working-directory ledger is counted but never written (unset path, X402_STATE_DIR set)', async () => {
@@ -107,12 +117,21 @@ it('a simulated restart rehydrates identical totals from the state-dir ledger', 
   delete process.env.PAYMENT_LOG_PATH;
   const state = tempDir('x402-lp-restart-');
   process.env.X402_STATE_DIR = state;
-  const first = await import(`./payment-utils.js?lp-restart=${++bust}`) as typeof import('./payment-utils.js');
-  first.logPayment(entry({ chain: 'base', amount_usdc: 0.30 }));
-  first.logPayment(entry({ chain: 'solana', amount_usdc: 0.20 }));
-  assert.ok(Math.abs(first.getDailySpent() - 0.50) < 1e-9);
-  const restarted = await import(`./payment-utils.js?lp-restart2=${++bust}`) as typeof import('./payment-utils.js');
-  assert.ok(Math.abs(restarted.getDailySpent() - 0.50) < 1e-9, 'a restart rehydrates identical totals');
-  assert.ok(Math.abs(restarted.getDailySpent('solana') - 0.20) < 1e-9);
-  assert.ok(existsSync(join(state, 'x402-payments.jsonl')));
+  // Hermetic cwd: no legacy ledger in the working directory may leak into
+  // these exact totals (some checkouts carry a dev ledger at the repo root).
+  const cwd = tempDir('x402-lp-restart-cwd-');
+  const originalCwd = process.cwd();
+  process.chdir(cwd);
+  try {
+    const first = await import(`./payment-utils.js?lp-restart=${++bust}`) as typeof import('./payment-utils.js');
+    first.logPayment(entry({ chain: 'base', amount_usdc: 0.30 }));
+    first.logPayment(entry({ chain: 'solana', amount_usdc: 0.20 }));
+    assert.ok(Math.abs(first.getDailySpent() - 0.50) < 1e-9);
+    const restarted = await import(`./payment-utils.js?lp-restart2=${++bust}`) as typeof import('./payment-utils.js');
+    assert.ok(Math.abs(restarted.getDailySpent() - 0.50) < 1e-9, 'a restart rehydrates identical totals');
+    assert.ok(Math.abs(restarted.getDailySpent('solana') - 0.20) < 1e-9);
+    assert.ok(existsSync(join(state, 'x402-payments.jsonl')));
+  } finally {
+    process.chdir(originalCwd);
+  }
 });

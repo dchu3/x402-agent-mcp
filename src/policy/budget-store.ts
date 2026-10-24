@@ -17,8 +17,18 @@
 // USD-settled chains (base/solana), exactly like the global daily tracker.
 
 import { existsSync, readFileSync } from "fs";
+// Issue #54 (req 3): the ledger path resolver shared by every ledger reader
+// (see the capture comment below).
+import { resolveLedger } from "../ledger-path.js";
 
-const LOG_PATH = process.env.PAYMENT_LOG_PATH || "./x402-payments.jsonl";
+// Issue #54: the ledger location resolves through src/ledger-path.ts — one
+// resolution shared by every reader/writer: an explicit PAYMENT_LOG_PATH wins
+// outright (absolute, no legacy read), otherwise the state-dir primary
+// (X402_STATE_DIR, default ~/.x402-agent-mcp) plus a read-only legacy
+// working-directory ledger when one exists. Captured once at module load,
+// mirroring the pre-#54 capture-at-load semantics.
+const LEDGER = resolveLedger();
+const LOG_PATH = LEDGER.primary;
 
 /** Today's USD spend per service hostname. */
 const perServiceSpent = new Map<string, number>();
@@ -28,30 +38,41 @@ let rehydrated = false;
 
 function rehydrateFromLedger(): void {
   if (rehydrated) return;
-  rehydrated = true; // set before any I/O — never double-read, even if read throws
-  if (!existsSync(LOG_PATH)) return;
-  try {
-    for (const line of readFileSync(LOG_PATH, "utf-8").split("\n")) {
-      try {
-        const e = JSON.parse(line) as { status?: string; chain?: string; url?: string; amount_usdc?: number; timestamp?: string };
-        if (
-          e.status === "success" &&
-          e.chain !== "casper" &&
-          typeof e.url === "string" &&
-          typeof e.timestamp === "string" &&
-          e.timestamp.slice(0, 10) === dailyDate
-        ) {
-          const host = hostnameOf(e.url);
-          if (host !== null) {
-            perServiceSpent.set(host, (perServiceSpent.get(host) ?? 0) + (e.amount_usdc ?? 0));
-          }
+  rehydrated = true; // set before any I/O — never double-read, even if a read throws
+  // Legacy first (read once, read-only), then the primary ledger — a
+  // pre-upgrade working-directory ledger must still count toward today's
+  // per-service spend (an upgrade that dropped it would silently widen the
+  // per-service cap).
+  for (const line of readLedgerLines(LEDGER.legacyReadOnly).concat(readLedgerLines(LOG_PATH))) {
+    try {
+      const e = JSON.parse(line) as { status?: string; chain?: string; url?: string; amount_usdc?: number; timestamp?: string };
+      if (
+        e.status === "success" &&
+        e.chain !== "casper" &&
+        typeof e.url === "string" &&
+        typeof e.timestamp === "string" &&
+        e.timestamp.slice(0, 10) === dailyDate
+      ) {
+        const host = hostnameOf(e.url);
+        if (host !== null) {
+          perServiceSpent.set(host, (perServiceSpent.get(host) ?? 0) + (e.amount_usdc ?? 0));
         }
-      } catch {
-        // Corrupted ledger lines are skipped — logging is best-effort, so is reading it back
       }
+    } catch {
+      // Corrupted ledger lines are skipped — logging is best-effort, so is reading it back
     }
+  }
+}
+
+/** Split a ledger file into lines, best-effort: a missing/unreadable file is
+ * an empty ledger (the per-file error names the path). */
+function readLedgerLines(path: string | undefined): string[] {
+  if (!path || !existsSync(path)) return [];
+  try {
+    return readFileSync(path, "utf-8").split("\n");
   } catch (err) {
-    console.error(`[x402] Failed to rehydrate per-service spend from ledger: ${err}`);
+    console.error(`[x402] Failed to read ledger ${path}: ${err}`);
+    return [];
   }
 }
 

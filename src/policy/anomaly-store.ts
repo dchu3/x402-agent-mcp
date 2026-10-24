@@ -3,8 +3,8 @@
 // x402-payments.jsonl is the single source of truth. Conventions deliberately
 // mirror src/policy/budget-store.ts:
 //
-// - PAYMENT_LOG_PATH captured at module load (tests use fresh query-busted
-//   imports with the env preset).
+// - LEDGER location captured at module load through src/ledger-path.ts (tests
+//   use fresh query-busted imports with the env preset).
 // - Rehydration is byte-mark based: rows of the ledger beyond the mark are
 //   integrated exactly once, corrupted ledger lines are skipped — logging is
 //   best-effort, so is reading it back.
@@ -34,18 +34,31 @@
 // must stay consistent with what logPayment already wrote, so a later opt-in
 // rehydrates the full history (the ledger is the source of truth).
 
-import { existsSync, readFileSync, statSync } from "fs";
+import { existsSync, readFileSync } from "fs";
 import { loadPolicyConfig } from "./config.js";
 import { emptyBaseline, updateBaseline } from "./anomaly.js";
 import { advertisedPriceUsd } from "../directory.js";
+// Issue #54 (req 3): the ledger path resolver shared by every ledger reader
+// (see the capture comment below).
+import { resolveLedger } from "../ledger-path.js";
 import type { AnomalyInputs, PriceBaseline } from "./types.js";
 
-const PAYMENT_LOG_PATH = process.env.PAYMENT_LOG_PATH || "./x402-payments.jsonl";
+const LEDGER = resolveLedger();
+// Issue #54: the primary ledger (writes land here) and the optional read-only
+// legacy working-directory ledger (read once; an upgrade must never reset
+// today's baselines to 0). Captured once at module load, mirroring the
+// pre-#54 capture-at-load semantics.
+const LEDGER_PRIMARY = LEDGER.primary;
+const LEDGER_LEGACY = LEDGER.legacyReadOnly;
+
+/** Has the legacy ledger been integrated (it is read-only and never grows,
+ * so one integration is forever valid)? */
+let legacyIntegrated = false;
 
 /** Per-host settled-amount baselines (lowercased hostname → last-N amounts). */
 const baselines = new Map<string, PriceBaseline>();
 
-/** Bytes of PAYMENT_LOG_PATH already integrated into `baselines` — either by
+/** Bytes of the primary ledger already integrated into `baselines` — either by
  * a rehydration read or by a recordSettledAmount call whose own ledger row
  * (logPayment writes it right before that call — same #45 guard) the read
  * itself integrated. Rehydration reads only bytes beyond this mark, so a
@@ -62,13 +75,16 @@ let integratedBytes = 0;
  * uses it to recognise the row of its own settlement (flushed by logPayment
  * immediately before the call) and skip re-adding it. */
 function rehydrateFromLedger(window: number): { url: string; amount: number } | null {
-  if (!existsSync(PAYMENT_LOG_PATH)) return null;
+  // Issue #54: the legacy working-directory ledger is integrated exactly once
+  // (it is read-only and never grows, so once is forever). It comes first so
+  // the integration order stays chronological (legacy → primary).
+  let last = integrateLegacyOnce(window);
+  if (!existsSync(LEDGER_PRIMARY)) return last;
   try {
-    const buf = readFileSync(PAYMENT_LOG_PATH);
-    if (buf.length === integratedBytes) return null; // nothing new on disk
+    const buf = readFileSync(LEDGER_PRIMARY);
+    if (buf.length === integratedBytes) return last; // nothing new on disk (legacy may have had rows)
     const start = integratedBytes <= buf.length ? integratedBytes : 0; // replaced ⇒ re-read whole
     const text = buf.subarray(start).toString("utf-8"); // start is a line boundary
-    let last: { url: string; amount: number } | null = null;
     for (const line of text.split("\n")) {
       try {
         const e = JSON.parse(line) as { status?: string; chain?: string; url?: string; amount_usdc?: number };
@@ -102,6 +118,39 @@ function rehydrateFromLedger(window: number): { url: string; amount: number } | 
     console.error(`[x402] Failed to rehydrate price baselines from ledger: ${err}`);
     return null;
   }
+}
+
+/** Integrate the read-only legacy working-directory ledger exactly once,
+ * with the same row filter as the primary stream. Returns the last row it
+ * integrated (may be a legacy row — the recordSettledAmount owner-row skip
+ * stays safe: logPayment's row for the very settlement being recorded is
+ * beyond the primary mark and always integrated by the primary read). */
+function integrateLegacyOnce(window: number): { url: string; amount: number } | null {
+  if (legacyIntegrated || LEDGER_LEGACY === undefined) return null;
+  legacyIntegrated = true; // set before I/O — read-once even if the read throws
+  if (!existsSync(LEDGER_LEGACY)) return null;
+  let last: { url: string; amount: number } | null = null;
+  try {
+    for (const line of readFileSync(LEDGER_LEGACY, "utf-8").split("\n")) {
+      try {
+        const e = JSON.parse(line) as { status?: string; chain?: string; url?: string; amount_usdc?: number };
+        if (e.status === "success" && e.chain !== "casper" && typeof e.url === "string") {
+          const amount = e.amount_usdc;
+          if (typeof amount !== "number" || !Number.isFinite(amount) || amount <= 0) continue;
+          const host = hostnameOf(e.url);
+          if (host !== null) {
+            baselines.set(host, updateBaseline(baselines.get(host) ?? emptyBaseline(), amount, window));
+            last = { url: e.url, amount };
+          }
+        }
+      } catch {
+        // Corrupted legacy lines are skipped — same rule as the primary stream.
+      }
+    }
+  } catch (err) {
+    console.error(`[x402] Failed to read legacy ledger ${LEDGER_LEGACY}: ${err}`);
+  }
+  return last;
 }
 
 /** Lowercased hostname of a URL, or null when unparseable (such entries are

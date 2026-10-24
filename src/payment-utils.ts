@@ -1,5 +1,7 @@
 import { appendFileSync, existsSync, readFileSync } from "fs";
-import { join } from "path";
+// Issue #54 (req 3): the ledger path resolver shared by every ledger
+// reader/writer (see the capture comment below).
+import { prepareLedgerDir, resolveLedger } from "./ledger-path.js";
 
 export interface PaymentLogEntry {
   timestamp: string;
@@ -29,7 +31,14 @@ export interface PaymentLogEntry {
   asset?: string;
 }
 
-const LOG_PATH = process.env.PAYMENT_LOG_PATH || "./x402-payments.jsonl";
+// Issue #54 (req 3): the ledger location resolves through src/ledger-path.ts
+// — one resolution shared by every reader/writer: an explicit PAYMENT_LOG_PATH
+// wins outright (absolute, no legacy read), otherwise the state-dir primary
+// (X402_STATE_DIR, default ~/.x402-agent-mcp) plus a read-only legacy
+// working-directory ledger when one exists. Captured once at module load,
+// mirroring the pre-#54 capture-at-load semantics.
+const LEDGER = resolveLedger();
+const LOG_PATH = LEDGER.primary;
 
 // Track daily spending in memory
 const dailySpentByChain = new Map<string, number>();
@@ -44,25 +53,36 @@ let rehydrated = false;
 function rehydrateFromLedger(): void {
   if (rehydrated) return;
   rehydrated = true; // set before any I/O — never double-read, even if read throws
-  if (!existsSync(LOG_PATH)) return;
-  try {
-    for (const line of readFileSync(LOG_PATH, "utf-8").split("\n")) {
-      try {
-        const entry = JSON.parse(line) as PaymentLogEntry;
-        if (
-          entry.status === "success" &&
-          entry.chain !== "casper" &&
-          typeof entry.chain === "string" &&
-          entry.timestamp.slice(0, 10) === dailyDate
-        ) {
-          dailySpentByChain.set(entry.chain, (dailySpentByChain.get(entry.chain) ?? 0) + (entry.amount_usdc ?? 0));
-        }
-      } catch {
-        // Corrupted ledger lines are skipped — logging is best-effort, so is reading it back
+  // Legacy first (read once, read-only), then the primary ledger — a
+  // pre-upgrade working-directory ledger must still count toward today's
+  // spend (an upgrade that dropped it would silently widen every cap that
+  // reads these totals).
+  for (const line of readLedgerLines(LEDGER.legacyReadOnly).concat(readLedgerLines(LOG_PATH))) {
+    try {
+      const entry = JSON.parse(line) as PaymentLogEntry;
+      if (
+        entry.status === "success" &&
+        entry.chain !== "casper" &&
+        typeof entry.chain === "string" &&
+        entry.timestamp.slice(0, 10) === dailyDate
+      ) {
+        dailySpentByChain.set(entry.chain, (dailySpentByChain.get(entry.chain) ?? 0) + (entry.amount_usdc ?? 0));
       }
+    } catch {
+      // Corrupted ledger lines are skipped — logging is best-effort, so is reading it back
     }
+  }
+}
+
+/** Split a ledger file into lines, best-effort: a missing/unreadable file is
+ * an empty ledger (the per-file error names the path). */
+function readLedgerLines(path: string | undefined): string[] {
+  if (!path || !existsSync(path)) return [];
+  try {
+    return readFileSync(path, "utf-8").split("\n");
   } catch (err) {
-    console.error(`[x402] Failed to rehydrate daily spend from ledger: ${err}`);
+    console.error(`[x402] Failed to read ledger ${path}: ${err}`);
+    return [];
   }
 }
 
@@ -102,6 +122,17 @@ export function checkSpendingLimit(amountUsdc: number): { allowed: boolean; reas
 
 export function logPayment(entry: PaymentLogEntry): void {
   resetDailyIfNewDay();
+  // Issue #54 (req 3): rehydrate BEFORE the first in-memory success-add, not
+  // after it. The one-shot ledger read must precede every in-memory row or a
+  // getDailySpent() that arrives late (e.g. a first call after a write) would
+  // merge the file's copy of rows that are already in memory — every restart
+  // parity and in-process/restart comparison then diverges (rehydration must
+  // read identical totals; the test catches it). Rehydrating in logPayment —
+  // the only in-memory writer — makes the merge order safe: the first write
+  // of a session always rehydrates an empty in-memory counter first. For
+  // settled rows the merge order is unchanged (checks already rehydrated
+  // before any payment leg in the real flow).
+  rehydrateFromLedger();
 
   if (entry.status === "success" && entry.chain !== "casper") {
     dailySpentByChain.set(entry.chain, (dailySpentByChain.get(entry.chain) ?? 0) + (entry.amount_usdc ?? 0));
@@ -109,6 +140,9 @@ export function logPayment(entry: PaymentLogEntry): void {
 
   try {
     const line = JSON.stringify(entry) + "\n";
+    // Issue #54: the state-dir ledger may live in a directory that does not
+    // exist yet — mkdir -p before the first append.
+    prepareLedgerDir(LOG_PATH);
     appendFileSync(LOG_PATH, line, { encoding: "utf-8" });
   } catch (err) {
     // Logging is best-effort — don't fail the payment if logging fails
