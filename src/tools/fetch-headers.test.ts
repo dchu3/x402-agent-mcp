@@ -134,10 +134,11 @@ it('an allowlisted header reaches the probe, the SDK-first request and the signe
 it('a header NOT on the allowlist is refused before any request (issue #64 req 2)', async () => {
   process.env.X402_EXTRA_HEADER_ALLOWLIST = 'x-client-id';
   const s = await seller();
+  const ledgerBefore = ledgerLines();
   const result = JSON.parse((await handler()({ url: s.url, headers: { 'x-session': MARKER } })).content[0].text);
   assert.equal(result.error, 'HEADER_REFUSED', `stable refusal code, got: ${JSON.stringify(result)}`);
   assert.equal(s.recorded.length, 0, 'no request may be made for a refused header');
-  assert.deepEqual(ledgerLines(), [], 'no payment attempt is recorded either');
+  assert.equal(ledgerLines().length, ledgerBefore.length, 'no new payment attempt is recorded either');
 });
 
 it('every hard-denied header is refused EVEN WHEN allowlisted (issue #64 req 3)', async () => {
