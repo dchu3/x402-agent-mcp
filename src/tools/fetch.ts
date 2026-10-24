@@ -1,8 +1,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { wrapFetchWithPayment, x402Client } from "@x402/fetch";
-import { ExactSvmScheme, toClientSvmSigner, SOLANA_MAINNET_CAIP2 } from "@x402/svm";
-import { ExactEvmScheme, toClientEvmSigner } from "@x402/evm";
+import { ExactSvmScheme, toClientSvmSigner, SOLANA_MAINNET_CAIP2, DEFAULT_ASSETS as SVM_DEFAULT_ASSETS } from "@x402/svm";
+import { ExactEvmScheme, toClientEvmSigner, DEFAULT_ASSETS as EVM_DEFAULT_ASSETS } from "@x402/evm";
 import { createKeyPairSignerFromBytes } from "@solana/kit";
 import bs58 from "bs58";
 import { privateKeyToAccount } from "viem/accounts";
@@ -13,7 +13,7 @@ import { CASPER_CHAIN, toCasperCaip2 } from "../casper/networks.js";
 import { caip2Of, isEvmNetwork, isUsdChain } from "../evm/networks.js";
 import { parseChainFromNetwork } from "./probe-utils.js";
 import { checkSpendingLimit, logPayment, getDailySpent, getMaxPerCall, getMaxDailySpend } from "../payment-utils.js";
-import { getPolicyEngine, buildPolicyContext, livenessVerdictForUrl } from "../policy/config.js";
+import { getPolicyEngine, buildPolicyContext, livenessVerdictForUrl, loadPolicyConfig } from "../policy/config.js";
 import { getPerServiceSpent, recordServicePayment } from "../policy/budget-store.js";
 // Issue #54 (req 1): the reserve-before-sign registry — overlapping calls
 // cannot each pass the same remaining budget while one is still being paid.
@@ -37,6 +37,14 @@ import { untrustedText, stripUntrusted, PROBE_UNTRUSTED_MAX, CHALLENGE_UNTRUSTED
 import { usdFromAtomic, sellerReportedCostUsd, parseBoundedBody } from "./accounting.js";
 import { createFromOffer, intentManager } from "../payment-intent/manager.js";
 import { executeGuarded } from "../payment-intent/executor.js";
+// Issue #61: deterministic offer selection — the payable offer is chosen by
+// integer atomic ranking over ALL accepts (never simply accepts[0]).
+import { DEFAULT_CHAIN_ORDER, selectOffer, type OfferCandidate, type RejectedOffer } from "./offer-selection.js";
+// Issue #55: the challenge-scope boundary — the contract an offer/challenge
+// must satisfy before the intent binds it (config from env + call-site keys;
+// scopeOf itself reads no env and no clock).
+// Issue #55: the challenge scope's bound values, bound into the intent.
+import { BoundScope, configFromEnv, scopeOf, type ScopeRefusalCode } from "../payment-intent/challenge-scope.js";
 import type { IntentRejectCode, PaymentIntent } from "../payment-intent/types.js";
 
 /** Structured policy refusal — keeps the pre-policy error shape keys verbatim
@@ -45,6 +53,49 @@ import type { IntentRejectCode, PaymentIntent } from "../payment-intent/types.js
  * machine-readable codes, never message-only). Reasons pass through verbatim,
  * including their optional detail payload (issue #30: PRICE_ANOMALY carries
  * the z-score / fallback ratio plus baseline stats there for the audit log). */
+
+// Issue #55: the one call-site extra key the fetch seam feeds the SDK —
+// extra.recentBlockhash is the payload block hint the SVM signing code
+// consumes (its VALUE is never bound; the scope boundary shape-checks it).
+const RECENT_BLOCKHASH_KEY = "recentBlockhash";
+
+/** The challenge-scope configuration: the operator's X402_* values plus the
+ * fetch seam's call-site additions. Read once per tool call. */
+function envChallengeScopeConfig() {
+  return configFromEnv(process.env, { extraAllowedKeys: [RECENT_BLOCKHASH_KEY] });
+}
+
+/** Fixed messages for the scope refusal codes (issue #63: our text only). */
+function scopeRefusalMessage(code: ScopeRefusalCode): string {
+  switch (code) {
+    case "EXTENSION_NOT_ALLOWED": return "the challenge advertises an extension outside the allowed set";
+    case "TRANSFER_METHOD_NOT_ALLOWED": return "the challenge's transfer method or extra vocabulary is outside the allowed set";
+    case "VALIDITY_WINDOW_INVALID": return "the challenge's validity window is not a finite positive number";
+    case "VALIDITY_WINDOW_TOO_LONG": return "the challenge's validity window exceeds the configured cap";
+    case "FEE_PAYER_REFUSED": return "the challenge's fee payer is refused (self, unlisted or malformed)";
+    case "MEMO_INVALID": return "the challenge's memo is not printable ASCII within the byte cap";
+    case "BLOCK_HINT_INVALID": return "the challenge's block hint is malformed";
+  }
+}
+
+/** The SDK's own default-asset universe across both default tables — the
+ * same set the SDK's spend controls accept, so the selector's asset filter
+ * matches the signing gate's behavior exactly (no new asset is introduced). */
+function sdkDefaultAssetIds(): string[] {
+  const ids = new Set<string>();
+  for (const table of [EVM_DEFAULT_ASSETS, SVM_DEFAULT_ASSETS]) {
+    for (const entries of Object.values(table as Record<string, unknown>)) {
+      if (!Array.isArray(entries)) continue;
+      for (const entry of entries) {
+        if (entry && typeof entry === "object" && typeof (entry as any).asset === "string" && (entry as any).asset !== "") {
+          ids.add((entry as { asset: string }).asset);
+        }
+      }
+    }
+  }
+  return [...ids];
+}
+
 function policyRefusal(
   result: ReturnType<ReturnType<typeof getPolicyEngine>["evaluate"]>,
   url: string,
@@ -174,6 +225,15 @@ export function registerFetchTool(server: McpServer): void {
       let probedOffer: { scheme?: string; network?: string; asset?: string; amount?: string; payTo?: string } | undefined;
       let casperIntent: PaymentIntent | null = null;
       let casperBlockedCode: IntentRejectCode | undefined;
+      // Issue #61: the deterministically chosen payable offer (when one
+      // exists), the fixed-vocabulary rejection records for the losing
+      // offers, and the challenge pieces the scope boundary (issue #55)
+      // needs at the binding seam. All stay undefined on the legacy
+      // fallback paths, which keep today's exact behavior.
+      let selectedOffer: OfferCandidate | undefined;
+      let offerRefusals: RejectedOffer[] = [];
+      let chosenAcceptRaw: unknown;
+      let challengeExtensions: unknown;
 
       // Forced-chain fix (#25): a forced USD chain (solana or any EVM alias —
       // issue #32 adds polygon/arbitrum, so a forced Polygon call must
@@ -241,6 +301,56 @@ export function registerFetchTool(server: McpServer): void {
               probedAmountUsdc = Number(firstAccept.amount) / 1e6;
             }
 
+            // Issue #61: deterministic offer selection across ALL accepts.
+            // The chosen offer is the cheapest payable one: a key on its
+            // chain, on the policy network/asset allowlists (the SAME config
+            // load the Step 3.5 gate reads — read-only; never widened), and
+            // the same policy gate, evaluated per candidate here. A forced
+            // chain constrains the selection to the caller's chain (the
+            // caller's chain is never replaced). Everything below reads the
+            // same single probe observation; nothing seller-visible widened.
+            // On NO_PAYABLE_OFFER the flow falls back to accepts[0] exactly
+            // as the pre-#61 flow did (the unpayable offers stay unpayable).
+            if (Array.isArray(accepts) && useChain !== CASPER_CHAIN) {
+              const policyState = loadPolicyConfig();
+              const selection = selectOffer({
+                accepts,
+                keysLoaded: { solana: !!solanaKey, evm: !!evmKey },
+                allowedNetworks: forcedChain
+                  ? [useChain]
+                  : policyState.configErrors.length > 0
+                    ? []
+                    : policyState.config.networks.allowed,
+                allowedAssets: sdkDefaultAssetIds(),
+                policyFor: (c) => {
+                  const evaluation = getPolicyEngine().evaluate(
+                    buildPolicyContext(url, c.chain, "USDC", c.usd, { recipient: c.payTo }),
+                    { dailySpentUsd: getDailySpent(), perServiceSpentUsd: getPerServiceSpent(serviceHost) + reservedUsd(`service:${serviceHost}`) },
+                    getAnomalyInputs(url),
+                  );
+                  return evaluation.decision === "ALLOW" ? "ALLOW" : "REFUSE";
+                },
+                chainOrder: DEFAULT_CHAIN_ORDER,
+              });
+              offerRefusals = selection.rejected;
+              if (selection.ok) {
+                selectedOffer = selection.chosen;
+                chosenAcceptRaw = (accepts as unknown[])[selection.chosen.index];
+                challengeExtensions = paymentInfo.extensions;
+                // The chain detection, the Step 3.5 gate, the spending-limit
+                // check and the intent creation all read these — the chosen
+                // offer is the single probe observation, no new request.
+                probedOffer = {
+                  scheme: selection.chosen.scheme,
+                  network: selection.chosen.network,
+                  asset: selection.chosen.asset,
+                  amount: selection.chosen.amountAtomic,
+                  payTo: selection.chosen.payTo,
+                };
+                probedAmountUsdc = selection.chosen.usd;
+              }
+            }
+
             if (useChain === CASPER_CHAIN || forcedChain) {
               // Forced Casper still probes and validates a real offer below;
               // forced USD chains keep the caller's chain — the probe only
@@ -249,8 +359,11 @@ export function registerFetchTool(server: McpServer): void {
               // Issue #32: chain detection resolves the offer's REAL CAIP-2 id
               // through the shared vocabulary (parseChainFromNetwork →
               // src/evm/networks.ts) — never the pre-#32 substring collapse
-              // that mapped every eip155:* onto base.
-              const detected = parseChainFromNetwork(network);
+              // that mapped every eip155:* onto base. Issue #61: when a
+              // payable offer was chosen, the detection reads the CHOSEN
+              // offer's network (probedOffer points at it); otherwise this is
+              // accepts[0] exactly as the pre-#61 flow detected.
+              const detected = parseChainFromNetwork(probedOffer?.network || network);
               if (detected !== "" && (isUsdChain(detected) || detected === CASPER_CHAIN)) {
                 useChain = detected;
               } else {
@@ -417,12 +530,16 @@ export function registerFetchTool(server: McpServer): void {
       // Step 3: Create x402 client with the right scheme
       try {
         const client = new x402Client();
+        // Issue #55: our own payer address, for the scope boundary's fee-payer
+        // rule (the agent never pays fee to itself unless the operator opted in).
+        let payerAddress: string | undefined;
 
         if (useChain === "solana") {
           const secretKeyBytes = bs58.decode(solanaKey!);
           const keypairSigner = await createKeyPairSignerFromBytes(secretKeyBytes);
           const svmSigner = toClientSvmSigner(keypairSigner);
           const scheme = new ExactSvmScheme(svmSigner, { rpcUrl: solanaRpc });
+          payerAddress = keypairSigner.address;
           client.register(SOLANA_MAINNET_CAIP2 as `${string}:${string}`, scheme);
 
         } else {
@@ -434,6 +551,7 @@ export function registerFetchTool(server: McpServer): void {
           // fail-closed toward the local EIP-3009 signing path, which needs no
           // RPC (a per-chain RPC matrix is explicitly out of scope in #32).
           const scheme = new ExactEvmScheme(evmSigner, { 8453: { rpcUrl: baseRpc } });
+          payerAddress = account.address;
           // Issue #32 (R4): register the CAIP-2 of the chain policy approved.
           // useChain is auto-detected FROM the offer (auto-detect path) or
           // caller-forced (forced path), so caip2Of(useChain) IS the offer's
@@ -474,6 +592,57 @@ export function registerFetchTool(server: McpServer): void {
           return policyRefusal(policyResult, url, useChain, amountUsdc);
         }
 
+        // Issue #55: the challenge-scope boundary runs at the binding seam —
+        // the CHOSEN offer (the one about to be signed) must satisfy the
+        // scope before the intent binds it; a refused challenge never reaches
+        // an intent or a signing client, and the flow refuses (fail closed —
+        // never clamped, never defaulted). Legacy offers (no chosen offer:
+        // unpayable/unbindable probes) are never signed, so the boundary not
+        // engaging there changes nothing.
+        let scope: BoundScope | undefined;
+        if (selectedOffer) {
+          const rawAccept = (chosenAcceptRaw ?? {}) as Record<string, unknown>;
+          const extensionObj = (value: unknown): Record<string, unknown> | undefined =>
+            value !== undefined && value !== null && typeof value === "object" && !Array.isArray(value)
+              ? value as Record<string, unknown>
+              : undefined;
+          const scopeAccept = {
+            ...rawAccept,
+            extensions: {
+              ...(extensionObj(rawAccept.extensions) ?? {}),
+              ...(extensionObj(challengeExtensions) ?? {}),
+            },
+          };
+          const scopeResult = scopeOf(scopeAccept, {
+            payerAddress,
+            // X402_* scope configuration + the one call-site key the fetch
+            // seam feeds the SDK (extra.recentBlockhash is the payload block
+            // hint the SVM signing code consumes; its VALUE is never bound).
+            config: envChallengeScopeConfig(),
+          });
+          if (scopeResult.ok === false) {
+            // Fixed error code and fixed message (issue #63): the offending
+            // field label (which can be seller text, e.g. an extension key)
+            // goes to the local debug log only.
+            console.error(
+              `[x402_fetch] challenge-scope refusal ${scopeResult.code} (${scopeResult.field}) for ${stripUntrusted(scopeResult.field, 200)}`,
+            );
+            return {
+              content: [{
+                type: "text" as const,
+                text: JSON.stringify({
+                  error: `Challenge refused by the signing-scope boundary (${scopeResult.code})`,
+                  url,
+                  chain: useChain,
+                  estimated_cost_usdc: amountUsdc,
+                  reasons: [{ code: scopeResult.code, message: scopeRefusalMessage(scopeResult.code) }],
+                }),
+              }],
+            };
+          }
+          scope = scopeResult.scope;
+        }
+
         // Issue #25: bind exactly what policy evaluated to a payment intent.
         // An offer that cannot be bound can never be PAID: the paid fetch
         // continues with a blocking hook (INTENT_UNAUTHORISED) so endpoints
@@ -494,6 +663,17 @@ export function registerFetchTool(server: McpServer): void {
             network: probedOffer.network ?? "",
             scheme: probedOffer.scheme ?? "",
             amountUsdEstimate: amountUsdc,
+            // Issue #55: bind the challenge scope whenever it was computed
+          // (the chosen offer); absent stays legacy so the comparator skips
+          // the new checks exactly as before #55.
+            ...(scope === undefined ? {} : {
+              maxTimeoutSeconds: scope.maxTimeoutSeconds,
+              extensionKeys: scope.extensionKeys,
+              ...(scope.evmDomainName === undefined ? {} : { evmDomainName: scope.evmDomainName }),
+              ...(scope.evmDomainVersion === undefined ? {} : { evmDomainVersion: scope.evmDomainVersion }),
+              ...(scope.solanaFeePayer === undefined ? {} : { solanaFeePayer: scope.solanaFeePayer }),
+              ...(scope.memo === undefined ? {} : { memo: scope.memo }),
+            }),
           });
           if (intentResult.ok === true) intent = intentResult.intent;
           else blockedCode = intentResult.code;
@@ -745,6 +925,25 @@ export function registerFetchTool(server: McpServer): void {
                 chain: useChain,
                 paid: resp.status === 200,
                 cost_usdc: recordedAmountUsdc,
+                // Issue #61: the deterministic selection is part of the
+                // output — what was paid (our vocabulary chain, the
+                // validated digits, and a stripped network id), so the
+                // agent sees exactly which advertised offer the flow paid.
+                ...(selectedOffer === undefined ? {} : {
+                  selected_offer: {
+                    chain: selectedOffer.chain,
+                    network: stripUntrusted(selectedOffer.network, 64),
+                    amount_atomic: selectedOffer.amountAtomic,
+                    amount_usdc: selectedOffer.usd,
+                  },
+                }),
+                ...(offerRefusals.length === 0 ? {} : {
+                  offer_refusals: offerRefusals.map((r) => ({
+                    index: r.index,
+                    chain: stripUntrusted(r.chain, 64),
+                    reject: r.reject,
+                  })),
+                }),
                 ...(sellerReportedCost !== undefined ? { seller_reported_cost: sellerReportedCost } : {}),
                 daily_spent_usdc: parseFloat(getDailySpent().toFixed(4)),
                 payment_receipt: paymentReceipt,

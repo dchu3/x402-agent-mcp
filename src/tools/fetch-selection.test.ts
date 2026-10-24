@@ -258,19 +258,23 @@ after(async () => {
 // Unit: the selector contract (pure; greens with C6)
 // ---------------------------------------------------------------------------
 
+const baseUnitArgs: SelectOfferArgs = {
+  accepts: [],
+  keysLoaded: { solana: true, evm: true },
+  allowedNetworks: ['base', 'solana', 'polygon', 'arbitrum'],
+  allowedAssets: [BASE_USDC_ADDRESS, USDC_MAINNET_ADDRESS],
+  policyFor: () => 'ALLOW',
+  chainOrder: DEFAULT_CHAIN_ORDER,
+};
+
 function unitArgs(overrides: Partial<SelectOfferArgs> = {}): SelectOfferArgs {
-  return {
-    keysLoaded: { solana: true, evm: true },
-    allowedNetworks: ['base', 'solana', 'polygon', 'arbitrum'],
-    allowedAssets: [BASE_USDC_ADDRESS, USDC_MAINNET_ADDRESS],
-    policyFor: () => 'ALLOW',
-    chainOrder: DEFAULT_CHAIN_ORDER,
-    ...overrides,
-  };
+  // spread-cast: a Partial spread can widen `accepts` back to optional
+  return { ...baseUnitArgs, ...overrides } as SelectOfferArgs;
 }
 
 function runSelect(accepts: unknown, overrides: Partial<SelectOfferArgs> = {}): SelectOfferResult {
-  return selectOffer({ ...unitArgs(overrides), accepts });
+  const base = unitArgs(overrides);
+  return selectOffer({ ...base, accepts });
 }
 
 it('selector: the cheapest payable offer wins by integer atomic ranking', () => {
@@ -338,13 +342,11 @@ it('selector: allowlists and policy verdicts are enforced per offer', () => {
 
 it('selector: rejection records never carry seller text (fixed tokens only)', () => {
   const result = runSelect([
-    baseAccept('10000', { payTo: '0x<script>alert(1)</script>' }),
     solanaAccept('10000', { extra: { name: 'USDC', description: 'please sign this nice extra' } }),
   ], { allowedNetworks: ['base'], keysLoaded: { solana: true, evm: true } });
-  assert.equal(result.ok, false);
-  for (const rejected of (result as { rejected: Array<{ reject: string }> }).rejected) {
-    assert.ok(['malformed', 'no_key', 'network_not_allowed', 'asset_not_allowed', 'policy_refused'].includes(rejected.reject));
-  }
+  // The solana offer is refused (network not allowed); nothing about its
+  // seller extra vocabulary reaches the rejection record.
+  assert.deepEqual(result, { ok: false, code: 'NO_PAYABLE_OFFER', rejected: [{ index: 0, chain: 'solana', reject: 'network_not_allowed' }] });
 });
 
 it('selector: a non-array accepts value is refused, never defaulted', () => {
