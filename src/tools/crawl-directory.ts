@@ -2,6 +2,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { addToDirectory } from "../directory.js";
 import { guardedFetch } from "../transport/guard.js";
+// Issue #63: scraped seller free text is stored stripped + capped.
+import { stripUntrusted, CRAWL_UNTRUSTED_MAX } from "../transport/untrusted.js";
 import { fetchJson, findPaymentChallenge, isX402Manifest, chainsFromManifest } from "./probe-utils.js";
 // Issue #58: the scraper's own fetch goes through the one shared transport
 // guard, and every host probed below is probed through the guarded shared
@@ -70,15 +72,16 @@ async function probeUrl(baseUrl: string): Promise<CrawledService | null> {
     let name = baseUrl.replace(/^https?:\/\//, "").split("/")[0].replace(/^www\./, "").split(".")[0];
     let description = "";
     let chains: string[] = [];
-
     // 1. /.well-known/x402 — must parse as JSON AND look like an x402 manifest.
     //    An HTML catch-all 200 (SPA host) or junk body is not x402 support.
     const x402Data = await fetchJson(`${baseUrl}/.well-known/x402`, 8000);
     let x402Enabled = x402Data !== null && isX402Manifest(x402Data);
     if (x402Enabled) {
       chains = chainsFromManifest(x402Data);
-      name = x402Data.service || x402Data.name || name;
-      description = x402Data.description || "";
+      // Issue #63 (req 2): scraped seller text is stored stripped + capped —
+      // controls/ANSI gone, length bounded before it ever reaches a directory.
+      name = stripUntrusted(x402Data.service || x402Data.name || name, 200);
+      description = stripUntrusted(x402Data.description || "", CRAWL_UNTRUSTED_MAX);
     }
 
     // 2. 402 PAYMENT-REQUIRED challenge fallback (root, then openapi.json GET
@@ -94,11 +97,11 @@ async function probeUrl(baseUrl: string): Promise<CrawledService | null> {
     const catalog = await fetchJson(`${baseUrl}/.well-known/ai-catalog.json`, 8000);
     if (catalog !== null) {
       if (catalog.entries && catalog.entries[0]) {
-        name = catalog.entries[0].displayName || catalog.host?.displayName || name;
-        description = description || catalog.entries[0].description || "";
+        name = stripUntrusted(catalog.entries[0].displayName || catalog.host?.displayName || name, 200);
+        description = description || stripUntrusted(catalog.entries[0].description || "", CRAWL_UNTRUSTED_MAX) || "";
       } else if (catalog.name) {
-        name = catalog.name;
-        description = description || catalog.description || "";
+        name = stripUntrusted(catalog.name, 200);
+        description = description || stripUntrusted(catalog.description || "", CRAWL_UNTRUSTED_MAX) || "";
       }
       if (!x402Enabled) {
         x402Enabled = true; // has ai-catalog, likely x402

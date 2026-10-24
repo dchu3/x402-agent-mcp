@@ -65,20 +65,23 @@ function bindableBaseChallenge(requestUrl: string): Response {
   return new Response('Payment Required', { status: 402, headers: { 'payment-required': b64url(payload) } });
 }
 
-/** Assert a marker appears ONLY under the untrusted subtree of an output
- * object: strip every untrusted field, then check the remainder (and the
- * serialised form) for the marker. */
-function assertMarkerOnlyUnderUntrusted(parsed: any, marker: string, context: string): void {
-  const clone = JSON.parse(JSON.stringify(parsed));
-  delete clone.untrusted;
-  const rest = JSON.stringify(clone);
-  assert.ok(!rest.includes(marker), `${context}: the marker must not appear outside the untrusted fields — got: ${rest.slice(0, 400)}`);
-  // and it must appear SOMEWHERE inside untrusted (i.e. data was preserved there)
-  const outer = JSON.stringify(parsed);
-  if (outer.includes(marker)) {
-    assert.ok(parsed.untrusted !== undefined && JSON.stringify(parsed.untrusted).includes(marker),
-      `${context}: when present at all, the marker may only live in untrusted fields`);
+/** Assert a marker appears ONLY under untrusted subtrees of an output object:
+ * strip every nested `untrusted` field, then check the remainder for the
+ * marker. */
+function stripUntrustedDeep(o: unknown): unknown {
+  if (Array.isArray(o)) return o.map(stripUntrustedDeep);
+  if (o && typeof o === "object") {
+    const clone: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(o as Record<string, unknown>)) {
+      if (k !== "untrusted") clone[k] = stripUntrustedDeep(v);
+    }
+    return clone;
   }
+  return o;
+}
+function assertMarkerOnlyUnderUntrusted(parsed: unknown, marker: string, context: string): void {
+  const rest = JSON.stringify(stripUntrustedDeep(parsed));
+  assert.ok(!rest.includes(marker), `${context}: the marker must not appear outside the untrusted fields — got: ${rest.slice(0, 400)}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -93,7 +96,7 @@ it('a free (non-402) response body with instructions, ANSI escapes and control c
   assert.ok(body, 'the seller body lives under untrusted.body');
   assert.ok(!/\u0000-\u001f\u007f\u0080-\u009f/.test(body.text), 'control characters (C0/C1) are stripped');
   assert.ok(!/\x1b/.test(body.text), 'ANSI escape sequences are stripped');
-  assert.ok(!/[\u0000-\u001f\u007f]/.test(body.text), 'no C0 controls remain');
+  assert.ok(!/[\u0000-\u0008\u000b-\u001f\u007f]/.test(body.text), 'no C0 controls remain (tab/newline kept)');
   assert.ok(body.text.includes(INSTRUCTIONS), 'the instruction-like TEXT is still present — as data');
   assert.equal(body.truncated, false);
   assert.ok(typeof body.original_bytes === 'number' && body.original_bytes > 0, 'original_bytes records the pre-strip size');
@@ -190,7 +193,7 @@ it('a scraped directory description with instruction-like text is returned by x4
   assert.ok(row, 'the row is emitted');
   assert.equal(row.description, undefined, 'the directory description no longer sits on the row');
   assert.ok(row.untrusted?.description, 'it moved to untrusted.description');
-  assert.ok(!/[\u0000-\u001f\u007f]/.test(row.untrusted.description.text), 'controls are stripped');
+  assert.ok(!/[\u0000-\u0008\u000b-\u001f\u007f]/.test(row.untrusted.description.text), 'controls are stripped (tab/newline kept)');
   assert.ok(row.untrusted.description.text.includes(INSTRUCTIONS), 'the text is preserved as data');
   assert.ok(row.source === 'discovery', 'crawled rows are labelled with their origin');
   assertMarkerOnlyUnderUntrusted(parsed, MARKER, 'search rows');
