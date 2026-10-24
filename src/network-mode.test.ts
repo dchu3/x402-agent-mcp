@@ -273,6 +273,7 @@ it('mode gate: a key loaded + X402_NETWORK_MODE unset refuses before probing; a 
   const parsed2 = JSON.parse(result2.content[0].text);
   assert.match(parsed2.error as string, /NETWORK_NOT_CONFIGURED/, 'an invalid mode value refuses too');
   assert.equal(recorded.filter(() => true).length, 0, 'still zero probes');
+  assert.equal(parsed2.network_mode, undefined, 'a mode-less run adds NOTHING to any result (free immunity — req 8)');
 
   // Free-tool immunity (option A): the same server with keys loaded and no
   // mode still runs the free tools.
@@ -302,6 +303,10 @@ it('mainnet mode refuses a DEVNET offer before signing (same asset id, different
     `the refusal is the FLOW's mode boundary, not an SDK crash (got: ${parsed.error})`,
   );
   assert.ok(parsed.status === undefined, 'no signed HTTP response: the leg never ran');
+  // Issue #59 (req 4 + req 8): the refusal reports the mode + the off-mode
+  // offer's exact network at the top level.
+  assert.equal(parsed.network_mode, 'mainnet');
+  assert.equal(parsed.network, SOLANA_DEVNET_CAIP2, `the off-mode offer's network is visible (got: ${JSON.stringify(parsed)})`);
   assert.ok(recorded.every(noPaymentHeaders), 'zero payment headers ever left');
   assert.ok(recorded.every((r) => r.url === new URL(url).pathname), 'only the seller endpoint was touched — no other-host request ever (the mock throws on the mainnet RPC, which would fail the leg)');
   const settled = ledgerLines().some((e) => e.status === 'success' && e.chain === 'solana' && e.amount_usdc === 0.001);
@@ -399,6 +404,10 @@ it('devnet mode pays the devnet ping against the mock: a devnet ledger row, an u
     const parsed = JSON.parse(result.content[0].text);
     assert.equal(parsed.status, 200, `devnet mode + a devnet offer pays against the mock (got: ${parsed.error ?? 'ok'})`);
     assert.equal(parsed.paid, true);
+    // Issue #59 (req 8): the visibility fields — the run's mode and the leg's
+    // network on EVERY result, including the paid one.
+    assert.equal(parsed.network_mode, 'devnet');
+    assert.equal(parsed.network, SOLANA_DEVNET_CAIP2, `the paid result's top-level network (got: ${JSON.stringify(parsed)})`);
     assert.equal(parsed.selected_offer.network, SOLANA_DEVNET_CAIP2, 'the selected offer is the devnet offer');
     assert.equal(parsed.selected_offer.amount_usdc, 0.001, 'priced through the SHIPPED devnet table entry (the measured $0.001 ping)');
     assert.ok(recorded.some((r) => !noPaymentHeaders(r)), 'a signed paid leg happened');
@@ -439,6 +448,37 @@ it('mainnet mode ignores SOLANA_DEVNET_RPC_URL: the mainnet RPC stays the scheme
   const parsed = JSON.parse(result.content[0].text);
   assert.equal(parsed.status, 200, `the mainnet leg pays using the MAINNET RPC (got: ${parsed.error ?? 'ok'})`);
   assert.ok(recorded.some((r) => !noPaymentHeaders(r)), 'a signed leg happened');
+});
+
+// Issue #59/#62 (C9): the visibility surface — check_payment shows the mode
+// + the asset-table summary + the mode match; the startup log's summary is
+// the same pure helper.
+it('visibility (C9): check_payment carries the mode, the asset-table summary and the mode_match; the summary helper is pure', async () => {
+  const ASSETS = (await import('./assets.js')) as typeof import('./assets.js');
+  const summary = ASSETS.assetTableSummary();
+  assert.ok(summary.table_entries >= 6, 'the shipped table’s entry count');
+  assert.ok(summary.networks.includes(SOLANA_MAINNET_CAIP2) && summary.networks.includes(SOLANA_DEVNET_CAIP2), 'both solana networks are in the summary');
+
+  process.env.X402_NETWORK_MODE = 'mainnet';
+  installMock();
+  let checkCallback: any;
+  const { registerCheckPaymentTool } = (await import('./tools/check-payment.js')) as typeof import('./tools/check-payment.js');
+  registerCheckPaymentTool({ tool: (_n: unknown, _d: unknown, _s: unknown, fn: unknown) => { checkCallback = fn; } } as any);
+  const result = await checkCallback({ url: 'https://example.invalid/api', chain: 'solana', token: 'USDC', network: SOLANA_DEVNET_CAIP2 });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.network_mode, 'mainnet', 'the run’s explicit mode is visible');
+  assert.equal(parsed.network, SOLANA_DEVNET_CAIP2, 'the checked network echoes verbatim');
+  assert.equal(parsed.network_mode_match, false, 'the checked network does NOT match mainnet mode — visible BEFORE calling x402_fetch');
+  assert.ok(parsed.asset_table, 'the asset-table summary is present');
+  assert.ok(parsed.asset_table.networks.includes(SOLANA_DEVNET_CAIP2), 'the summary names the devnet network (the devnet surface is visible)');
+  assert.ok(typeof parsed.asset_table.operator_extensions === 'number', 'the operator’s extension count is visible');
+
+  // The unset-with-key condition surfaces on the free tool too.
+  delete process.env.X402_NETWORK_MODE;
+  const result2 = await checkCallback({ url: 'https://example.invalid/api', chain: 'solana', token: 'USDC' });
+  const parsed2 = JSON.parse(result2.content[0].text);
+  assert.equal(parsed2.network_mode, null, 'no mode → null, never a guess');
+  assert.match(parsed2.network_mode_error ?? '', /Networking?_NOT_CONFIGURED|X402_NETWORK_MODE/, `the unset condition surfaces with the same message the paid gate refuses with (got: ${parsed2.network_mode_error})`);
 });
 
 // ---------------------------------------------------------------------------

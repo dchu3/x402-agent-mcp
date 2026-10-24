@@ -43,6 +43,12 @@ import { normalizeCaip2Evm } from "./evm/networks.js";
 import type { OperatorAssetEntry } from "./policy/types.js";
 import { usdFromAtomic } from "./tools/accounting.js";
 
+/** Issue #62/#59 visibility (C9): the summary the startup log and
+ * x402_check_payment render. Pure: no env reads, no I/O. */
+export function assetTableSummary(): { table_entries: number; networks: string[] } {
+  return { table_entries: ASSET_TABLE.length, networks: [...new Set(ASSET_TABLE.map((e) => e.network))] };
+}
+
 /** Refusal codes of the asset table. Stable contract (issue #62 req 5):
  * ASSET_NOT_LISTED — the asset id has no entry for this network (the asset
  * gate refuses BEFORE the challenge scope, the intent binding and any signing);

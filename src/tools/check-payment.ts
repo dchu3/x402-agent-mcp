@@ -18,11 +18,14 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { advertisedPriceUsd, loadDirectory } from "../directory.js";
-import { getPolicyEngine, buildPolicyContext } from "../policy/config.js";
+import { getPolicyEngine, buildPolicyContext, loadPolicyConfig } from "../policy/config.js";
 import { normalizeRecipient } from "../policy/recipient.js";
 import { getDailySpent } from "../payment-utils.js";
 import { getPerServiceSpent } from "../policy/budget-store.js";
 import { getAnomalyInputs } from "../policy/anomaly-store.js";
+// Issue #59/#62 (C9 visibility): the run's explicit mode + the asset table.
+import { modeAllowsNetwork, resolveNetworkMode } from "../networks.js";
+import { assetTableSummary } from "../assets.js";
 
 /** Directory entry for a hostname, or null. Case-insensitive hostname match —
  * the same rule resolveTrustLevel uses for DISCOVERED classification. */
@@ -50,6 +53,7 @@ export function registerCheckPaymentTool(server: McpServer): void {
       amount: z.number().optional().describe("Prospective payment amount in USD (e.g. from the 402 challenge). Omit to check chain/token/service rules with the directory price when known."),
       chain: z.enum(["base", "solana", "casper", "polygon", "arbitrum"]).optional().describe("Payment chain: 'base', 'polygon', 'arbitrum', 'solana' or 'casper'. Defaults to the directory entry's chain, else 'base'."),
       token: z.string().optional().describe("Payment token, e.g. 'USDC' or 'wCSPR'. Defaults to 'USDC'."),
+      network: z.string().optional().describe("The EXACT CAIP-2 network id of the prospective offer (e.g. 'eip155:8453', 'solana:5eykt4Us...') — checked against the run's X402_NETWORK_MODE (issue #59); omitted = no mode/network check."),
       recipient: z.string().optional().describe("The recipient address that would be paid (payTo from the 402 challenge). Required to evaluate recipient allowlist mode; compared against the recorded baseline in change-detect mode."),
     },
     async (args) => {
@@ -96,12 +100,36 @@ export function registerCheckPaymentTool(server: McpServer): void {
         ? { recipient: args.recipient, recipient_normalized: normalizeRecipient(chain, args.recipient) ?? null }
         : {};
 
+      // Issue #62/#59 (C9): the run's EXPLICIT network mode — when it is
+      // unset over a loaded key the paid tool refuses, so this tool surfaces
+      // the same condition with the stable code's message.
+      const modeState = resolveNetworkMode();
+      const modeStateError = modeState.error;
+
       const output = {
         decision: result.decision,
         service: ctx.service,
         amount: amountUsd.toFixed(2),
         currency: token,
         chain,
+        // Issue #59 (C9 visibility): the run's EXPLICIT network mode — when it
+        // is unset over a loaded key the paid tool refuses, so this tool
+        // surfaces the same condition with the stable code's message.
+        network_mode: modeState.mode ?? null,
+        ...(modeStateError ? { network_mode_error: modeStateError } : {}),
+        // Issue #62/#59 (C9): the asset table's summary — what IS listed (the
+        // shipped entries + the operator's assets.extensions), so an agent
+        // can see which assets may pay before probing any seller.
+        asset_table: {
+          ...assetTableSummary(),
+          operator_extensions: loadPolicyConfig().config.assets.extensions.length,
+        },
+        ...(args.network !== undefined ? {
+          network: args.network,
+          ...(modeState.mode !== undefined
+            ? { network_mode_match: modeAllowsNetwork(modeState.mode, args.network) }
+            : {}),
+        } : {}),
         ...recipientEcho,
         trust_level: result.limits.trustLevel,
         // Issue #34: echo the endpoint liveness verdict the gate saw (rule

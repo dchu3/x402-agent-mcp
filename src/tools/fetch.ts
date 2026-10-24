@@ -177,6 +177,35 @@ function intentRefusal(
   };
 }
 
+/** The tool-callback result's shape this module builds (single exit wrapper). */
+interface ToolResult { content: Array<{ type: "text"; text: string; [key: string]: unknown }>; [key: string]: unknown }
+
+// Issue #59 (req 8 — visibility): EVERY x402_fetch result carries the run's
+// `network_mode` (when the mode is explicit) and, when the flow observed a
+// leg network (the exact CAIP-2 the offer/the casper accept named), the
+// `network` field. The overlay parses the result's JSON once at the
+// handler's single exit; results without a JSON body pass through untouched;
+// a mode-less run (no keys) adds NOTHING (free behavior — immunity).
+// Generic over the result type: the SDK's inferred shape flows through.
+function overlayVisibility<T extends { content?: Array<{ type?: unknown; text?: unknown }> }>(
+  result: T,
+  mode: NetworkMode | undefined,
+  network: string | undefined,
+): T {
+  try {
+    const first = result.content?.[0];
+    if (!first || first.type !== "text" || typeof first.text !== "string" || first.text === "") return result;
+    const parsed = JSON.parse(first.text) as Record<string, unknown>;
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return result;
+    if (mode !== undefined && parsed.network_mode === undefined) parsed.network_mode = mode;
+    if (network !== undefined && network !== "" && parsed.network === undefined) parsed.network = network;
+    first.text = JSON.stringify(parsed);
+    return result;
+  } catch {
+    return result; // never invent, never crash the visibility layer
+  }
+}
+
 /** Parse an SDK abort marker out of a payment failure (`Failed to create
  * payment payload: Payment creation aborted: INTENT_<CODE>[:<field>]`). The
  * raw SDK string is never returned as the whole message — it is attached as a
@@ -206,6 +235,11 @@ export function registerFetchTool(server: McpServer): void {
       chain: z.enum(["base", "solana", "casper", "polygon", "arbitrum"]).optional().describe("Force chain: 'base', 'polygon', 'arbitrum', 'solana' or 'casper'. Auto-detected if omitted."),
     },
         async (args) => {
+      // Issue #59 (req 8): the exact network the flow observed — set at the
+      // SEAM (the selected/casper-leg network) and carried into the overlay.
+      const observed: { network?: string } = {};
+      const observeNetwork = (n: string | undefined): void => { if (n && observed.network === undefined) observed.network = stripUntrusted(n, 64); };
+      const runResult: ToolResult = await (async (): Promise<ToolResult> => {
       const url = args.url;
       const method = (args.method || "GET").toUpperCase();
 
@@ -522,6 +556,13 @@ export function registerFetchTool(server: McpServer): void {
               }
             }
 
+            // Issue #59 (req 8): record the network the flow observed — the
+            // SEAM (mode boundary + asset boundary) and everything downstream
+            // (refusals, the paid result) report it; the check_payment tool
+            // and the startup log render it. CASPER legs observe their
+            // resolved network in their own branch below.
+            observeNetwork(useChain === CASPER_CHAIN ? undefined : probedOffer?.network);
+
             // Issue #59 (req 4): THE MODE BOUNDARY. An offer's exact network
             // must be the registered network of the run's mode: a devnet
             // genesis is not "the solana chain" — the chain vocabulary cannot
@@ -589,6 +630,8 @@ export function registerFetchTool(server: McpServer): void {
               }
               if (casperAccept) {
                 casperNetwork = toCasperCaip2(casperAccept.network);
+                // Issue #59 (req 8): the casper leg's observed network.
+                observeNetwork(casperNetwork);
                 // Issue #59 (req 3 + D6): the offer's own network must equal
                 // the RESOLVED network — the mode pinned what this leg may
                 // settle on; an offer pointing at the other Casper network is
@@ -1390,6 +1433,10 @@ export function registerFetchTool(server: McpServer): void {
           }],
         };
       }
+    })();
+      // Issue #59 (req 8): the single exit — every result carries the run's
+      // mode (+ the observed network) — see overlayVisibility above.
+      return overlayVisibility(runResult, resolveNetworkMode().mode, observed.network);
     }
   );
 }
