@@ -239,15 +239,102 @@ it('e2e: the SDK is never more permissive than the project gate — a >cap offer
       if (parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost') return await realFetch(input as any, init as any);
       throw new Error(`unexpected network touch in this test: ${urlStr}`);
     }) as unknown as typeof fetch;
+    const before = ledgerLines();
     const result = await handler()({ url });
     const parsed = JSON.parse(result.content[0].text);
     assert.match(parsed.error as string, /REQUEST_LIMIT_EXCEEDED/, 'the PROJECT gate refuses first (the SDK cap would have allowed $0.10)');
     assert.ok(recorded.every(noPaymentHeaders), 'zero payment headers under the project refusal');
-    assert.ok(!ledgerLines().some((e) => e.status === 'success'), 'nothing settled');
+    assert.ok(!ledgerLines().some((e) => e.url === url && e.status === 'success'), 'nothing settled for this url');
+    assert.deepEqual(ledgerLines(), before, 'no ledger row written by this refusal');
   } finally {
     if (saved.cap !== undefined) process.env.MAX_PAYMENT_PER_CALL = saved.cap; else delete process.env.MAX_PAYMENT_PER_CALL;
     if (saved.daily !== undefined) process.env.MAX_DAILY_SPEND = saved.daily; else delete process.env.MAX_DAILY_SPEND;
   }
+});
+
+// ---------------------------------------------------------------------------
+// Issue #62 (C5): the exact-atomic cap derivation + the Casper authority.
+// ---------------------------------------------------------------------------
+
+it('payment-utils: the per-call cap converts to an EXACT integer atomic cap per decimals (no float multiply)', async () => {
+  const pu = (await import('./payment-utils.js')) as typeof import('./payment-utils.js');
+  const saved = process.env.MAX_PAYMENT_PER_CALL;
+  try {
+    process.env.MAX_PAYMENT_PER_CALL = '0.50';
+    assert.equal(pu.getMaxPerCallAtomic(6), 500000n, "'0.50' at 6 decimals is exactly 500000");
+    assert.equal(pu.getMaxPerCallAtomic(9), 500000000n, "'0.50' at 9 decimals is exactly 500000000");
+    process.env.MAX_PAYMENT_PER_CALL = '5';
+    assert.equal(pu.getMaxPerCallAtomic(6), 5000000n);
+    process.env.MAX_PAYMENT_PER_CALL = '1.50';
+    assert.equal(pu.getMaxPerCallAtomic(6), 1500000n, 'the largest atomic value still within the cap (the exact boundary the tests pin)');
+    process.env.MAX_PAYMENT_PER_CALL = '0.05';
+    assert.equal(pu.getMaxPerCallAtomic(9), 50000000n);
+    process.env.MAX_PAYMENT_PER_CALL = '1.000000001';
+    assert.equal(pu.getMaxPerCallAtomic(6), 1000000n, 'fraction digits finer than the asset floors the cap — only integer atomic amounts exist');
+    process.env.MAX_PAYMENT_PER_CALL = 'not-a-number';
+    assert.equal(pu.getMaxPerCallAtomic(6), 0n, 'a malformed cap reads as the same fail-closed 0 the value path reads (nothing over 0 is signed)');
+    process.env.MAX_PAYMENT_PER_CALL = saved ?? '0.50';
+    assert.equal(pu.getMaxPerCallAtomic(19), undefined, 'out-of-domain decimals return undefined (entry excluded, fail closed)');
+  } finally {
+    if (saved !== undefined) process.env.MAX_PAYMENT_PER_CALL = saved; else delete process.env.MAX_PAYMENT_PER_CALL;
+  }
+});
+
+it('casper: the wCSPR leg pays DESPITE the SDK default-asset allowlist, and its refusals come from the repo budget guard — never the SDK controls', async () => {
+  const { WCSPR_ASSETS } = (await import('./casper/accepts.js')) as typeof import('./casper/accepts.js');
+  const { casperBudget } = (await import('./casper/budget.js')) as typeof import('./casper/budget.js');
+  const offer = {
+    scheme: 'exact', network: 'casper:casper', asset: WCSPR_ASSETS['casper:casper'],
+    payTo: '00' + 'ab'.repeat(32), amount: '1000000000', maxTimeoutSeconds: 60,
+    extra: { name: 'Wrapped CSPR', version: '1' },
+  };
+  const casperChallenge = (): Response => {
+    const payload = JSON.stringify({ x402Version: 2, resource: { url: 'https://example.invalid', description: '', mimeType: 'text/plain' }, accepts: [{ ...offer }] });
+    return new Response(payload, { status: 402, headers: { 'payment-required': Buffer.from(payload).toString('base64') } } as ResponseInit);
+  };
+  process.env.CASPER_PRIVATE_KEY = '44'.repeat(32);
+  process.env.X402_ALLOW_PRIVATE_HOSTS = '';
+
+  // (1) the BUDGET guard refuses a too-expensive offer (its own message —
+  // not anything the SDK's spend controls would say) and nothing is signed.
+  const beforeSpend = casperBudget.getDailySpent();
+  process.env.CASPER_MAX_PAYMENT_PER_CALL = '0.1';
+  process.env.CASPER_MAX_DAILY_SPEND = '10';
+  let calls = 0;
+  globalThis.fetch = (async (input: unknown) => {
+    calls++;
+    if (input instanceof Request) assert.ok(noPaymentHeaders({ method: '', url: '', headers: Object.fromEntries(input.headers) }), 'zero payment headers before the guard allows');
+    return casperChallenge();
+  }) as unknown as typeof fetch;
+  const refused = JSON.parse((await handler()({ url: 'https://example.invalid', chain: 'casper' })).content[0].text);
+  assert.match(refused.error as string, /Casper per-call budget exceeded/, 'the REPO budget guard is the Casper authority — its refusal code and message surface');
+  assert.doesNotMatch(refused.error as string, /spendControls/, 'the SDK spend controls must never be the Casper refusal source');
+  assert.equal(calls, 1, 'the SDK never ran a paid leg under the budget refusal');
+  assert.equal(casperBudget.getDailySpent(), beforeSpend, 'a budget refusal debits nothing');
+
+  // (2) with an ample budget the wCSPR offer PAYS — wCSPR is NOT an SDK
+  // default asset, so the SDK's implicit default-asset allowlist would have
+  // refused this very offer: the Casper path's SDK spend controls are
+  // DISABLED (setSpendControls(false)) and the repo budget guard is the only
+  // authority.
+  calls = 0;
+  process.env.CASPER_MAX_PAYMENT_PER_CALL = '1';
+  process.env.CASPER_MAX_DAILY_SPEND = '10';
+  const receiptB64 = Buffer.from(JSON.stringify({ success: true, transaction: 'ab'.repeat(32), network: 'casper:casper' })).toString('base64');
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    calls++;
+    const headers = new Headers(input instanceof Request ? (input as Request).headers : (init as any)?.headers);
+    if (calls <= 2) return casperChallenge();
+    const sigHeader = headers.get('payment-signature');
+    assert.ok(sigHeader, 'the paid leg carries a real signature header');
+    const payload = JSON.parse(Buffer.from(sigHeader!, 'base64').toString());
+    assert.equal(payload.payload.authorization.value, '1000000000', 'the signed value is the mote-exact offer amount');
+    assert.ok((payload.payload.signature ?? '').length > 0);
+    return new Response('{"ok":true}', { status: 200, headers: { 'payment-response': receiptB64 } });
+  }) as unknown as typeof fetch;
+  const paid = JSON.parse((await handler()({ url: 'https://example.invalid', chain: 'casper' })).content[0].text);
+  assert.equal(paid.paid, true, `the wCSPR leg pays with the SDK controls disabled — the repo budget guard is authoritative (${JSON.stringify(paid)})`);
+  assert.equal(casperBudget.getDailySpent(), beforeSpend + 1000000000n, 'the budget guard debited the signed motes — never the SDK controls');
 });
 
 // ---------------------------------------------------------------------------

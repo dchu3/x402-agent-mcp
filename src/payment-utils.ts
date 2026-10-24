@@ -125,6 +125,47 @@ export function getMaxDailySpend(): number {
   return readCapUsd("MAX_DAILY_SPEND", 10.00);
 }
 
+// ---------------------------------------------------------------------------
+// Issue #62 (D4): the SDK's explicit spend controls need the per-call cap as
+// an EXACT integer ATOMIC value per asset decimals (the SDK's
+// allowedAssets[].maxAmountPerPayment field rejects a "$1"-style money
+// string). Deriving that number from a float would drift; these helpers read
+// the configured cap's DECIMAL STRING and scale with BigInt arithmetic only.
+// ---------------------------------------------------------------------------
+
+/** The cap as its configured decimal string, mirroring readCapUsd exactly:
+ * absent → the same documented fallback expressed exactly; a malformed value
+ * → "0" (the same fail-closed 0 that path produces — the cap reads 0 and
+ * nothing is signed, the stderr line included in readCapUsd's first read). */
+function capUsdExactString(name: string, fallback: string): string {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  if (!/^\d+(\.\d+)?$/.test(raw)) return "0"; // mirrors readCapUsd's fail-closed 0
+  return raw;
+}
+
+/** The per-call cap as its exact configured decimal string ("0.50" unless the
+ * operator wrote a plain decimal — never a float round trip). */
+export function getMaxPerCallExactUsdString(): string {
+  return capUsdExactString("MAX_PAYMENT_PER_CALL", "0.50");
+}
+
+/** The per-call cap as an exact integer atomic value for an asset's decimals:
+ * the LARGEST integer atomic amount whose USD value is still within the cap
+ * (the same >cap boundary checkSpendingLimit refuses). BigInt arithmetic on
+ * the configured decimal string — no float multiply ('0.50' at 6 decimals is
+ * exactly 500000; a cap with more fraction digits than the asset has floors,
+ * because only integer atomic amounts exist). Returns undefined outside the
+ * decimals domain; a fail-closed cap of "0" stays 0 (the entry then caps
+ * every atomic amount at 0 — nothing over an invalid cap is signed). */
+export function getMaxPerCallAtomic(decimals: number): bigint | undefined {
+  if (!Number.isInteger(decimals) || decimals < 0 || decimals > 18) return undefined;
+  const usd = getMaxPerCallExactUsdString();
+  const [whole, frac = ""] = usd.split(".");
+  const atomicFraction = BigInt((frac + "0".repeat(decimals)).slice(0, decimals) || "0");
+  return BigInt(whole) * (10n ** BigInt(decimals)) + atomicFraction;
+}
+
 export function checkSpendingLimit(amountUsdc: number): { allowed: boolean; reason?: string } {
   rehydrateFromLedger();
   resetDailyIfNewDay();

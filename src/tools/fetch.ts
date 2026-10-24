@@ -10,11 +10,12 @@ import { fetchCasper, boundedText } from "./casper-fetch.js";
 import { casperBudget } from "../casper/budget.js";
 import { selectCasperAccept, assertPayableCasperAccept, casperAmountMotes } from "../casper/accepts.js";
 import { CASPER_CHAIN, toCasperCaip2 } from "../casper/networks.js";
-import { caip2Of, isEvmNetwork, isUsdChain } from "../evm/networks.js";
+import { caip2Of, isEvmNetwork, isUsdChain, normalizeCaip2Evm } from "../evm/networks.js";
 import { parseChainFromNetwork } from "./probe-utils.js";
-import { checkSpendingLimit, logPayment, getDailySpent, getMaxPerCall, getMaxDailySpend } from "../payment-utils.js";
+import { checkSpendingLimit, logPayment, getDailySpent, getMaxPerCall, getMaxPerCallAtomic, getMaxDailySpend } from "../payment-utils.js";
 import { getPolicyEngine, buildPolicyContext, livenessVerdictForUrl, loadPolicyConfig } from "../policy/config.js";
 import { getPerServiceSpent, recordServicePayment } from "../policy/budget-store.js";
+import type { OperatorAssetEntry } from "../policy/types.js";
 // Issue #54 (req 1): the reserve-before-sign registry — overlapping calls
 // cannot each pass the same remaining budget while one is still being paid.
 import { releaseReservation, reserveSpend, reservedUsd, settleReservation } from "../reservations.js";
@@ -46,7 +47,8 @@ import { executeGuarded } from "../payment-intent/executor.js";
 // usdFromAtomic); unlisted assets are refused with a stable code BEFORE any
 // pricing, binding or signing. Injected into selectOffer so the selector
 // stays pure (src/assets.ts is the single table; no fixed-6 float anywhere).
-import { priceAtomicAsUsd, resolveAsset } from "../assets.js";
+import { ASSET_TABLE, priceAtomicAsUsd, resolveAsset } from "../assets.js";
+import type { SpendControlAsset, SpendControls } from "@x402/core/client";
 import { DEFAULT_CHAIN_ORDER, selectOffer, type OfferCandidate, type RejectedOffer } from "./offer-selection.js";
 // Issue #55: the challenge-scope boundary — the contract an offer/challenge
 // must satisfy before the intent binds it (config from env + call-site keys;
@@ -84,6 +86,37 @@ function scopeRefusalMessage(code: ScopeRefusalCode): string {
     case "MEMO_INVALID": return "the challenge's memo is not printable ASCII within the byte cap";
     case "BLOCK_HINT_INVALID": return "the challenge's block hint is malformed";
   }
+}
+
+/** Issue #62 (D4): the explicit SDK spend-control object for a registered
+ * network. `maxAmountPerPayment` is the project's own per-call USD cap (the
+ * same getMaxPerCall() the policy gate reads, Money number form);
+ * `allowedAssets` carries ONE entry per listed asset on the registered
+ * network — the shipped asset table PLUS the operator's
+ * config-validated assets.extensions — each capped at the cap's exact integer
+ * ATOMIC equivalent (the SDK requires the integer atomic form for per-asset
+ * entries, never a "$1"-style money string; getMaxPerCallAtomic's BigInt
+ * derivation is exact). By the SDK's own rule the default assets stay
+ * payable under the top-level USD cap; the PROJECT asset boundary upstream
+ * decides what is actually signable — these controls are the OUTER bound.
+ * This helper never returns `false`: the control set can only ever be the
+ * project's caps (D4: an invalid per-call cap refuses the call upstream). */
+function sdkSpendControls(registeredNetwork: string, extensions: readonly OperatorAssetEntry[]): SpendControls {
+  const networkOf = (n: string): string => normalizeCaip2Evm(n);
+  const entries: SpendControlAsset[] = [];
+  const pushEntry = (network: string, asset: string, decimals: number): void => {
+    if (entries.some((e) => e.network === network && e.asset === asset)) return;
+    const cap = getMaxPerCallAtomic(decimals);
+    if (cap === undefined) return; // out-of-domain decimals — the entry stays excluded (fail closed); the top-level USD cap still bounds
+    entries.push({ network: network as `${string}:${string}`, asset, maxAmountPerPayment: cap.toString() });
+  };
+  for (const entry of ASSET_TABLE) {
+    if (networkOf(entry.network) === networkOf(registeredNetwork)) pushEntry(entry.network, entry.asset, entry.decimals);
+  }
+  for (const entry of extensions) {
+    if (networkOf(entry.network) === networkOf(registeredNetwork)) pushEntry(entry.network, entry.asset, entry.decimals);
+  }
+  return { maxAmountPerPayment: getMaxPerCall(), allowedAssets: entries };
 }
 
 function policyRefusal(
@@ -582,15 +615,19 @@ export function registerFetchTool(server: McpServer): void {
       // asset is refused with the STABLE code ASSET_NOT_LISTED; a listed
       // asset the table prices nothing on the USD leg with ASSET_NO_USD_RATE.
       // The operator's assets.extensions (config-validated, fail closed) are
-      // in scope here too. Legacy offers that never produced an asset (an
+      // in scope here and are KEPT so the D4 spend controls below can list
+      // them per network. Legacy offers that never produced an asset (an
       // unpayable/unbindable probe) keep today's behavior — nothing to
       // resolve, nothing to refuse here.
+      let probedAssetExtensions: OperatorAssetEntry[] = [];
       if (probedOffer?.asset) {
+        const assetPolicyState = loadPolicyConfig();
+        probedAssetExtensions = assetPolicyState.config.assets.extensions;
         const assetPricing = priceAtomicAsUsd(
           probedOffer.network ?? "",
           probedOffer.asset,
           probedOffer.amount ?? "",
-          loadPolicyConfig().config.assets.extensions,
+          probedAssetExtensions,
         );
         if (assetPricing.ok === false) {
           const assetReason = assetPricing.code === "ASSET_NOT_LISTED"
@@ -653,6 +690,7 @@ export function registerFetchTool(server: McpServer): void {
         // Issue #55: our own payer address, for the scope boundary's fee-payer
         // rule (the agent never pays fee to itself unless the operator opted in).
         let payerAddress: string | undefined;
+        let registeredNetwork = "";
 
         if (useChain === "solana") {
           const secretKeyBytes = bs58.decode(solanaKey!);
@@ -660,7 +698,8 @@ export function registerFetchTool(server: McpServer): void {
           const svmSigner = toClientSvmSigner(keypairSigner);
           const scheme = new ExactSvmScheme(svmSigner, { rpcUrl: solanaRpc });
           payerAddress = keypairSigner.address;
-          client.register(SOLANA_MAINNET_CAIP2 as `${string}:${string}`, scheme);
+          registeredNetwork = SOLANA_MAINNET_CAIP2; // issue #59 (C7): the mode's exact CAIP-2
+          client.register(registeredNetwork as `${string}:${string}`, scheme);
 
         } else {
           const account = privateKeyToAccount(evmKey! as `0x${string}`);
@@ -686,8 +725,37 @@ export function registerFetchTool(server: McpServer): void {
           // undetermined registration matches nothing at selection time (fail
           // closed, never a default chain).
           const registerNetwork = caip2Of(useChain) ?? caip2Of(probedOffer?.network ?? "");
+          registeredNetwork = registerNetwork;
           client.register(registerNetwork as `${string}:${string}`, scheme);
         }
+
+        // Issue #62 (D4): EXPLICIT SDK spend controls — the SDK's implicit
+        // "$1 default cap + default-asset allowlist" must never be the reason
+        // an allowed payment fails. The project's own per-call cap is the
+        // single source of truth: the top-level USD cap (the same
+        // getMaxPerCall() the policy gate reads) plus ONE per-asset entry per
+        // listed asset on the registered network (table + operator
+        // extensions), each at the cap's exact ATOMIC equivalent (the SDK
+        // requires the integer atomic form there). D4: an non-finite or
+        // non-positive cap refuses the call here rather than ever passing
+        // `false` — the SDK layer is NEVER left uncapped.
+        const sdkPerCallUsd = getMaxPerCall();
+        if (!(Number.isFinite(sdkPerCallUsd) && sdkPerCallUsd > 0)) {
+          console.error(`[x402_fetch] CONFIG_INVALID: MAX_PAYMENT_PER_CALL read ${sdkPerCallUsd} — the SDK spend controls take the project's per-call cap as their source of truth, so refusing instead of any uncapped/invalid control set`);
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                error: "CONFIG_INVALID: MAX_PAYMENT_PER_CALL must be a finite positive number — the SDK spend controls take the project's per-call cap as their source of truth (never uncapped at the SDK layer)",
+                url,
+                chain: useChain,
+                estimated_cost_usdc: amountUsdc,
+                reasons: [{ code: "CONFIG_INVALID", message: `Issue #62 (D4): the per-call cap reads ${sdkPerCallUsd}; refuse rather than leave the SDK spend controls uncapped` }],
+              }),
+            }],
+          };
+        }
+        client.setSpendControls(sdkSpendControls(registeredNetwork, probedAssetExtensions));
 
         // Step 3.5: POLICY GATE (issue #19) — the outer gate every payment
         // must pass before payment code runs. APPROVAL_REQUIRED is refused
