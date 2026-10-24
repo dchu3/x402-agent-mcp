@@ -94,12 +94,35 @@ function resetDailyIfNewDay(): void {
   }
 }
 
+/** Issue #54 (cap-parsing hardening): caps must fail CLOSED. A garbage
+ * env value must never widen spend: today's `parseFloat("abc")` yields NaN
+ * and `amount > NaN` is false, so a typo silently allowed every payment.
+ * Only plain non-negative decimal strings are accepted (digits with an
+ * optional .digits part — no sign, no exponent, no whitespace); anything else
+ * logs one stderr line and reads as 0, denying all payments until the env is
+ * fixed. Absent vars keep the documented fallbacks (zero behavior change for
+ * ordinary operators). The policy layer's own defaults (policy/config.ts
+ * legacyNumber) already fail closed on their side. */
+function readCapUsd(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  if (!/^\d+(\.\d+)?$/.test(raw)) {
+    console.error(
+      `[x402] ${name}="${raw}" is not a plain non-negative decimal amount ` +
+      `(digits with an optional . fraction) — failing closed: the cap reads 0 ` +
+      `and every payment is denied until the environment is fixed`,
+    );
+    return 0;
+  }
+  return Number(raw);
+}
+
 export function getMaxPerCall(): number {
-  return parseFloat(process.env.MAX_PAYMENT_PER_CALL || "0.50");
+  return readCapUsd("MAX_PAYMENT_PER_CALL", 0.50);
 }
 
 export function getMaxDailySpend(): number {
-  return parseFloat(process.env.MAX_DAILY_SPEND || "10.00");
+  return readCapUsd("MAX_DAILY_SPEND", 10.00);
 }
 
 export function checkSpendingLimit(amountUsdc: number): { allowed: boolean; reason?: string } {
