@@ -1,6 +1,6 @@
 # x402-agent-mcp
 
-**Universal x402 MCP for AI agents — discover and pay for any x402 endpoint on Base, Polygon, Arbitrum, Solana or Casper.**
+**Universal x402 MCP for AI agents — discover and pay for any x402 endpoint on Base, Polygon, Arbitrum, Solana, Casper or Nano.**
 
 Agents discover services, pay per call, and consume data — all autonomously. No API keys, no subscriptions, no signup. Just a wallet.
 
@@ -28,7 +28,7 @@ The agent never sees wallets, private keys, or x402 protocol details. Just searc
 | `x402_discover_urls` | Free | Batch discover multiple x402 services in parallel |
 | `x402_crawl_directory` | Free | Crawl x402scan.com to discover new x402 services and auto-add to directory |
 | `x402_check_payment` | Free | Evaluate a prospective payment against policy — ALLOW / DENY / APPROVAL_REQUIRED with reason codes. **Never pays.** |
-| `x402_fetch` | Endpoint price | Fetch any x402 endpoint — handles 402 payment on Base, Polygon, Arbitrum, Solana or Casper |
+| `x402_fetch` | Endpoint price | Fetch any x402 endpoint — handles 402 payment on Base, Polygon, Arbitrum, Solana, Casper or Nano |
 
 ## Multi-Chain Support
 
@@ -39,8 +39,9 @@ The agent never sees wallets, private keys, or x402 protocol details. Just searc
 | Polygon | `EVM_PRIVATE_KEY` or `BASE_PRIVATE_KEY` | USDC via @x402/evm |
 | Arbitrum | `EVM_PRIVATE_KEY` or `BASE_PRIVATE_KEY` | USDC via @x402/evm |
 | Casper | `CASPER_PRIVATE_KEY` | wCSPR via @make-software/casper-x402 |
+| Nano | `NANO_RPC_URL` + `NANO_WALLET_ID` + `NANO_SOURCE_ACCOUNT` | native XNO via your node's wallet RPC (opt-in) |
 
-Chain is auto-detected from the 402 response's real CAIP-2 network id (`eip155:8453` ⇒ base, `eip155:137` ⇒ polygon, `eip155:42161` ⇒ arbitrum — an unrecognised `eip155:*` id keeps its verbatim identity and is denied by the default policy, never collapsed onto base). Override with the `chain` parameter (`base`/`polygon`/`arbitrum`/`solana`/`casper`). All EVM chains share the one `EVM_PRIVATE_KEY`; the Ethereum L1 (`eip155:1`) is always refused (see rule 3). `BASE_RPC_URL` applies to Base only — EVM payments on Polygon/Arbitrum sign locally (EIP-3009) with no RPC dependency. Policy note: Polygon and Arbitrum are **opt-in** — add them to `networks.allowed` (and keep the facilitator settle-list `evm.facilitatorNetworks` covering their CAIP-2 ids) to make them payable; the default policy pays Base only among EVM chains.
+Chain is auto-detected from the 402 response's real CAIP-2 network id (`eip155:8453` ⇒ base, `eip155:137` ⇒ polygon, `eip155:42161` ⇒ arbitrum — an unrecognised `eip155:*` id keeps its verbatim identity and is denied by the default policy, never collapsed onto base). Override with the `chain` parameter (`base`/`polygon`/`arbitrum`/`solana`/`casper`/`nano`). All EVM chains share the one `EVM_PRIVATE_KEY`; the Ethereum L1 (`eip155:1`) is always refused (see rule 3). `BASE_RPC_URL` applies to Base only — EVM payments on Polygon/Arbitrum sign locally (EIP-3009) with no RPC dependency. Policy note: Polygon and Arbitrum are **opt-in** — add them to `networks.allowed` (and keep the facilitator settle-list `evm.facilitatorNetworks` covering their CAIP-2 ids) to make them payable; the default policy pays Base only among EVM chains.
 
 ### Casper
 
@@ -90,6 +91,28 @@ Check the payment ledger for an entry with `currency: "wCSPR"` and an exact `amo
 
 **Why fail-closed:** if the key or either budget is unset, no Casper payment is ever signed — there is no silent fallback. Ambiguous failures retain their budget reservation (authorized, not settled), and spend stays bounded in native motes without any USD-conversion assumptions.
 
+### Nano
+
+Nano endpoints advertise the CAIP-2 network `nano:mainnet` with `scheme: "exact"`, `asset: "XNO"` and a checksummed `nano_` `payTo`. Nano is feeless and settles in the native currency; amounts are exact integer **raw** (1 XNO = 10^30 raw, uint128), handled as BigInt end to end. A `payTo` with a bad BLAKE2b checksum is rejected, never repaired.
+
+Nano has no off-chain authorization a facilitator could settle later, so the payment *is* the send: `x402_fetch` publishes a send block for the offered amount to the offered `payTo`, waits for network confirmation, and retries the request with the payload `{ "blockHash": "<64 hex>" }`. The server verifies that block on its own node. The shipped sender drives the `send` action of a Nano node's wallet RPC (the node holds the key and computes proof-of-work) and then polls `block_info` until the block is confirmed **and** matches the requested source, destination and amount. The sender is an injectable interface (`NanoSender` in `src/nano/client.ts`), so a local signer can replace it without touching the fetch path.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NANO_RPC_URL` | — | Your node's RPC endpoint (wallet RPC enabled). Keep it on localhost or a private network. |
+| `NANO_WALLET_ID` | — | Node wallet id holding the source account's key — treat it as a secret |
+| `NANO_SOURCE_ACCOUNT` | — | `nano_` account the payments are sent from |
+| `NANO_MAX_PAYMENT_PER_CALL` | disabled | Maximum per send in decimal XNO (e.g. `0.01`) |
+| `NANO_MAX_DAILY_SPEND` | disabled | Daily send budget in decimal XNO (e.g. `1`) |
+
+Nano is **opt-in twice**: it is not in the default policy allowlists (add `nano` to `networks.allowed` and `XNO` to `tokens.allowed`, e.g. `X402_POLICY_NETWORKS=base,solana,casper,nano` and `X402_POLICY_TOKENS=USDC,wCSPR,XNO`), and both raw budgets must be set, or every paid Nano request fails closed before any send. The gate order is the Casper one: policy (chain, token, service, recipient) → offer validation → payment intent → raw budget check, and the SDK-selected requirements are checked again (network pin, asset, payee, amount, one send per call) immediately before the send.
+
+Because a confirmed Nano send is final, the ledger records `status: "success"`, `currency: "XNO"`, an exact `amount_raw` and the block hash as `tx_hash` as soon as the block confirms — even if the server then refuses the request (that row also carries `http_status`, and the tool result says `paid: true, accepted: false`). The budget reservation is kept on every failure after a send was attempted. The raw daily counter is rebuilt from the ledger on first use and at each UTC day change (today's `success` nano rows, plus `failed` nano rows that carry a published block hash), so restarting the server does not reset the Nano daily cap; if the ledger exists but cannot be read, paid Nano requests are refused.
+
+```
+x402_fetch({ url: "https://some-nano-endpoint.example/api", chain: "nano" })
+```
+
 ## Spending Limits & Payment Logging
 
 | Env var | Default | Description |
@@ -100,7 +123,7 @@ Check the payment ledger for an entry with `currency: "wCSPR"` and an exact `amo
 | `X402_DIRECTORY_PATH` | ./endpoints.json | Path to the endpoint directory file (gitignored); set to isolate tests/sandboxes from the live directory |
 | `X402_INTENT_TTL_MS` | 60000 | Payment-intent time-to-live in milliseconds (see Payment Intent Boundary); an expired intent can never be signed |
 
-Payments share one `x402-payments.jsonl` ledger with timestamp, URL, chain, amount, tx hash, and status. USDC entries use `amount_usdc`; Casper entries use `currency: "wCSPR"` and an exact `amount_motes` string. Base/Solana counters are tracked by chain and summed for the existing USD daily limit. Casper has an independent mote counter. A `failed` row (issue #45) is self-describing: it carries the HTTP status in `http_status` and the refusal reason in `error` (the gateway's error string, e.g. an insufficient-balance-style challenge message, or `HTTP <status>` when the body is not JSON), `amount_usdc` reads 0 because nothing settled, and the attempted price is preserved in `attempted_amount_usdc`.
+Payments share one `x402-payments.jsonl` ledger with timestamp, URL, chain, amount, tx hash, and status. USDC entries use `amount_usdc`; Casper entries use `currency: "wCSPR"` and an exact `amount_motes` string. Base/Solana counters are tracked by chain and summed for the existing USD daily limit. Casper has an independent mote counter; Nano entries use `currency: "XNO"` and an exact `amount_raw` string with their own raw counter, and never enter the USD counters, per-service USD caps or the price-anomaly baseline. A `failed` row (issue #45) is self-describing: it carries the HTTP status in `http_status` and the refusal reason in `error` (the gateway's error string, e.g. an insufficient-balance-style challenge message, or `HTTP <status>` when the body is not JSON), `amount_usdc` reads 0 because nothing settled, and the attempted price is preserved in `attempted_amount_usdc`.
 
 Casper reserves budget synchronously before signing to prevent concurrent overspending. Failed or ambiguous requests retain that reservation; it represents authorized spend, not confirmed settlement. Only one authorization is permitted per fetch. A server-provided settlement receipt is not independently verified on-chain. Payment response bodies/headers are size-bounded and Casper redirects are refused.
 

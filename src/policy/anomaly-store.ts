@@ -55,7 +55,7 @@ function rehydrateFromLedger(window: number): void {
     for (const line of readFileSync(PAYMENT_LOG_PATH, "utf-8").split("\n")) {
       try {
         const e = JSON.parse(line) as { status?: string; chain?: string; url?: string; amount_usdc?: number };
-        if (e.status === "success" && e.chain !== "casper" && typeof e.url === "string") {
+        if (e.status === "success" && e.chain !== "casper" && e.chain !== "nano" && typeof e.url === "string") {
           const amount = e.amount_usdc;
           // Same filter as recordSettledAmount (below): rehydration must
           // rebuild exactly the values the writer produced — rehydration parity.

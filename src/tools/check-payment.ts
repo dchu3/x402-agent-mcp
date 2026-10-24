@@ -48,8 +48,8 @@ export function registerCheckPaymentTool(server: McpServer): void {
     {
       url: z.string().describe("Full URL of the x402 endpoint you intend to pay (e.g. https://example.com/api)"),
       amount: z.number().optional().describe("Prospective payment amount in USD (e.g. from the 402 challenge). Omit to check chain/token/service rules with the directory price when known."),
-      chain: z.enum(["base", "solana", "casper", "polygon", "arbitrum"]).optional().describe("Payment chain: 'base', 'polygon', 'arbitrum', 'solana' or 'casper'. Defaults to the directory entry's chain, else 'base'."),
-      token: z.string().optional().describe("Payment token, e.g. 'USDC' or 'wCSPR'. Defaults to 'USDC'."),
+      chain: z.enum(["base", "solana", "casper", "polygon", "arbitrum", "nano"]).optional().describe("Payment chain: 'base', 'polygon', 'arbitrum', 'solana', 'casper' or 'nano'. Defaults to the directory entry's chain, else 'base'."),
+      token: z.string().optional().describe("Payment token, e.g. 'USDC', 'wCSPR' or 'XNO'. Defaults to 'USDC'."),
       recipient: z.string().optional().describe("The recipient address that would be paid (payTo from the 402 challenge). Required to evaluate recipient allowlist mode; compared against the recorded baseline in change-detect mode."),
     },
     async (args) => {
