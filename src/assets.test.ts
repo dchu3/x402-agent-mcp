@@ -220,7 +220,7 @@ it('config: assets.extensions[] entries validate fail-closed; a priced entry app
     const bad = loadPolicyConfig();
     assert.ok(bad.configErrors.some((e) => /assets\.extensions\[0\]/.test(e)), 'the offending entry is named');
     assert.ok(bad.configErrors.some((e) => /usdRat|usd Peg|prices nothing/i.test(e)), `the unpriced entry is rejected at CONFIG VALIDATION (got: ${bad.configErrors.join(' | ')})`);
-    assert.deepEqual(bad.config.assets, [], 'a rejected asset extension list falls back to the empty default (fail closed)');
+    assert.deepEqual(bad.config.assets, { extensions: [] }, 'a rejected asset extension list falls back to the empty default (fail closed)');
 
     // (2) a priced entry applies and the loaded entry carries every field
     process.env.POLICY_CONFIG_PATH = join(configDir, 'good.json');
@@ -231,9 +231,9 @@ it('config: assets.extensions[] entries validate fail-closed; a priced entry app
     }), 'utf8');
     const good = loadPolicyConfig();
     assert.deepEqual(good.configErrors, [], 'a priced entry validates');
-    assert.equal(good.config.assets?.length, 1);
+    assert.equal(good.config.assets?.extensions?.length, 1);
     assert.deepEqual(
-      { ...good.config.assets?.[0] },
+      { ...good.config.assets?.extensions?.[0] },
       { network: SOLANA_MAINNET_CAIP2, asset: NINE_DP_ASSET, symbol: 'WUSD9', decimals: 9, usdRate: NINE_DP_RATE },
       'operator-extended symbol/decimals/rate are loaded verbatim (no normalisation)'
     );

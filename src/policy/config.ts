@@ -48,6 +48,7 @@ import type {
   EndpointLiveness,
   LivenessAllowlistEntry,
   LivenessConfig,
+  OperatorAssetEntry,
   PolicyConfig,
   PolicyContext,
   PolicyEngineState,
@@ -92,6 +93,9 @@ export function defaultPolicyConfig(errors: string[] = []): PolicyConfig {
     },
     networks: { allowed: ["base", "solana", "casper"] },
     tokens: { allowed: ["USDC", "wCSPR"] },
+    // Issue #62: no operator asset extensions by default — the shipped
+    // per-network asset table (src/assets.ts) applies alone.
+    assets: { extensions: [] },
     // Issue #32 (R2): the compat default for networks.allowed intentionally
     // stays [base, solana, casper] — Polygon/Arbitrum are OPT-IN via config,
     // never silently payable by default (money-path widenings ship opt-in, the
@@ -142,6 +146,8 @@ function failClosedConfig(errors: string[]): PolicyConfig {
     },
     networks: { allowed: [] },
     tokens: { allowed: [] },
+    // Fail-closed state: no operator asset extensions either (issue #62).
+    assets: { extensions: [] },
     // Fail-closed state: an empty settle-list — nothing is payable in this
     // state anyway (the engine short-circuits on configErrors first).
     evm: { facilitatorNetworks: [] },
@@ -184,6 +190,50 @@ function stringArray(v: unknown, path: string, errors: string[]): string[] | und
     return undefined;
   }
   return v as string[];
+}
+
+/** Issue #62 (D2): strict shape + price validation for one operator asset
+ * entry list. network/asset/symbol are non-empty strings, decimals an integer
+ * in usdFromAtomic's domain (0–18), and every entry must price SOMETHING:
+ * usdPeg: true (USD-pegged unit) or a finite positive usdRate. Nothing is
+ * assumed at runtime — an entry pricing nothing is rejected at CONFIG
+ * VALIDATION, never silently treated as a pegged unit. */
+function assetsPolicy(v: unknown, path: string, errors: string[]): void {
+  if (!Array.isArray(v)) {
+    errors.push(`${path} must be an array of { network, asset, symbol, decimals, usdPeg?, usdRate? } asset entries`);
+    return;
+  }
+  v.forEach((item, i) => {
+    const ipath = `${path}[${i}]`;
+    if (!isPlainObject(item)) {
+      errors.push(`${ipath} must be an object { network, asset, symbol, decimals, usdPeg?, usdRate? }`);
+      return;
+    }
+    const known = new Set(["network", "asset", "symbol", "decimals", "usdPeg", "usdRate"]);
+    for (const key of Object.keys(item)) {
+      if (!known.has(key)) errors.push(`${ipath}.${key} is not a recognised asset-entry key (typo protection)`);
+    }
+    for (const field of ["network", "asset", "symbol"] as const) {
+      if (typeof item[field] !== "string" || (item[field] as string).trim() === "") {
+        errors.push(`${ipath}.${field} must be a non-empty string`);
+      }
+    }
+    if (typeof item.decimals !== "number" || !Number.isInteger(item.decimals) || item.decimals < 0 || item.decimals > 18) {
+      errors.push(`${ipath}.decimals must be an integer 0–18 (the decimals domain of usdFromAtomic)`);
+    }
+    if (item.usdPeg !== undefined && typeof item.usdPeg !== "boolean") {
+      errors.push(`${ipath}.usdPeg must be a boolean`);
+    }
+    if (item.usdRate !== undefined && !(typeof item.usdRate === "number" && Number.isFinite(item.usdRate) && item.usdRate > 0)) {
+      errors.push(`${ipath}.usdRate must be a finite positive number when present`);
+    }
+    const hasRate = typeof item.usdRate === "number" && Number.isFinite(item.usdRate) && (item.usdRate as number) > 0;
+    if (item.usdPeg !== true && !hasRate) {
+      errors.push(
+        `${ipath} prices nothing: set usdPeg: true (USD-pegged unit) or a positive usdRate — the asset table never assumes a unit or rate (fail closed)`,
+      );
+    }
+  });
 }
 
 function servicePolicy(v: unknown, path: string, errors: string[]): ServicePolicy | undefined {
@@ -369,7 +419,7 @@ function validateDocument(doc: unknown, errors: string[]): void {
     errors.push("policy config must be a JSON object");
     return;
   }
-  const knownTop = new Set(["payments", "services", "networks", "tokens", "recipients", "anomaly", "evm", "liveness"]);
+  const knownTop = new Set(["payments", "services", "networks", "tokens", "assets", "recipients", "anomaly", "evm", "liveness"]);
   for (const key of Object.keys(doc)) {
     if (!knownTop.has(key)) errors.push(`policy config key "${key}" is not recognised (typo protection)`);
   }
@@ -417,6 +467,19 @@ function validateDocument(doc: unknown, errors: string[]): void {
     else {
       for (const key of Object.keys(doc.tokens)) if (key !== "allowed") errors.push(`tokens.${key} is not a recognised policy key`);
       stringArray(doc.tokens.allowed, "tokens.allowed", errors);
+    }
+  }
+
+  // assets — optional (issue #62): only "extensions", an array of operator
+  // asset entries extending the shipped per-network asset table. Strict shape
+  // with typo protection; an entry that prices NOTHING is rejected here (fail
+  // closed — never an assumed unit/rate at runtime).
+  if (doc.assets !== undefined) {
+    if (!isPlainObject(doc.assets)) {
+      errors.push('assets must be an object with an "extensions" array of asset entries (issue #62)');
+    } else {
+      for (const key of Object.keys(doc.assets)) if (key !== "extensions") errors.push(`assets.${key} is not a recognised policy key`);
+      if (doc.assets.extensions !== undefined) assetsPolicy(doc.assets.extensions, "assets.extensions", errors);
     }
   }
 
@@ -505,6 +568,7 @@ function applyFileConfig(config: PolicyConfig, errors: string[]): void {
     services?: Partial<Record<ServiceLevelKey, ServicePolicy>>;
     networks?: { allowed?: string[] };
     tokens?: { allowed?: string[] };
+    assets?: { extensions?: Array<{ network: string; asset: string; symbol: string; decimals: number; usdPeg?: boolean; usdRate?: number }> };
     recipients?: {
       mode?: "allowlist" | "change-detect";
       allowed?: string[];
@@ -533,6 +597,26 @@ function applyFileConfig(config: PolicyConfig, errors: string[]): void {
   }
   if (d.networks?.allowed) config.networks = { allowed: [...d.networks.allowed] };
   if (d.tokens?.allowed) config.tokens = { allowed: [...d.tokens.allowed] };
+
+  // Issue #62: operator asset extensions replace the default empty list ONLY
+  // when present; every entry is validated (and priced) before this merge
+  // runs, so the fresh copies can be applied verbatim — operator-extended
+  // symbol/decimals/rate load exactly as written (no normalisation).
+  if (d.assets?.extensions) {
+    config.assets = {
+      extensions: d.assets.extensions.map((entry) => {
+        const fresh: OperatorAssetEntry = {
+          network: entry.network,
+          asset: entry.asset,
+          symbol: entry.symbol,
+          decimals: entry.decimals,
+        };
+        if (entry.usdPeg !== undefined) fresh.usdPeg = entry.usdPeg;
+        if (entry.usdRate !== undefined) fresh.usdRate = entry.usdRate;
+        return fresh;
+      }),
+    };
+  }
 
   // Issue #26: merge recipients over the default ONLY when the section is
   // present, field-by-field, copying fresh arrays/objects — never aliasing

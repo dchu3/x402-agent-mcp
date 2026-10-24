@@ -170,10 +170,39 @@ export interface PolicyConfig {
   };
   networks: { allowed: string[] };
   tokens: { allowed: string[] };
+  /** Issue #62: operator-extended per-network asset entries. Defaults to an
+   * empty list (the shipped asset table applies alone); entries are validated
+   * fail-closed at config load and priced at runtime via the asset table
+   * (src/assets.ts) — an unpriced entry is rejected at CONFIG VALIDATION,
+   * never assumed at runtime. */
+  assets: { extensions: OperatorAssetEntry[] };
   recipients: RecipientPolicy;
   anomaly: AnomalyConfig;
   evm: EvmPolicyConfig;
   liveness: LivenessConfig;
+}
+
+/** Issue #62 (D2): one OPERATOR-CONFIGURED asset extension — adds an asset
+ * the shipped per-network asset table (src/assets.ts) does not list, so the
+ * offer's asset id resolves to a real symbol + decimals and a USD price
+ * (usdPeg OR a positive usdRate). Never an assumed unit: an entry pricing
+ * nothing is rejected at config validation. */
+export interface OperatorAssetEntry {
+  /** Exact CAIP-2 network id the entry belongs to, e.g. "solana:5eykt…" —
+   * matches the offer's network EXACTLY (issue #59: no substring matching). */
+  network: string;
+  /** On-chain asset id exactly as an x402 offer names it (SPL mint /
+   * EIP-20 address / CEP-18 package hash). */
+  asset: string;
+  /** Policy-vocabulary token symbol — compared by tokens.allowed. */
+  symbol: string;
+  /** Integer decimals in usdFromAtomic's domain (0–18). */
+  decimals: number;
+  /** USD-pegged stablecoin: priced at exactly 1 USD per whole token unit. */
+  usdPeg?: boolean;
+  /** USD per WHOLE token unit for non-pegged assets (positive, finite).
+   * Required when usdPeg is not true. */
+  usdRate?: number;
 }
 
 /** The request a payment decision is made about. `trustLevel` is supplied by
@@ -218,7 +247,13 @@ export interface PolicyBudgetState {
  * ENDPOINT_NOT_LIVE is emitted by rule 4.7 (issue #34): the fail-closed
  * endpoint liveness gate — it IS a DENY code (a liveness refusal has no
  * approval band). CONFIG_INVALID is the fail-closed marker for unusable policy
- * configuration (operator-ratified addition to the issue's list). */
+ * configuration (operator-ratified addition to the issue's list).
+ * ASSET_NOT_LISTED (issue #62) is the fail-closed asset-table gate: an offer's
+ * asset id is not listed for its network, so there is no symbol/decimals to
+ * price with — refused before any signing, never with an assumed unit.
+ * ASSET_NO_USD_RATE (issue #62) is the USD-leg sibling: the asset is listed
+ * but carries neither usdPeg nor a positive usdRate, so no USD price exists
+ * (the USD leg prices in USD-pegged units only — fail closed). */
 export type ReasonCode =
   | "PAYMENTS_DISABLED"
   | "REQUEST_LIMIT_EXCEEDED"
@@ -232,6 +267,9 @@ export type ReasonCode =
   | "RECIPIENT_NOT_ALLOWED"
   | "PRICE_ANOMALY"
   | "ENDPOINT_NOT_LIVE"
+  // Issue #62: the per-network asset-table refusal codes (see above).
+  | "ASSET_NOT_LISTED"
+  | "ASSET_NO_USD_RATE"
   | "CONFIG_INVALID";
 
 export interface PolicyReason {
