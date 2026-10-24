@@ -35,6 +35,7 @@ import { DEFAULT_CHAIN_ORDER, selectOffer, type OfferCandidate, type SelectOffer
 // PAYMENT_LOG_PATH pattern from the existing suites).
 // ---------------------------------------------------------------------------
 const dir = mkdtempSync(join(tmpdir(), 'x402-fetch-selection-test-'));
+process.env.X402_NETWORK_MODE = 'mainnet'; // issue #59: these suites must name the MAINNET mode explicitly — set BEFORE the env capture so every afterEach restore keeps it
 const env = { ...process.env };
 process.env.PAYMENT_LOG_PATH = join(dir, 'ledger.jsonl');
 process.env.X402_DIRECTORY_PATH = join(dir, 'endpoints.json');

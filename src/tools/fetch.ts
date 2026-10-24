@@ -13,6 +13,9 @@ import { CASPER_CHAIN, toCasperCaip2 } from "../casper/networks.js";
 import { caip2Of, isEvmNetwork, isUsdChain, normalizeCaip2Evm } from "../evm/networks.js";
 import { parseChainFromNetwork } from "./probe-utils.js";
 import { checkSpendingLimit, logPayment, getDailySpent, getMaxPerCall, getMaxPerCallAtomic, getMaxDailySpend } from "../payment-utils.js";
+// Issue #59: the EXPLICIT network mode + the mode's registration/RPC.
+import { casperNetworkResolved, modeAllowsNetwork, resolveNetworkMode, solanaNetworkForMode, solanaRpcUrlForMode } from "../networks.js";
+import type { NetworkMode } from "../networks.js";
 import { getPolicyEngine, buildPolicyContext, livenessVerdictForUrl, loadPolicyConfig } from "../policy/config.js";
 import { getPerServiceSpent, recordServicePayment } from "../policy/budget-store.js";
 import type { OperatorAssetEntry } from "../policy/types.js";
@@ -233,7 +236,35 @@ export function registerFetchTool(server: McpServer): void {
       const solanaKey = process.env.SOLANA_PRIVATE_KEY;
       const evmKey = process.env.EVM_PRIVATE_KEY || process.env.BASE_PRIVATE_KEY;
       const casperKey = process.env.CASPER_PRIVATE_KEY;
-      const solanaRpc = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
+
+      // Issue #59 (req 1 + option A): the EXPLICIT network mode — with a
+      // payment key loaded, an unset (or invalid) X402_NETWORK_MODE refuses
+      // EVERY call with the stable code NETWORK_NOT_CONFIGURED BEFORE the
+      // probe; there is no mainnet-by-accident and no invalid-mode
+      // half-state. Free tools are immune (this gate lives in the paid
+      // tool only). The mode decides the registration network (Step 3), the
+      // Solana RPC (below) and the payable-offer boundary (post-detection).
+      const modeState = resolveNetworkMode();
+      if (modeState.error) {
+        console.error(`[x402_fetch] NETWORK_NOT_CONFIGURED: ${modeState.error}`);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              error: `NETWORK_NOT_CONFIGURED: ${modeState.error}`,
+              reasons: [{ code: "NETWORK_NOT_CONFIGURED", message: modeState.unset
+                ? `${modeState.error} — set X402_NETWORK_MODE=mainnet or devnet (breaking change: #59 removed the implicit mainnet default)`
+                : modeState.error }],
+            }),
+          }],
+        };
+      }
+      const networkMode: NetworkMode | undefined = modeState.mode;
+
+      // Issue #59 (req 5): the Solana RPC follows the mode — devnet payloads
+      // never reach a mainnet RPC. SOLANA_DEVNET_RPC_URL's documented public
+      // fallback is the SDK's DEVNET_RPC_URL; mainnet keeps today's value.
+      const solanaRpc = solanaRpcUrlForMode(networkMode ?? "mainnet");
       const baseRpc = process.env.BASE_RPC_URL || "https://mainnet.base.org";
 
       // Step 1: Probe to detect chain from 402 response
@@ -246,6 +277,28 @@ export function registerFetchTool(server: McpServer): void {
       let probedSymbol: string | undefined;
       let probedDecimals: number | undefined;
       let casperNetwork = process.env.CASPER_NETWORK || "";
+
+      // Issue #59 (req 3 + D6): the CASPER leg agrees with the mode — mainnet
+      // mode refuses the Casper testnet and vice versa; an explicit mode with
+      // the env unset follows the mode. A rejected value is refused here (the
+      // stable CHAIN_NOT_ALLOWED code) — the leg never starts.
+      const casperResolution = casperNetworkResolved(networkMode, process.env.CASPER_NETWORK);
+      if (casperResolution.ok === false) {
+        const casperEnvRaw = (process.env.CASPER_NETWORK ?? "").trim();
+        console.error(`[x402_fetch] CHAIN_NOT_ALLOWED: CASPER_NETWORK=${casperEnvRaw || "(unset, following the mode)"} disagrees with X402_NETWORK_MODE=${networkMode} — refusing (issue #59 req 3)`);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              error: "Payment refused: the CASPER_NETWORK setting disagrees with X402_NETWORK_MODE (CHAIN_NOT_ALLOWED)",
+              reasons: [{ code: "CHAIN_NOT_ALLOWED", message: networkMode === "mainnet"
+                ? `X402_NETWORK_MODE=mainnet refuses the Casper TESTNET (CASPER_NETWORK=${casperEnvRaw || "unset → casper-test"}) — set CASPER_NETWORK=casper to pay the Casper mainnet, or use devnet mode`
+                : `X402_NETWORK_MODE=devnet refuses the Casper MAINNET (CASPER_NETWORK=${casperEnvRaw || "unset → casper"}) — set CASPER_NETWORK=casper-test for the devnet` }],
+            }),
+          }],
+        };
+      }
+      if (networkMode) casperNetwork = casperResolution.network;
       // Issue #25: the concrete probe offer, retained so the payment intent
       // can bind exactly what policy evaluated (the USD estimate alone is not
       // an authorisation). Undefined only when the probe cannot yield an
@@ -388,6 +441,11 @@ export function registerFetchTool(server: McpServer): void {
                   : policyState.configErrors.length > 0
                     ? []
                     : policyState.config.networks.allowed,
+                // Issue #59 (req 4): the MODE is part of the selection's own
+                // network gate — a cross-mode offer is a reported selection
+                // refusal (network_not_allowed) and never chosen; the exact
+                // network comparison lives in modeAllowsNetwork.
+                networkAllowed: (network) => !networkMode || modeAllowsNetwork(networkMode, network),
                 // Issue #62: the table decides, not the SDK's implicitly
                 // allowed default-asset universe (spend controls at Step 3
                 // enforce an OUTER bound now; the table is the source of
@@ -462,6 +520,31 @@ export function registerFetchTool(server: McpServer): void {
               }
             }
 
+            // Issue #59 (req 4): THE MODE BOUNDARY. An offer's exact network
+            // must be the registered network of the run's mode: a devnet
+            // genesis is not "the solana chain" — the chain vocabulary cannot
+            // express this, the exact CAIP-2 can. The boundary fires BEFORE
+            // the asset-table boundary below (the mode is the outer
+            // decision) and before any client construction, so a cross-mode
+            // offer never probed further, never priced, never signed.
+            if (networkMode && probedOffer?.network && !modeAllowsNetwork(networkMode, probedOffer.network)) {
+              const offModeNetwork = stripUntrusted(probedOffer.network, 64);
+              console.error(`[x402_fetch] CHAIN_NOT_ALLOWED: network ${offModeNetwork} is not the registered network of X402_NETWORK_MODE=${networkMode} — refusing before the asset boundary (issue #59 req 4)`);
+              return {
+                content: [{
+                  type: "text" as const,
+                  text: JSON.stringify({
+                    error: "Payment refused at the mode boundary (CHAIN_NOT_ALLOWED)",
+                    url,
+                    chain: useChain,
+                    network: offModeNetwork,
+                    network_mode: networkMode,
+                    reasons: [{ code: "CHAIN_NOT_ALLOWED", message: `network <${offModeNetwork}> is not the registered network of X402_NETWORK_MODE=${networkMode} — in mainnet mode only mainnet networks pay, in devnet mode only the solana devnet id pays (issue #59 req 4)` }],
+                  }),
+                }],
+              };
+            }
+
             // Casper settles in wCSPR motes (9 decimals), not 6-decimal USDC.
             if (useChain === CASPER_CHAIN) {
               // Issue #26: the Casper recipient is only knowable after accept
@@ -504,6 +587,25 @@ export function registerFetchTool(server: McpServer): void {
               }
               if (casperAccept) {
                 casperNetwork = toCasperCaip2(casperAccept.network);
+                // Issue #59 (req 3 + D6): the offer's own network must equal
+                // the RESOLVED network — the mode pinned what this leg may
+                // settle on; an offer pointing at the other Casper network is
+                // refused here, before any binding, budget hold or signing.
+                if (networkMode && casperNetwork !== casperResolution.network) {
+                  return {
+                    content: [{
+                      type: "text" as const,
+                      text: JSON.stringify({
+                        error: "Payment refused: the offer's Casper network disagrees with X402_NETWORK_MODE (CHAIN_NOT_ALLOWED)",
+                        url,
+                        chain: CASPER_CHAIN,
+                        network: stripUntrusted(casperNetwork, 64),
+                        network_mode: networkMode,
+                        reasons: [{ code: "CHAIN_NOT_ALLOWED", message: `the offer settles on <${stripUntrusted(casperNetwork, 64)}> but X402_NETWORK_MODE=${networkMode} pins <${casperResolution.network}> (issue #59 req 3)` }],
+                      }),
+                    }],
+                  };
+                }
                 try {
                   assertPayableCasperAccept(casperAccept);
                   // Issue #25: bind the validated offer to a payment intent now
@@ -698,7 +800,11 @@ export function registerFetchTool(server: McpServer): void {
           const svmSigner = toClientSvmSigner(keypairSigner);
           const scheme = new ExactSvmScheme(svmSigner, { rpcUrl: solanaRpc });
           payerAddress = keypairSigner.address;
-          registeredNetwork = SOLANA_MAINNET_CAIP2; // issue #59 (C7): the mode's exact CAIP-2
+          // Issue #59 (req 2): the mode's REGISTRATION — the exact CAIP-2 of
+          // this run's network (mainnet in mainnet mode; the solana devnet
+          // id in devnet mode). The chain detection above cannot distinguish
+          // the two (both resolve to the chain "solana"); the mode does.
+          registeredNetwork = solanaNetworkForMode(networkMode ?? "mainnet");
           client.register(registeredNetwork as `${string}:${string}`, scheme);
 
         } else {

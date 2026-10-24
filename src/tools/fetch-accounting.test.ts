@@ -20,6 +20,7 @@ import { join } from 'node:path';
 // Isolate the payment ledger BEFORE importing fetch.js (PAYMENT_LOG_PATH
 // pattern from fetch.test.ts / payment-utils.rehydrate.test.ts).
 const dir = mkdtempSync(join(tmpdir(), 'x402-fetch-acc-'));
+process.env.X402_NETWORK_MODE = 'mainnet'; // issue #59: these suites must name the MAINNET mode explicitly — set BEFORE the env capture so every afterEach restore keeps it
 const env = { ...process.env };
 process.env.PAYMENT_LOG_PATH = join(dir, 'ledger.jsonl');
 // Hermetic directory keeps trust = UNKNOWN deterministically (same as fetch.test.ts).

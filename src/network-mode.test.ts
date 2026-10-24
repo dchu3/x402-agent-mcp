@@ -2,11 +2,9 @@
 // classification, and the separate devnet spend bucket.
 //
 // RED commit (plan C6): this file imports ./networks.js (the post-C7 module)
-// and payment-utils' getDevnetDailySpent(), neither of which exists yet, so
-// the test compile fails with "Cannot find module './networks.js'" and the
-// TS2339 on getDevnetDailySpent — the stated failures (the mode resolver
-// module and the devnet spend bucket are not built yet; precedent: #61's C1
-// and #62's C1/C4). The classification tests additionally fail at RUNTIME
+// which does not exist yet, so the test compile fails with "Cannot find
+// module './networks.js'" — the stated failure (the mode resolver module is
+// not built yet; precedent: #61's C1 and #62's C1/C4). The classification tests additionally fail at RUNTIME
 // against the current probe-utils.ts:51 substring matcher (that is the #59
 // req 6 defect being pinned). Everything goes green with C7 (mode resolver +
 // exact parser + mode-bounded registration + RPC split) and C8 (the devnet
@@ -281,7 +279,7 @@ it('mode gate: a key loaded + X402_NETWORK_MODE unset refuses before probing; a 
   const { registerCheckPaymentTool } = (await import('./tools/check-payment.js')) as typeof import('./tools/check-payment.js');
   let freeCallback: any;
   registerCheckPaymentTool({ tool: (_n: unknown, _d: unknown, _s: unknown, fn: unknown) => { freeCallback = fn; } } as any);
-  const freeResult = await freeCallback();
+  const freeResult = await freeCallback({ url: 'https://free-tool-test.invalid/api', chain: 'base', token: 'USDC' });
   const freeParsed = JSON.parse(freeResult.content[0].text);
   assert.equal(freeParsed.error, undefined, 'a free tool works with the mode unset (immunity)');
 });
@@ -305,7 +303,7 @@ it('mainnet mode refuses a DEVNET offer before signing (same asset id, different
   );
   assert.ok(parsed.status === undefined, 'no signed HTTP response: the leg never ran');
   assert.ok(recorded.every(noPaymentHeaders), 'zero payment headers ever left');
-  assert.ok(!recorded.some((r) => r.url !== url), 'only the seller was touched — the mainnet RPC never (the mock throws on it, which would fail the leg)');
+  assert.ok(recorded.every((r) => r.url === new URL(url).pathname), 'only the seller endpoint was touched — no other-host request ever (the mock throws on the mainnet RPC, which would fail the leg)');
   const settled = ledgerLines().some((e) => e.status === 'success' && e.chain === 'solana' && e.amount_usdc === 0.001);
   assert.ok(!settled, 'nothing settled for the cross-mode offer');
 });
@@ -370,14 +368,18 @@ it('devnet mode pays the devnet ping against the mock: a devnet ledger row, an u
     process.env.SOLANA_DEVNET_RPC_URL = RPC_SIM_URL;
 
     // Seed the MAINNET (non-devnet) daily total: a mainnet-classified row.
+    // The devnet bucket is read through the EXISTING getDailySpent(chain?)
+    // key — the exact devnet network id (issue #59 D7: the bucket is the
+    // network id itself; getDailySpent()'s whole-map sum must never include
+    // it).
     PM.logPayment({
       timestamp: new Date().toISOString(), url: 'https://mainnet-seed.invalid/v1/paid', method: 'GET', chain: 'solana',
       amount_usdc: 0.002, amount_atomic: '2000', decimals: 6,
       asset: USDC_MAINNET_SOL, currency: 'USDC', status: 'success',
     });
     const mainnetBefore = PM.getDailySpent();
-    const devnetBefore = PM.getDevnetDailySpent();
-    assert.ok(!PM.getDevnetDailySpent(), 'the devnet bucket starts empty (a mainnet-classified row does not feed it)');
+    const devnetBefore = PM.getDailySpent(SOLANA_DEVNET_CAIP2);
+    assert.ok(!PM.getDailySpent(SOLANA_DEVNET_CAIP2), 'the devnet bucket starts empty (a mainnet-classified row does not feed it)');
 
     const receiptB64 = Buffer.from(JSON.stringify({ success: true, transaction: 'ef'.repeat(32) })).toString('base64');
     const { url, recorded } = await seller((req, res, _visitIndex, signed) => {
@@ -409,7 +411,7 @@ it('devnet mode pays the devnet ping against the mock: a devnet ledger row, an u
     assert.equal(devnetRow.chain, 'solana', 'the chain vocabulary is still solana');
     assert.equal(devnetRow.amount_usdc, 0.001);
     assert.equal(PM.getDailySpent(), mainnetBefore, 'the MAINNET daily total is UNCHANGED by a devnet payment');
-    assert.equal(PM.getDevnetDailySpent(), devnetBefore + 0.001, 'the DEVNET daily bucket absorbed exactly the paid amount');
+    assert.equal(PM.getDailySpent(SOLANA_DEVNET_CAIP2), devnetBefore + 0.001, 'the DEVNET daily bucket absorbed exactly the paid amount');
   } finally {
     if (previousConfigPath !== undefined) process.env.POLICY_CONFIG_PATH = previousConfigPath; else delete process.env.POLICY_CONFIG_PATH;
     rmSync(configDir, { recursive: true, force: true });
