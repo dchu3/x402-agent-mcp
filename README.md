@@ -400,17 +400,19 @@ npm run build
 > **Before your first paid call:** the default payment policy is permissive — any x402 endpoint is payable up to the global caps. Set `MAX_PAYMENT_PER_CALL` and `MAX_DAILY_SPEND` explicitly before going live, and make your first paid calls with a throwaway key on a chain you can afford. See [Spending Limits & Payment Logging](#spending-limits--payment-logging) for the knobs and their exact semantics.
 
 ```bash
-# .env
-SOLANA_PRIVATE_KEY=your-base58-solana-key
-EVM_PRIVATE_KEY=your-hex-base-key
-CASPER_PRIVATE_KEY=your-hex-casper-key-or-pem-path
-SOLANA_RPC_URL=https://mainnet.helius-rpc.com/?api-key=your-key
-BASE_RPC_URL=https://mainnet.base.org
+# .env — replace every <PLACEHOLDER> with your own value; never commit real key material
+SOLANA_PRIVATE_KEY=<YOUR_SOLANA_PRIVATE_KEY>
+EVM_PRIVATE_KEY=<YOUR_EVM_PRIVATE_KEY>
+CASPER_PRIVATE_KEY=<YOUR_CASPER_PRIVATE_KEY>
+# RPC URLs are placeholders too; if left unset, the code falls back to the
+# documented public endpoints (https://api.mainnet-beta.solana.com, https://mainnet.base.org).
+SOLANA_RPC_URL=<YOUR_SOLANA_RPC_URL>
+BASE_RPC_URL=<YOUR_BASE_RPC_URL>
 MAX_PAYMENT_PER_CALL=0.50
 MAX_DAILY_SPEND=10.00
 ```
 
-You only need the key for chains you want to pay on. Solana-only? Just set `SOLANA_PRIVATE_KEY`.
+You only need the key for chains you want to pay on. Solana-only? Just fill in `SOLANA_PRIVATE_KEY`.
 
 ### 3. Connect to Your Agent
 
@@ -427,8 +429,8 @@ import yaml
 with open('$HOME/.hermes/config.yaml') as f:
     config = yaml.safe_load(f)
 config['mcp_servers']['x402']['env'] = {
-    'SOLANA_PRIVATE_KEY': 'your-base58-key',
-    'EVM_PRIVATE_KEY': 'your-hex-key',
+    'SOLANA_PRIVATE_KEY': '<YOUR_SOLANA_PRIVATE_KEY>',
+    'EVM_PRIVATE_KEY': '<YOUR_EVM_PRIVATE_KEY>',
 }
 with open('$HOME/.hermes/config.yaml', 'w') as f:
     yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
@@ -447,8 +449,8 @@ hermes mcp test x402
       "command": "node",
       "args": ["/path/to/x402-agent-mcp/dist/index.js"],
       "env": {
-        "SOLANA_PRIVATE_KEY": "your-base58-key",
-        "EVM_PRIVATE_KEY": "your-hex-key"
+        "SOLANA_PRIVATE_KEY": "<YOUR_SOLANA_PRIVATE_KEY>",
+        "EVM_PRIVATE_KEY": "<YOUR_EVM_PRIVATE_KEY>"
       }
     }
   }
