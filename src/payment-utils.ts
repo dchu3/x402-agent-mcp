@@ -10,7 +10,9 @@ export interface PaymentLogEntry {
   amount_motes?: string;
   currency?: "USDC" | "wCSPR";
   tx_hash?: string;
-  status: "success" | "failed";
+  // An emitted signed request can have an unverified payment outcome.
+  // "unknown" never contributes to settled-spend rehydration.
+  status: "success" | "failed" | "unknown";
   error?: string;
   // Issue #45: a refused (non-200) paid fetch row is self-describing — it
   // carries the HTTP status and the gateway's error string (or `HTTP <status>`
@@ -18,6 +20,9 @@ export interface PaymentLogEntry {
   // settled, and preserves the advertised price in attempted_amount_usdc.
   // Both fields are optional: rows written before #45 (and the intent-abort
   // catch rows) rehydrate and read exactly as before.
+  // For status "unknown", amount_usdc stays ZERO: no settlement was proven.
+  // The attempted_amount_usdc is a conservative budget RESERVATION instead.
+  // Do not interpret a reservation as a vendor receipt or earned revenue.
   http_status?: number;
   attempted_amount_usdc?: number;
 }
@@ -43,12 +48,17 @@ function rehydrateFromLedger(): void {
       try {
         const entry = JSON.parse(line) as PaymentLogEntry;
         if (
-          entry.status === "success" &&
+          (entry.status === "success" || entry.status === "unknown") &&
           entry.chain !== "casper" &&
           typeof entry.chain === "string" &&
           entry.timestamp.slice(0, 10) === dailyDate
         ) {
-          dailySpentByChain.set(entry.chain, (dailySpentByChain.get(entry.chain) ?? 0) + (entry.amount_usdc ?? 0));
+          const reserved = entry.status === "unknown"
+            ? entry.attempted_amount_usdc ?? 0
+            : entry.amount_usdc ?? 0;
+          if (Number.isFinite(reserved) && reserved > 0) {
+            dailySpentByChain.set(entry.chain, (dailySpentByChain.get(entry.chain) ?? 0) + reserved);
+          }
         }
       } catch {
         // Corrupted ledger lines are skipped — logging is best-effort, so is reading it back
@@ -96,8 +106,11 @@ export function checkSpendingLimit(amountUsdc: number): { allowed: boolean; reas
 export function logPayment(entry: PaymentLogEntry): void {
   resetDailyIfNewDay();
 
-  if (entry.status === "success" && entry.chain !== "casper") {
-    dailySpentByChain.set(entry.chain, (dailySpentByChain.get(entry.chain) ?? 0) + (entry.amount_usdc ?? 0));
+  if ((entry.status === "success" || entry.status === "unknown") && entry.chain !== "casper") {
+    const reserved = entry.status === "unknown" ? entry.attempted_amount_usdc ?? 0 : entry.amount_usdc ?? 0;
+    if (Number.isFinite(reserved) && reserved > 0) {
+      dailySpentByChain.set(entry.chain, (dailySpentByChain.get(entry.chain) ?? 0) + reserved);
+    }
   }
 
   try {

@@ -99,12 +99,24 @@ Check the payment ledger for an entry with `currency: "wCSPR"` and an exact `amo
 | `PAYMENT_LOG_PATH` | ./x402-payments.jsonl | Path to payment log file (gitignored) |
 | `X402_DIRECTORY_PATH` | ./endpoints.json | Path to the endpoint directory file (gitignored); set to isolate tests/sandboxes from the live directory |
 | `X402_INTENT_TTL_MS` | 60000 | Payment-intent time-to-live in milliseconds (see Payment Intent Boundary); an expired intent can never be signed |
+| `X402_PROBE_TIMEOUT_MS` | 30000 | Whole unsigned probe (headers + body) deadline; 50–120000 ms |
+| `X402_PRE_SIGN_TIMEOUT_MS` | 30000 | SDK pre-sign/402 fetch deadline, checked immediately before payload creation; 50–120000 ms |
+| `X402_PAID_TIMEOUT_MS` | 60000 | Total EVM/Solana x402 wrapper deadline, including SDK recovery; 50–180000 ms |
+| `X402_PAID_MAX_BODY_BYTES` | 1048576 | Maximum EVM/Solana HTTP response bytes on **every** SDK fetch hop; 512–1048576 (1 MiB). Payment header values separately capped at 65536 characters |
 
 Payments share one `x402-payments.jsonl` ledger with timestamp, URL, chain, amount, tx hash, and status. USDC entries use `amount_usdc`; Casper entries use `currency: "wCSPR"` and an exact `amount_motes` string. Base/Solana counters are tracked by chain and summed for the existing USD daily limit. Casper has an independent mote counter. A `failed` row (issue #45) is self-describing: it carries the HTTP status in `http_status` and the refusal reason in `error` (the gateway's error string, e.g. an insufficient-balance-style challenge message, or `HTTP <status>` when the body is not JSON), `amount_usdc` reads 0 because nothing settled, and the attempted price is preserved in `attempted_amount_usdc`.
 
+### EVM/Solana paid x402 transport safety (issue #56)
+
+Both the initial 402 leg **inside the x402 SDK** and the signed paid request now pass through one transport which refuses HTTP redirects at the actual network fetch (including SDK recovery), checks payment response headers, reads response bodies with a byte cap, and enforces independent deadlines. The outer free chain-detection probe uses the same bounded transport. Invalid/oversized timeout and body-size settings refuse the request **before network activity**. The separate pre-sign timer is checked in the SDK before-payment-creation hook: a timed-out 402 body cannot cause a later signature.
+
+**Before a signature is sent:** a timeout returns `error_code: "timeout_before_payment"`, `paid: false`, spend 0. **After a signed request is dispatched:** timeout, redirect, oversized body or ambiguous SDK transport failure returns `paid: "unknown"`, `do_not_retry_blindly: true`, and an `unknown` ledger row recording the attempted amount, not a confirmed settlement. **Do not blindly retry**. Independently inspect the seller and chain settlement first; a signed payment could have reached the merchant despite the error. For conservative cap enforcement, `unknown` amounts remain reserved in the global and per-service USD budgets even after restart; they are **not** included as confirmed settled transactions or in the anomaly-price baseline. A later verified payment reconciliation workflow is needed before releasing a reservation. Every successful HTTP 200 still uses the existing server-attested (not chain-verified) settlement semantics. Casper has its separate existing native-mote budget and transport.
+
+No x402 wallet, gas or private-key action is required to run the included tests: all tests use fake HTTPS hosts, synthetic ephemeral signing keys and/or mocked fetch responses, without sending payment transactions.
+
 Casper reserves budget synchronously before signing to prevent concurrent overspending. Failed or ambiguous requests retain that reservation; it represents authorized spend, not confirmed settlement. Only one authorization is permitted per fetch. A server-provided settlement receipt is not independently verified on-chain. Payment response bodies/headers are size-bounded and Casper redirects are refused.
 
-Counters are process-local and reset at UTC midnight or process restart. They are not a durable, multi-instance wallet limit.
+Counters are process-local and reset at UTC midnight; a process restart lazily restores today's settled and conservatively reserved unknown spend from the JSONL ledger. They are not a durable, multi-instance wallet limit.
 
 ### Limitations — read before relying on these budgets
 

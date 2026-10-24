@@ -7,6 +7,7 @@ import { createKeyPairSignerFromBytes } from "@solana/kit";
 import bs58 from "bs58";
 import { privateKeyToAccount } from "viem/accounts";
 import { fetchCasper, boundedText } from "./casper-fetch.js";
+import { createSafePaidTransport, PaidTransportFailure, transportLimitsFromEnv } from "./paid-transport.js";
 import { casperBudget } from "../casper/budget.js";
 import { selectCasperAccept, assertPayableCasperAccept, casperAmountMotes } from "../casper/accepts.js";
 import { CASPER_CHAIN, toCasperCaip2 } from "../casper/networks.js";
@@ -111,6 +112,17 @@ export function registerFetchTool(server: McpServer): void {
       const url = args.url;
       const method = (args.method || "GET").toUpperCase();
 
+      // Operator bounds are checked before any network I/O or possible signing.
+      let limits: ReturnType<typeof transportLimitsFromEnv>;
+      try {
+        limits = transportLimitsFromEnv();
+      } catch {
+        return { content: [{ type: "text" as const, text: JSON.stringify({
+          error: "Invalid x402 transport timeout or body-size configuration",
+          url, paid: false, cost_usdc: 0,
+        }) }] };
+      }
+
       // Policy context host (issue #19): derived once, used for per-service
       // budget state at both gate points (Casper + Step 3.5).
       let serviceHost = "";
@@ -151,9 +163,15 @@ export function registerFetchTool(server: McpServer): void {
 
       if (!useChain || useChain === CASPER_CHAIN || forcedChain) {
         try {
-          const probeResp = await fetch(url, {
+          // The unsigned probe has a whole-request deadline, not just an
+          // AbortSignal on the headers. Its body is bounded before SDK parsing.
+          const probe = createSafePaidTransport(fetch, {
+            totalTimeoutMs: limits.probeTimeoutMs,
+            preSignTimeoutMs: limits.probeTimeoutMs,
+            maxBodyBytes: Math.min(65536, limits.maxBodyBytes),
+          });
+          const probeResp = await probe.fetch(url, {
             method,
-            signal: AbortSignal.timeout(30000),
             redirect: "error",
             headers: args.body ? { "Content-Type": "application/json" } : {},
             body: args.body || undefined,
@@ -338,6 +356,9 @@ export function registerFetchTool(server: McpServer): void {
       const amountUsdc = probedAmountUsdc || 0.01;
 
       // Step 3: Create x402 client with the right scheme
+      // Keep this outside try so transport errors can be tagged as
+      // pre-sign/refused or post-send ambiguous in the catch/ledger.
+      let paidTransport: ReturnType<typeof createSafePaidTransport> | undefined;
       try {
         const client = new x402Client();
 
@@ -449,6 +470,18 @@ export function registerFetchTool(server: McpServer): void {
         // Step 4: Make the paid request — only through the guarded executor,
         // which validates/begins the intent and registers the enforcement (or
         // blocking) hook on the client before any payload can be signed.
+        paidTransport = createSafePaidTransport(fetch, {
+          totalTimeoutMs: limits.paidTimeoutMs,
+          preSignTimeoutMs: limits.preSignTimeoutMs,
+          maxBodyBytes: limits.maxBodyBytes,
+        });
+        // Register BEFORE intent validation so an expired pre-sign window
+        // cannot consume an authorisation or produce an x402 signature.
+        const transportAtSigning = paidTransport;
+        client.onBeforePaymentCreation(async () => transportAtSigning.preSignExpired()
+          ? { abort: true as const, reason: "INTENT_PRE_SIGN_TIMEOUT" }
+          : undefined);
+
         const guarded = await executeGuarded({
           intent,
           blockedCode,
@@ -472,7 +505,9 @@ export function registerFetchTool(server: McpServer): void {
             return { ok: verdict.ok, reason: verdict.reason };
           },
           run: async () => {
-            const paidFetch = wrapFetchWithPayment(fetch, client);
+            // Every internal SDK HTTP hop (402, hook, signed payment, SDK
+            // recovery) receives no-redirect + deadline + bounded-body rules.
+            const paidFetch = wrapFetchWithPayment(transportAtSigning.fetch, client);
             return paidFetch(url, {
               method,
               headers: args.body ? { "Content-Type": "application/json" } : {},
@@ -489,6 +524,8 @@ export function registerFetchTool(server: McpServer): void {
         }
         const resp = guarded.result;
 
+        // The underlying paid transport has already streamed and bounded the
+        // payload; this second .text() operates on a ≤1 MiB in-memory copy.
         const text = await resp.text();
         let bodyResult: unknown;
         try {
@@ -586,35 +623,56 @@ export function registerFetchTool(server: McpServer): void {
           }],
         };
       } catch (err: any) {
-        // Log failed payment attempt
+        const signingTimeout = /Payment creation aborted: INTENT_PRE_SIGN_TIMEOUT/.test(
+          String(err?.message ?? err),
+        );
+        const phaseUnknown = paidTransport?.wasPaymentDispatched() === true;
+        const uncertain = (err instanceof PaidTransportFailure && err.paid === "unknown") ||
+          phaseUnknown;
+        // A signed HTTP request can have reached the outside seller even when
+        // the local network times out or the body is truncated. "failed" or
+        // paid:false would be an UNSUPPORTED financial assertion. The neutral
+        // unknown ledger state does not enter settled-spend rehydration.
+        const transportErrorCode = signingTimeout ? "timeout_before_payment"
+          : err instanceof PaidTransportFailure ? err.code
+          : phaseUnknown ? "timeout_after_payment"
+          : "transport_failed";
         logPayment({
           timestamp: new Date().toISOString(),
-          url,
-          method,
-          chain: useChain,
+          url, method, chain: useChain,
           amount_usdc: 0,
-          status: "failed",
-          error: err.message,
+          attempted_amount_usdc: amountUsdc,
+          status: uncertain ? "unknown" : "failed",
+          error: transportErrorCode,
         });
+        // Reserve the entire possible amount in both budget views, including
+        // after a restart. This is NOT recorded as a confirmed settlement or
+        // used as an observed price in the anomaly baseline.
+        if (uncertain) recordServicePayment(url, amountUsdc);
 
-        // Issue #25: an intent-boundary abort means signing was refused before
-        // any payload existed — surface the structured refusal, never the raw
-        // SDK error string as the message.
-        const abortReasons = intentAbortReasons(String(err?.message ?? err));
-        if (abortReasons) {
-          return intentRefusal(url, useChain, amountUsdc, abortReasons);
+        if (signingTimeout || err instanceof PaidTransportFailure || uncertain) {
+          return { content: [{ type: "text" as const, text: JSON.stringify({
+            error: signingTimeout ? "Payment signing deadline expired before the payload was created"
+              : err instanceof PaidTransportFailure ? err.message
+              : "A signed payment request has an unverified transport outcome",
+            error_code: transportErrorCode,
+            url, chain: useChain,
+            paid: uncertain ? "unknown" : false,
+            cost_usdc: uncertain ? "unknown" : 0,
+            attempted_cost_usdc: amountUsdc,
+            do_not_retry_blindly: uncertain,
+          }) }] };
         }
 
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              error: `x402 payment failed: ${err.message}`,
-              chain: useChain,
-              url,
-            }),
-          }],
-        };
+        // Issue #25: a refused intent is still a structured no-signature
+        // refusal, never the SDK's untrusted raw message.
+        const abortReasons = intentAbortReasons(String(err?.message ?? err));
+        if (abortReasons) return intentRefusal(url, useChain, amountUsdc, abortReasons);
+
+        return { content: [{ type: "text" as const, text: JSON.stringify({
+          error: "x402 payment failed before any confirmed signed HTTP dispatch",
+          chain: useChain, url, paid: false,
+        }) }] };
       }
     }
   );

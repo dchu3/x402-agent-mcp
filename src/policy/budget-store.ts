@@ -33,9 +33,9 @@ function rehydrateFromLedger(): void {
   try {
     for (const line of readFileSync(LOG_PATH, "utf-8").split("\n")) {
       try {
-        const e = JSON.parse(line) as { status?: string; chain?: string; url?: string; amount_usdc?: number; timestamp?: string };
+        const e = JSON.parse(line) as { status?: string; chain?: string; url?: string; amount_usdc?: number; attempted_amount_usdc?: number; timestamp?: string };
         if (
-          e.status === "success" &&
+          (e.status === "success" || e.status === "unknown") &&
           e.chain !== "casper" &&
           typeof e.url === "string" &&
           typeof e.timestamp === "string" &&
@@ -43,7 +43,10 @@ function rehydrateFromLedger(): void {
         ) {
           const host = hostnameOf(e.url);
           if (host !== null) {
-            perServiceSpent.set(host, (perServiceSpent.get(host) ?? 0) + (e.amount_usdc ?? 0));
+            const reserved = e.status === "unknown" ? e.attempted_amount_usdc ?? 0 : e.amount_usdc ?? 0;
+            if (Number.isFinite(reserved) && reserved > 0) {
+              perServiceSpent.set(host, (perServiceSpent.get(host) ?? 0) + reserved);
+            }
           }
         }
       } catch {
@@ -82,7 +85,7 @@ export function getPerServiceSpent(host: string): number {
   return perServiceSpent.get((host || "").toLowerCase()) ?? 0;
 }
 
-/** Record a successful USD-settled payment against its service host, in
+/** Record a successful USD-settled payment OR conservatively uncertain amount against its service host, in
  * memory. Call this right next to payment-utils.logPayment for non-Casper
  * successes so the in-memory map and the ledger stay consistent (rehydration
  * rebuilds the same values after a restart). */
