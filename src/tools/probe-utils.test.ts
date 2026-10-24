@@ -290,7 +290,11 @@ describe('probePaymentChallenge — the discriminated liveness probe (issue #34)
     assert.equal(result.error, undefined);
     assert.ok(Number.isFinite(result.latency_ms) && result.latency_ms >= 0, 'latency is always recorded');
     assert.equal(seen.length, 1, 'exactly one request');
-    assert.equal(seen[0].init.redirect, 'error', 'redirects are never followed');
+    // Issue #58 disclosed deviation: the guard refuses redirects with
+    // redirect: "manual" + a stable REDIRECT_REFUSED code instead of
+    // redirect: "error"'s indistinct TypeError — the pinned intent
+    // ("redirects are never followed") is unchanged.
+    assert.equal(seen[0].init.redirect, 'manual', 'redirects are never followed');
   });
 
   it('a 402 whose header is missing or undecodable is no_402 (answered, but nothing decodable)', async () => {
@@ -307,13 +311,21 @@ describe('probePaymentChallenge — the discriminated liveness probe (issue #34)
   });
 
   it('any non-402 answered response is no_402 — never live by HTTP status alone', async () => {
-    for (const status of [200, 301, 404, 500]) {
+    // Issue #58: the redirect status moved out of this loop — with the shared
+    // transport guard a 3xx is REFUSED (stable REDIRECT_REFUSED error outcome),
+    // never followed and never classified as an answered no_402. The pinned
+    // intent ("redirects never count as liveness") now holds MORE strictly.
+    for (const status of [200, 404, 500]) {
       globalThis.fetch = (async () => new Response('body', { status })) as any;
       const result = await probePaymentChallenge('https://probe.invalid/api');
       assert.equal(result.kind, 'no_402', `status ${status} is an answer, not liveness`);
       assert.equal(result.challenge, undefined);
       assert.equal(result.error, undefined);
     }
+    globalThis.fetch = (async () => new Response('body', { status: 301, headers: { location: 'http://10.1.2.3/' } })) as any;
+    const redirected = await probePaymentChallenge('https://probe.invalid/api');
+    assert.equal(redirected.kind, 'error', 'a redirect is refused by the transport guard — never live, never merely no_402');
+    assert.equal(redirected.error?.startsWith('REDIRECT_REFUSED: '), true, `stable code prefix, got: ${redirected.error}`);
   });
 
   it('a thrown fetch is error with the diagnostic carried — and never live', async () => {

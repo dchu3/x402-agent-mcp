@@ -4,6 +4,11 @@ import { isIP } from "net";
 import { lookup } from "dns/promises";
 import { addToDirectory } from "../directory.js";
 import { fetchJson, fetchRootPaymentChallenge, parseChainFromNetwork } from "./probe-utils.js";
+// Issue #58 (D1): the SSRF address classifiers live in src/transport/guard.ts
+// now — one shared guard for every tool that fetches a caller- or
+// third-party-supplied URL. Re-exported here so existing imports keep working.
+import { isPrivateIPv4, isPrivateIPv6, isPrivateAddress } from "../transport/guard.js";
+export { isPrivateIPv4, isPrivateIPv6, isPrivateAddress };
 
 interface WellKnownX402 {
   x402Version?: number;
@@ -65,86 +70,11 @@ interface DiscoveryResult {
 // covers the practical attack; full DNS-rebinding prevention needs socket-level
 // pinning and remains a documented known limitation, as does redirect-following
 // in the shared probe helpers (fetchJson/fetchRootPaymentChallenge).
-
-/** True if ip is a private/loopback/link-local/unspecified IPv4 address:
- * 127/8, 10/8, 172.16/12, 192.168/16, 169.254/16, 0/8. Fail closed on junk. */
-export function isPrivateIPv4(ip: string): boolean {
-  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(ip);
-  if (!m) return true; // unparseable — fail closed
-  const a = Number(m[1]);
-  const b = Number(m[2]);
-  if (a === 0 || a === 10 || a === 127) return true;   // unspecified / 10/8 / loopback
-  if (a === 172 && b >= 16 && b <= 31) return true;    // 172.16/12
-  if (a === 192 && b === 168) return true;             // 192.168/16
-  if (a === 169 && b === 254) return true;             // 169.254/16 link-local
-  return false;
-}
-
-/** Expand an IPv6 literal into 8 numeric hextets, or null if unparseable.
- * Handles '::' compression and a trailing dotted quad (converted to two hextets). */
-function expandIPv6(ip: string): number[] | null {
-  if (!/^[0-9a-f:.]+$/.test(ip)) return null;
-  const hasCompression = ip.includes("::");
-  let head: string[];
-  let tail: string[];
-  if (hasCompression) {
-    const parts = ip.split("::");
-    if (parts.length !== 2) return null;
-    head = parts[0] === "" ? [] : parts[0].split(":");
-    tail = parts[1] === "" ? [] : parts[1].split(":");
-  } else {
-    head = ip.split(":");
-    tail = [];
-  }
-  const lastHead = head[head.length - 1];
-  const lastTail = tail[tail.length - 1];
-  const dotted = lastTail?.includes(".") ? lastTail : lastHead?.includes(".") ? lastHead : null;
-  if (dotted) {
-    const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(dotted);
-    if (!m) return null;
-    const hi = ((Number(m[1]) << 8) | Number(m[2])).toString(16);
-    const lo = ((Number(m[3]) << 8) | Number(m[4])).toString(16);
-    if (lastTail?.includes(".")) tail = [...tail.slice(0, -1), hi, lo];
-    else head = [...head.slice(0, -1), hi, lo];
-  }
-  if (head.length + tail.length > 8) return null;
-  const missing = 8 - head.length - tail.length;
-  if (!hasCompression && missing !== 0) return null;
-  const groups = [...head, ...Array<string>(missing).fill("0"), ...tail].map((g) => parseInt(g, 16));
-  if (groups.some((g) => Number.isNaN(g) || g < 0 || g > 0xffff)) return null;
-  return groups;
-}
-
-/** True if ip is a private/loopback/link-local/unspecified IPv6 address:
- * ::1, :: (unspecified), IPv4-mapped ::ffff:0:0/96 (judged by embedded IPv4),
- * fc00::/7 (ULA), fe80::/10 (link-local). Fail closed on junk. */
-export function isPrivateIPv6(ip: string): boolean {
-  const s = ip.toLowerCase();
-  // A dotted-quad tail (IPv4-mapped ::ffff:a.b.c.d, deprecated IPv4-compatible
-  // ::a.b.c.d, or NAT64-style literals) is judged by its embedded IPv4 address.
-  const colonParts = s.split(":");
-  const tail = colonParts[colonParts.length - 1];
-  if (tail.includes(".") && isPrivateIPv4(tail)) return true;
-  const groups = expandIPv6(s);
-  if (!groups) return true; // unparseable — fail closed
-  const [g0, g1, g2, g3, g4, g5, g6, g7] = groups;
-  if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0xffff) {
-    return isPrivateIPv4(`${(g6 >> 8) & 0xff}.${g6 & 0xff}.${(g7 >> 8) & 0xff}.${g7 & 0xff}`);
-  }
-  if (groups.every((g) => g === 0)) return true;                       // :: unspecified
-  if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0 && g6 === 0 && g7 === 1) return true; // ::1
-  if (g0 >= 0xfc00 && g0 <= 0xfdff) return true;                      // fc00::/7
-  if (g0 >= 0xfe80 && g0 <= 0xfebf) return true;                      // fe80::/10
-  return false;
-}
-
-/** Classifier used by the SSRF guard and its tests. */
-export function isPrivateAddress(ip: string): boolean {
-  const kind = isIP(ip);
-  if (kind === 4) return isPrivateIPv4(ip);
-  if (kind === 6) return isPrivateIPv6(ip);
-  return false;
-}
+//
+// Issue #58 (D1): the address classifiers moved to src/transport/guard.ts and
+// are re-exported from this module (above); this file keeps its own
+// discovery-shaped refusal + resolve flow (unresolvable hosts fall through to
+// the normal not-found path, unlike the stricter guardUrl refusals).
 
 function refusalFor(url: string): object {
   return {
