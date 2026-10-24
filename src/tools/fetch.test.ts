@@ -143,7 +143,11 @@ it('default policy: the paid flow completes exactly as before (compat proof thro
   const parsed = JSON.parse(result.content[0].text);
   assert.equal(parsed.status, 200, 'default policy must not refuse an ordinary payable request');
   assert.equal(parsed.paid, true);
-  assert.equal(parsed.cost_usdc, 0.01);
+  // Issue #53: this flow is the UNSIGNED pass-through (the SDK never creates a
+  // payload for the asset-less offer) — nothing was signed, so the recorded
+  // cost reads 0 (a free endpoint is not spend); the pre-#53 code reported the
+  // probe estimate here.
+  assert.equal(parsed.cost_usdc, 0);
   assert.equal(parsed.policy_decision, undefined, 'ALLOW adds no policy keys to the success output');
 });
 
@@ -188,23 +192,41 @@ it('casper default policy: gate passes and the pre-existing budget check still g
 it('per-service parity control: a 200 settled response still records and rehydrates identically after a restart', async () => {
   process.env.MAX_PAYMENT_PER_CALL = '50';
   process.env.MAX_DAILY_SPEND = '50';
+  process.env.SOLANA_RPC_URL = RPC_SIM_URL;
   const host = 'parity-200-test.invalid';
-  let calls = 0;
-  globalThis.fetch = (async () => {
-    calls++;
-    if (calls === 1) return probeChallengeFixed(); // probe: 402 with a $0.01 Solana offer
-    return new Response('{"result":"ok"}', { status: 200 }); // settled 200
+  const url = `https://${host}/api`;
+  // Post-#53 the settled amount must be a SIGNED amount, so this control
+  // drives the real bindable+signable flow (probe → attempt → signed retry)
+  // rather than the pre-#53 unsigned pass-through, which now records 0
+  // (nothing was signed → nothing spent).
+  let probes = 0, paidAttempts = 0, rpcCalls = 0, signedRetries = 0;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    const urlStr = input instanceof Request ? input.url : String(input);
+    if (urlStr.startsWith(RPC_SIM_URL)) {
+      rpcCalls++;
+      return rpcSimResponse(await requestBodyText(input, init));
+    }
+    assert.equal(urlStr, url, 'no other endpoint call may happen');
+    // noSignatureHeader (has-semantics): true ⇔ a payment-signature is present.
+    if (noSignatureHeader(input, init)) {
+      signedRetries++;
+      return new Response('{"result":"ok"}', { status: 200 }); // the signed retry settles
+    }
+    if (probes === 0) { probes++; return chargeableSolanaChallenge(url); } // the free 402 probe
+    paidAttempts++;
+    return chargeableSolanaChallenge(url); // the paid attempt that gets signed
   }) as any;
-  const result = await handler()({ url: `https://${host}/api` });
+  const result = await handler()({ url });
   const parsed = JSON.parse(result.content[0].text);
   assert.equal(parsed.status, 200, 'the flow must reach the accounting block through a settled 200');
+  assert.equal(signedRetries, 1, 'the settlement is a signed payment (the post-#53 accounting input)');
 
   const store = await import('../policy/budget-store.js') as typeof import('../policy/budget-store.js'); // same instance fetch.js records into
   const inProcess = store.getPerServiceSpent(host);
   const restarted = await import(`../policy/budget-store.js?parity200=${++bust}`) as typeof import('../policy/budget-store.js'); // "restart": fresh module against the same ledger
   const rehydrated = restarted.getPerServiceSpent(host);
-  assert.equal(inProcess, 0.01, 'a 200 response must still be recorded in-process');
-  assert.equal(rehydrated, 0.01, 'a 200 response must rehydrate from the ledger after a restart');
+  assert.equal(inProcess, 0.01, 'a signed 200 settlement must still be recorded in-process at the signed amount');
+  assert.equal(rehydrated, 0.01, 'the signed amount must rehydrate from the ledger after a restart');
   assert.equal(inProcess, rehydrated, 'in-process and rehydrated per-service spend must be identical');
 });
 
@@ -372,7 +394,9 @@ it('intent boundary compat proof: an unpaid endpoint answers 200 directly — no
   assert.equal(signatureSeen, false, 'no payment payload was ever created or attached');
   assert.equal(parsed.status, 200);
   assert.equal(parsed.paid, true);
-  assert.equal(parsed.cost_usdc, 0.01);
+  // Issue #53: nothing was signed in this pass-through — the recorded cost is
+  // 0 (pre-#53 this echoed the probe estimate).
+  assert.equal(parsed.cost_usdc, 0);
   assert.equal(parsed.policy_decision, undefined, 'ALLOW adds no policy keys to the success output');
 });
 
@@ -454,10 +478,16 @@ const BASE_PAYTO = '0x2222222222222222222222222222222222222222';
  * round-trip (the single mint-metadata fetch is answered by the simulated
  * RPC below). */
 function chargeableSolanaChallenge(requestUrl: string) {
+  return chargeableSolanaChallengeWith(requestUrl, '10000');
+}
+
+/** Same challenge with an explicit atomic amount (6-decimal USDC units) — used
+ * by the #53 signed-settlement baseline flows to parameterize the price. */
+function chargeableSolanaChallengeWith(requestUrl: string, amount: string) {
   const payload = JSON.stringify({
     x402Version: 2,
     resource: { url: requestUrl, description: '', mimeType: 'text/plain' },
-    accepts: [{ scheme: 'exact', network: SOLANA_CAIP2, asset: BINDABLE_SOLANA_ASSET, amount: '10000', payTo: CHARGE_PAYTO_B58, maxTimeoutSeconds: 60, extra: { name: 'USDC', feePayer: CHARGE_FEE_PAYER_B58, recentBlockhash: CHARGE_BLOCKHASH_B58 } }],
+    accepts: [{ scheme: 'exact', network: SOLANA_CAIP2, asset: BINDABLE_SOLANA_ASSET, amount, payTo: CHARGE_PAYTO_B58, maxTimeoutSeconds: 60, extra: { name: 'USDC', feePayer: CHARGE_FEE_PAYER_B58, recentBlockhash: CHARGE_BLOCKHASH_B58 } }],
   });
   return new Response('Payment Required', { status: 402, headers: { 'payment-required': b64url(payload) } });
 }
@@ -817,15 +847,26 @@ const ANOMALY_ENABLED = {
   enabled: true, window: 20, warnZ: 2.0, denyZ: 3.0, minSamples: 5, seedFromDirectory: true, defaultTolerance: 2.0,
 };
 
-/** Grow the host's in-process baseline through REAL settlements (probe 402 +
- * settled 200), so the baseline provably comes from the fetch.ts accounting
- * guard — no ledger pre-writing, no rehydration-timing dependence. */
+/** Grow the host's in-process baseline through REAL SIGNED settlements (probe
+ * 402 → paid attempt 402 → signed retry 200). Post-#53 a bare pass-through
+ * 200-after-probe records 0 spend (nothing was signed), so baseline samples
+ * must come from bindable, signed settlements — the atomic amount of the i-th
+ * probe/attempt pair is probeAmounts[i]. No ledger pre-writing, no
+ * rehydration-timing dependence. */
 async function growBaseline(url: string, probeAmounts: string[]) {
-  let calls = 0;
-  globalThis.fetch = (async (input: unknown) => {
-    calls++;
-    if (calls % 2 === 1) return probeChallengeAmount(probeAmounts[Math.floor(calls / 2)]);
-    return new Response('{"result":"ok"}', { status: 200 }); // settled 200
+  process.env.SOLANA_RPC_URL = RPC_SIM_URL; // only the mint-metadata fetch is simulated
+  let unsignedChallenges = 0;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    const urlStr = input instanceof Request ? input.url : String(input);
+    if (urlStr.startsWith(RPC_SIM_URL)) {
+      return rpcSimResponse(await requestBodyText(input, init));
+    }
+    if (noSignatureHeader(input, init)) {
+      return new Response('{"result":"ok"}', { status: 200 }); // the signed retry settles
+    }
+    const amount = probeAmounts[unsignedChallenges >> 1] ?? probeAmounts[probeAmounts.length - 1];
+    unsignedChallenges++;
+    return chargeableSolanaChallengeWith(url, amount); // the probe AND the paid attempt bind the same offer
   }) as any;
   for (let i = 0; i < probeAmounts.length; i++) {
     const r = await handler()({ url });
@@ -923,22 +964,33 @@ it('price anomaly: a non-200 settled response never moves the baseline (same gua
 it('price anomaly: the compat default keeps the flow untouched — the spike pays as before (enabled false ⇒ no inputs, no refusal)', async () => {
   process.env.MAX_PAYMENT_PER_CALL = '50';
   process.env.MAX_DAILY_SPEND = '50';
+  process.env.SOLANA_RPC_URL = RPC_SIM_URL;
   // No POLICY_CONFIG_PATH ⇒ the behavior-compat default (anomaly disabled).
   const store = await import('../policy/anomaly-store.js') as typeof import('../policy/anomaly-store.js');
   const host = 'anomaly-compat-test.invalid';
   const url = `https://${host}/api`;
-  let calls = 0;
-  globalThis.fetch = (async () => {
-    calls++;
-    if (calls === 1) return probeChallengeAmount('50000'); // a $0.05 spike offer
-    return new Response('{"result":"ok"}', { status: 200 });
+  // Post-#53 the stored settled amount must be the SIGNED amount, so the
+  // settlement here is a real bindable+signed $0.50 payment (50000 atomic) —
+  // not the unsigned pass-through, which records 0 spend now.
+  let unsignedChallenges = 0;
+  globalThis.fetch = (async (input: unknown, init: unknown) => {
+    const urlStr = input instanceof Request ? input.url : String(input);
+    if (urlStr.startsWith(RPC_SIM_URL)) {
+      return rpcSimResponse(await requestBodyText(input, init));
+    }
+    if (noSignatureHeader(input, init)) {
+      return new Response('{"result":"ok"}', { status: 200 });
+    }
+    unsignedChallenges++;
+    return chargeableSolanaChallengeWith(url, '50000'); // probe AND paid attempt: the same $0.50 offer
   }) as any;
   const result = await handler()({ url });
   const parsed = JSON.parse(result.content[0].text);
   assert.equal(parsed.status, 200);
   assert.equal(parsed.paid, true);
+  assert.equal(parsed.cost_usdc, 0.05, 'the recorded cost is the SIGNED amount');
   assert.equal(parsed.policy_decision, undefined, 'ALLOW adds no policy keys to the success output');
-  // The settled amount still feeds the (ungated) baseline writer so a later
+  // The signed amount still feeds the (ungated) baseline writer so a later
   // opt-in rehydrates the history — but reads stay gated on enabled.
   assert.deepEqual(store.getBaseline(host)!.samples, [0.05]);
 });

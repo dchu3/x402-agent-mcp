@@ -94,15 +94,24 @@ Check the payment ledger for an entry with `currency: "wCSPR"` and an exact `amo
 
 | Env var | Default | Description |
 |---------|---------|-------------|
-| `MAX_PAYMENT_PER_CALL` | 0.50 | Reject any single call above this amount (USDC) |
-| `MAX_DAILY_SPEND` | 10.00 | Reject after cumulative daily spend exceeded (USDC) |
-| `PAYMENT_LOG_PATH` | ./x402-payments.jsonl | Path to payment log file (gitignored) |
+| `MAX_PAYMENT_PER_CALL` | 0.50 | Reject any single call above this amount (USDC). Fail-closed: a value that does not parse as a plain non-negative decimal reads as 0 and disables payments |
+| `MAX_DAILY_SPEND` | 10.00 | Reject after cumulative daily spend exceeded (USDC). Fail-closed on malformed values like the per-call cap |
+| `PAYMENT_LOG_PATH` | `<state dir>/x402-payments.jsonl` | Explicit ledger path — wins outright; when unset the state-dir ledger is used and a legacy working-directory ledger is counted read-only |
+| `X402_STATE_DIR` | `~/.x402-agent-mcp` | Per-user state directory holding the spend ledger (`x402-payments.jsonl`) when `PAYMENT_LOG_PATH` is unset |
 | `X402_DIRECTORY_PATH` | ./endpoints.json | Path to the endpoint directory file (gitignored); set to isolate tests/sandboxes from the live directory |
 | `X402_INTENT_TTL_MS` | 60000 | Payment-intent time-to-live in milliseconds (see Payment Intent Boundary); an expired intent can never be signed |
 
-Payments share one `x402-payments.jsonl` ledger with timestamp, URL, chain, amount, tx hash, and status. USDC entries use `amount_usdc`; Casper entries use `currency: "wCSPR"` and an exact `amount_motes` string. Base/Solana counters are tracked by chain and summed for the existing USD daily limit. Casper has an independent mote counter. A `failed` row (issue #45) is self-describing: it carries the HTTP status in `http_status` and the refusal reason in `error` (the gateway's error string, e.g. an insufficient-balance-style challenge message, or `HTTP <status>` when the body is not JSON), `amount_usdc` reads 0 because nothing settled, and the attempted price is preserved in `attempted_amount_usdc`.
+Payments share one ledger (by default `<state dir>/x402-payments.jsonl`) with timestamp, URL, chain, amount, tx hash, and status. USDC entries use `amount_usdc`; Casper entries use `currency: "wCSPR"` and an exact `amount_motes` string. Base/Solana counters are tracked by chain and summed for the existing USD daily limit. Casper has an independent mote counter. A `failed` row (issue #45) is self-describing: it carries the HTTP status in `http_status` and the refusal reason in `error` (the gateway's error string, e.g. an insufficient-balance-style challenge message, or `HTTP <status>` when the body is not JSON), `amount_usdc` reads 0 because nothing settled, and the attempted price is preserved in `attempted_amount_usdc`.
 
-Casper reserves budget synchronously before signing to prevent concurrent overspending. Failed or ambiguous requests retain that reservation; it represents authorized spend, not confirmed settlement. Only one authorization is permitted per fetch. A server-provided settlement receipt is not independently verified on-chain. Payment response bodies/headers are size-bounded and Casper redirects are refused.
+### Spend accounting (issue #53/#54)
+
+What you are charged derives from the SIGNED payment only: the ledger `amount_usdc` of a settled call is the bound intent's atomic amount narrowed once to USD (`usdFromAtomic`, integer arithmetic), never a value from the seller's response body and never the probe estimate. A call that signed nothing records 0 — a free 200 is not spend. The seller's own cost figure, when their body carries one, is surfaced as `seller_reported_cost` information-only: it cannot move accounting, policy decisions, or what the caps read. The caps themselves fail closed — a `MAX_PAYMENT_PER_CALL`/`MAX_DAILY_SPEND` env value that is not a plain non-negative decimal (`abc`, `1e3`, `-1`, empty) reads as 0 and denies every payment instead of silently disabling the check.
+
+Overlap safety (#54 req 1): each paid call reserves its signed amount synchronously BEFORE signing — the reserve's check+insert is one synchronous step (Node's single-threaded atomicity), spanning the global and the per-service scope — and the hold is settled into the ledger write or released whenever nothing was signed, so overlapping calls cannot each pass the same remaining budget. No reservation is released merely because a response was slow.
+
+Ledger location (#54 req 3): an explicit `PAYMENT_LOG_PATH` wins. When it is unset, the ledger lives in `<X402_STATE_DIR|~/.x402-agent-mcp>/x402-payments.jsonl` and a legacy working-directory `x402-payments.jsonl` is counted once, read-only — an upgrade never resets today's spend to 0.
+
+Casper reserves budget synchronously before signing to prevent concurrent overspending, and (#54 req 1) the USD chains now reserve their SIGNED amount the same way (issue #53: the amount that costs you money is the signed intent's amount — see Spend accounting). Failed or ambiguous requests retain that reservation; it represents authorized spend, not confirmed settlement. Only one authorization is permitted per fetch. A server-provided settlement receipt is not independently verified on-chain. Payment response bodies/headers are size-bounded and Casper redirects are refused.
 
 Counters are process-local and reset at UTC midnight or process restart. They are not a durable, multi-instance wallet limit.
 
@@ -110,7 +119,7 @@ Counters are process-local and reset at UTC midnight or process restart. They ar
 
 - **Per-process counters.** Daily spend lives in the memory of one MCP process (rehydrated once from the ledger on the first budget check). It is never a wallet-level limit.
 - **Multiple instances = separate budgets.** Running two MCP processes gives each its own counter, so the real daily spend can reach N × `MAX_DAILY_SPEND`. Durable multi-instance enforcement requires an external store and is on the roadmap; until then, run one instance per budget scope.
-- **The USDC daily cap can be overshot by in-flight concurrency.** The guard checks `MAX_DAILY_SPEND` before paying and records spend only after settlement; the await points between the check and the log inside a paid fetch mean several in-flight requests can pass the same check. The synchronous check-then-log span itself is exact (locked by the concurrent-consumption test in `src/payment-utils.rehydrate.test.ts`), but cross-await atomicity must not be assumed.
+- **The USDC daily cap is protected against in-flight concurrency (fix, #54 req 1).** Each paid call now reserves its signed amount synchronously before signing — the reserve's check+insert is one synchronous step, so overlapping calls cannot each pass the same remaining budget (`src/reservations.test.ts`: N interleaved reservations against a cap of k×price → exactly k are granted; the reserve holds span release/settle across every no-sign/throw path). Pre-#54, concurrent in-flight requests could overshoot until the ledger write; holds are process-local like the counters themselves.
 - **Casper is the fail-closed equivalent class.** Casper reserves budget synchronously *before* signing, so concurrent Casper calls cannot overspend, and an unset or invalid budget disables Casper payments entirely. Verified by `src/casper/budget.test.ts`: "daily reservations prevent concurrent callers overspending", "checks changed requirements at signing and blocks retries", "unset either Casper budget disables signing", "invalid, zero and negative budgets disable payment", and "rolls only the Casper counter at UTC day change".
 
 ## Payment Policy Engine (Phase 1)

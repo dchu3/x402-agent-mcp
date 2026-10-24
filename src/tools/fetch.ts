@@ -15,8 +15,12 @@ import { parseChainFromNetwork } from "./probe-utils.js";
 import { checkSpendingLimit, logPayment, getDailySpent, getMaxPerCall, getMaxDailySpend } from "../payment-utils.js";
 import { getPolicyEngine, buildPolicyContext, livenessVerdictForUrl } from "../policy/config.js";
 import { getPerServiceSpent, recordServicePayment } from "../policy/budget-store.js";
+// Issue #54 (req 1): the reserve-before-sign registry — overlapping calls
+// cannot each pass the same remaining budget while one is still being paid.
+import { releaseReservation, reserveSpend, reservedUsd, settleReservation } from "../reservations.js";
 import { getAnomalyInputs, recordSettledAmount } from "../policy/anomaly-store.js";
 import { extractSettlementReceipt, RECEIPT_VERIFIED, RECEIPT_NOTE } from "./receipt-utils.js";
+import { usdFromAtomic, sellerReportedCostUsd, parseBoundedBody } from "./accounting.js";
 import { createFromOffer, intentManager } from "../payment-intent/manager.js";
 import { executeGuarded } from "../payment-intent/executor.js";
 import type { IntentRejectCode, PaymentIntent } from "../payment-intent/types.js";
@@ -387,7 +391,10 @@ export function registerFetchTool(server: McpServer): void {
         // core never touches the ledger or the directory.
         const policyResult = getPolicyEngine().evaluate(
           buildPolicyContext(url, useChain, "USDC", amountUsdc, { recipient: probedOffer?.payTo }),
-          { dailySpentUsd: getDailySpent(), perServiceSpentUsd: getPerServiceSpent(serviceHost) },
+          // Issue #54 (req 1): outstanding reservations hold budget that is
+          // not in the ledger yet — the per-service context must include this
+          // host's holds or overlapping calls read a stale picture.
+          { dailySpentUsd: getDailySpent(), perServiceSpentUsd: getPerServiceSpent(serviceHost) + reservedUsd(`service:${serviceHost}`) },
           getAnomalyInputs(url),
         );
         if (policyResult.decision !== "ALLOW") {
@@ -446,145 +453,240 @@ export function registerFetchTool(server: McpServer): void {
           };
         }
 
-        // Step 4: Make the paid request — only through the guarded executor,
-        // which validates/begins the intent and registers the enforcement (or
-        // blocking) hook on the client before any payload can be signed.
-        const guarded = await executeGuarded({
-          intent,
-          blockedCode,
-          manager: intentManager,
-          client,
-          label: "x402_fetch",
-          // Issue #34 (L9): signing-time liveness recheck. Re-derives the
-          // verdict from the CACHED directory + config + the real clock — no
-          // new network I/O — at payload creation, inside the enforcement
-          // hook: a record that aged out or flipped to error/no_402 between
-          // the Step 3.5 gate and the signature aborts with
-          // INTENT_ENDPOINT_NOT_LIVE (surfaced below via intentAbortReasons,
-          // which maps INTENT_* markers onto the structured refusal shape).
-          // Fail-closed on the unreachable re-derivation failure path: the
-          // same failure at the gate above would already have refused.
-          recheck: () => {
-            const verdict = livenessVerdictForUrl(url);
-            if (verdict === undefined) {
-              return { ok: false, reason: "the liveness verdict could not be re-derived at signing time — failing closed" };
-            }
-            return { ok: verdict.ok, reason: verdict.reason };
-          },
-          run: async () => {
-            const paidFetch = wrapFetchWithPayment(fetch, client);
-            return paidFetch(url, {
-              method,
-              headers: args.body ? { "Content-Type": "application/json" } : {},
-              body: args.body || undefined,
-            });
-          },
-        });
-        if (guarded.ok === false) {
-          // validate/beginAttempt failed — the payment layer never ran.
+        // Issue #53: the USD value of the SIGNED candidate amount — derived
+        // from the intent's bound atomic amount with integer arithmetic and a
+        // single narrowing to `number` (usdFromAtomic), never from the probe
+        // estimate and never from the response. `amountUsdc` above remains the
+        // policy engine's estimate input; this is the money.
+        // Fail-closed: an unconvertible amount is treated as unpayable (the
+        // recorded amount then reads 0 with the raw atomic fields on the row
+        // for audit — never a made-up value); for an intent created by
+        // createFromOffer (validated digits + decimals) this is unreachable.
+        const signedAmountUsdc = intent !== null ? usdFromAtomic(intent.amountAtomic, intent.decimals) : undefined;
+        if (intent !== null && signedAmountUsdc === undefined) {
           return intentRefusal(url, useChain, amountUsdc, [
-            { code: "INTENT_UNAUTHORISED", message: `payment-intent boundary refused execution (${guarded.code})` },
-            { code: guarded.code, message: `${guarded.code}: ${guarded.message}` },
+            { code: "INTENT_UNAUTHORISED", message: "the signed amount could not be converted to USD for spend accounting — refusing before signing (fail closed)" },
+            { code: "AMOUNT_UNBINDABLE", message: "atomic amount of the bound intent is not convertible even though the intent itself is valid" },
           ]);
         }
-        const resp = guarded.result;
 
-        const text = await resp.text();
-        let bodyResult: unknown;
-        try {
-          bodyResult = JSON.parse(text);
-        } catch {
-          bodyResult = text.substring(0, 5000);
-        }
+        // Issue #53/#54: flips inside the enforcement hook right after the
+        // intent is consumed — the only point where a signature may exist.
+        let payloadSigned = false;
 
-        const { receipt: paymentReceipt, txHash } = extractSettlementReceipt(resp.headers);
-
-        // The exact accounting rule payment-utils.logPayment counts by (and
-        // ledger rehydration filters by): only a 200 counts as spend.
-        const isSuccessfulPayment = resp.status === 200;
-
-        // Extract actual cost from response body if available
-        let actualCost = amountUsdc;
-        if (bodyResult && typeof bodyResult === "object") {
-          const meta = (bodyResult as any).meta;
-          if (meta?.cost?.usd) actualCost = meta.cost.usd;
-        }
-
-        // Issue #45: a refused (non-200) paid fetch must still leave a
-        // self-describing ledger row. The reason is in hand right here — the
-        // gateway's 402/5xx body carries its own `error` string (verified live
-        // 2026-09-28: {"x402Version":2,"error":"Payment verification failed —
-        // invalid or insufficient payment","accepts":[...]}) — and resp.status
-        // is known at this call site; today both are discarded, so the only
-        // way to tell "client unfunded / payment refused" from "settled, then
-        // the server failed" is the seller's server-side audit log. A non-JSON
-        // body falls back to `HTTP <status>` — the field is never absent on a
-        // non-200 row. Nothing settles on a non-200, so the settled-spend
-        // field reads 0 and the attempted price moves to
-        // attempted_amount_usdc: every accounting consumer (ledger
-        // rehydration, budget-store, anomaly-store) gates on
-        // status === "success", so no budget, cap or baseline changes. The
-        // 200 (success) path below stays byte-identical to the pre-#45 row.
-        const failureRowFields = isSuccessfulPayment
-          ? {}
-          : {
-              amount_usdc: 0,
-              attempted_amount_usdc: actualCost,
-              http_status: resp.status,
-              error:
-                typeof bodyResult === "object" && bodyResult !== null &&
-                typeof (bodyResult as any).error === "string" && (bodyResult as any).error !== ""
-                  ? (bodyResult as any).error
-                  : `HTTP ${resp.status}`,
-            };
-
-        logPayment({
-          timestamp: new Date().toISOString(),
-          url,
-          method,
-          chain: useChain,
-          ...(isSuccessfulPayment ? { amount_usdc: actualCost } : failureRowFields),
-          tx_hash: txHash,
-          status: isSuccessfulPayment ? "success" : "failed",
+        // Issue #54 (req 1): reserve the signed candidate amount BEFORE the
+        // payment layer runs. The reserve’s check+insert is synchronous
+        // (single-threaded), so overlapping tool calls cannot each pass the
+        // same remaining budget while one is still being paid. The hold spans
+        // ‘global’ (the daily cap) and ‘service:<host>’ (the per-service
+        // context the policy gate reads above) and is settled right after the
+        // ledger write on the signed path and released on every path that
+        // never signed (the finally below). No reservation is released merely
+        // because the response was slow — only signing, or its absence, resolves it.
+        const reservation = reserveSpend({
+          amountUsd: signedAmountUsdc ?? amountUsdc,
+          scopes: [`service:${serviceHost}`],
         });
-
-        // Issue #19: per-service budget accounting — recorded right next to
-        // logPayment for USD-settled successes (same rules as the global
-        // tracker; rehydration rebuilds identical values after a restart).
-        // Post-#23 parity fix: the guard MUST be the same one logPayment
-        // counts by (resp.status === 200). Rehydration filters ledger entries
-        // by status === "success", so recording a non-200 settled response
-        // here (e.g. 500-after-settlement) would count it in-process while
-        // the ledger drops it — per-service caps would silently loosen after
-        // a restart (in-process vs post-restart spend divergence).
-        if (isSuccessfulPayment) {
-          recordServicePayment(url, actualCost);
-          // Issue #30: the settled amount feeds the per-service price baseline
-          // (rule 4.6) — recorded ONLY on a successful settlement, next to
-          // recordServicePayment under the SAME guard logPayment counts by, so
-          // a denied or failed payment can never poison the baseline and the
-          // ledger rehydrates identical values after a restart. Never logged on
-          // the failure path.
-          recordSettledAmount(url, actualCost);
+        if (reservation.ok === false) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                error: `Spending limit exceeded: ${reservation.reason}`,
+                url,
+                chain: useChain,
+                estimated_cost_usdc: amountUsdc,
+                daily_spent_usdc: getDailySpent(),
+                reserved_usdc: reservedUsd("global"),
+                max_per_call: getMaxPerCall(),
+                max_daily: getMaxDailySpend(),
+              }),
+            }],
+          };
         }
+        try {
 
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              status: resp.status,
-              url,
-              chain: useChain,
-              paid: resp.status === 200,
-              cost_usdc: actualCost,
-              daily_spent_usdc: parseFloat(getDailySpent().toFixed(4)),
-              payment_receipt: paymentReceipt,
-              receipt_verified: RECEIPT_VERIFIED,
-              receipt_note: RECEIPT_NOTE,
-              body: bodyResult,
-            }),
-          }],
-        };
+          // Step 4: Make the paid request — only through the guarded executor,
+          // which validates/begins the intent and registers the enforcement (or
+          // blocking) hook on the client before any payload can be signed.
+          const guarded = await executeGuarded({
+            intent,
+            blockedCode,
+            manager: intentManager,
+            client,
+            label: "x402_fetch",
+            // Issue #53/#54: the "was anything signed?" signal — fires inside
+            // the enforcement hook after the intent is consumed, the only point
+            // where a signature may exist. Never fires on an abort or through
+            // the blocking hook (nothing was signed in either case).
+            onPayloadSigned: () => { payloadSigned = true; },
+            // Issue #34 (L9): signing-time liveness recheck. Re-derives the
+            // verdict from the CACHED directory + config + the real clock — no
+            // new network I/O — at payload creation, inside the enforcement
+            // hook: a record that aged out or flipped to error/no_402 between
+            // the Step 3.5 gate and the signature aborts with
+            // INTENT_ENDPOINT_NOT_LIVE (surfaced below via intentAbortReasons,
+            // which maps INTENT_* markers onto the structured refusal shape).
+            // Fail-closed on the unreachable re-derivation failure path: the
+            // same failure at the gate above would already have refused.
+            recheck: () => {
+              const verdict = livenessVerdictForUrl(url);
+              if (verdict === undefined) {
+                return { ok: false, reason: "the liveness verdict could not be re-derived at signing time — failing closed" };
+              }
+              return { ok: verdict.ok, reason: verdict.reason };
+            },
+            run: async () => {
+              const paidFetch = wrapFetchWithPayment(fetch, client);
+              return paidFetch(url, {
+                method,
+                headers: args.body ? { "Content-Type": "application/json" } : {},
+                body: args.body || undefined,
+              });
+            },
+          });
+          if (guarded.ok === false) {
+            // validate/beginAttempt failed — the payment layer never ran.
+            return intentRefusal(url, useChain, amountUsdc, [
+              { code: "INTENT_UNAUTHORISED", message: `payment-intent boundary refused execution (${guarded.code})` },
+              { code: guarded.code, message: `${guarded.code}: ${guarded.message}` },
+            ]);
+          }
+          const resp = guarded.result;
+
+          const text = await resp.text();
+          const bodyResult = parseBoundedBody(text);
+
+          const { receipt: paymentReceipt, txHash } = extractSettlementReceipt(resp.headers);
+
+          // The exact accounting rule payment-utils.logPayment counts by (and
+          // ledger rehydration filters by): only a 200 counts as spend.
+          const isSuccessfulPayment = resp.status === 200;
+
+          // Issue #53: the recorded amount comes from the SIGNED payment only —
+          // the intent amount via usdFromAtomic above — never from the seller's
+          // body and never from the probe estimate. The seller-reported cost is
+          // carried information-only below (bounded, type-checked, and
+          // structurally barred from every accounting/decision call).
+          //
+          // Accounting rule: payloadSigned === false means nothing was signed
+          // or sent — record 0 (a 200 from a free endpoint is not spend).
+          // A signed-but-never-sent payload still counts (over-count is the
+          // fail-closed direction). Counting signed-but-UNSERVED payments is
+          // issue #54 req 2 — deliberately NOT decided here.
+          const signedRecordedUsdc = payloadSigned ? (signedAmountUsdc ?? 0) : 0;
+          const recordedAmountUsdc = isSuccessfulPayment ? signedRecordedUsdc : 0; // the row's amount_usdc
+          // The price the flow attempted: the signed amount when a payload was
+          // signed, else the probe estimate (used for nothing but display and
+          // the #45 attempted_amount_usdc row field).
+          const attemptedAmountUsdc = payloadSigned ? (signedAmountUsdc ?? 0) : amountUsdc;
+          const sellerReportedCost = sellerReportedCostUsd(bodyResult);
+
+          // Exact audit trail of the SIGNED payment on settled rows (#53). An
+          // unsigned 200 (nothing signed — a free endpoint) must not dress up
+          // as a paid settlement, so the trail only prints when a payload was
+          // actually signed.
+          const intentTrail = payloadSigned && intent !== null
+            ? {
+                amount_atomic: intent.amountAtomic,
+                decimals: intent.decimals,
+                ...(intent.asset !== "" ? { asset: intent.asset } : {}),
+              }
+            : {};
+
+          // Issue #45: a refused (non-200) paid fetch must still leave a
+          // self-describing ledger row. The reason is in hand right here — the
+          // gateway's 402/5xx body carries its own `error` string (verified live
+          // 2026-09-28: {"x402Version":2,"error":"Payment verification failed —
+          // invalid or insufficient payment","accepts":[...]}) — and resp.status
+          // is known at this call site; today both are discarded, so the only
+          // way to tell "client unfunded / payment refused" from "settled, then
+          // the server failed" is the seller's server-side audit log. A non-JSON
+          // body falls back to `HTTP <status>` — the field is never absent on a
+          // non-200 row. Nothing settles on a non-200, so the settled-spend
+          // field reads 0 and the attempted price moves to
+          // attempted_amount_usdc: every accounting consumer (ledger
+          // rehydration, budget-store, anomaly-store) gates on
+          // status === "success", so no budget, cap or baseline changes. The
+          // 200 (success) path below stays byte-identical to the pre-#45 row.
+          const failureRowFields = isSuccessfulPayment
+            ? {}
+            : {
+                amount_usdc: 0,
+                attempted_amount_usdc: attemptedAmountUsdc,
+                http_status: resp.status,
+                error:
+                  typeof bodyResult === "object" && bodyResult !== null &&
+                  typeof (bodyResult as any).error === "string" && (bodyResult as any).error !== ""
+                    ? (bodyResult as any).error
+                    : `HTTP ${resp.status}`,
+              };
+
+          logPayment({
+            timestamp: new Date().toISOString(),
+            url,
+            method,
+            chain: useChain,
+            ...(isSuccessfulPayment ? { amount_usdc: recordedAmountUsdc, ...intentTrail } : failureRowFields),
+            tx_hash: txHash,
+            status: isSuccessfulPayment ? "success" : "failed",
+          });
+          // Issue #54 (req 1): the hold converts to ledger accounting exactly
+          // once the ledger wrote the signed amount (idempotent — the finally
+          // below repeats the same call, which is a no-op by id).
+          if (payloadSigned) settleReservation(reservation.id);
+
+          // Issue #19: per-service budget accounting — recorded right next to
+          // logPayment for USD-settled successes (same rules as the global
+          // tracker; rehydration rebuilds identical values after a restart).
+          // Post-#23 parity fix: the guard MUST be the same one logPayment
+          // counts by (resp.status === 200). Rehydration filters ledger entries
+          // by status === "success", so recording a non-200 settled response
+          // here (e.g. 500-after-settlement) would count it in-process while
+          // the ledger drops it — per-service caps would silently loosen after
+          // a restart (in-process vs post-restart spend divergence).
+          if (isSuccessfulPayment) {
+            recordServicePayment(url, recordedAmountUsdc);
+            // Issue #30: the settled amount feeds the per-service price baseline
+            // (rule 4.6) — recorded ONLY on a successful settlement, next to
+            // recordServicePayment under the SAME guard logPayment counts by, so
+            // a denied or failed payment can never poison the baseline and the
+            // ledger rehydrates identical values after a restart. Never logged on
+            // the failure path. Post-#53: the recorded amount is the SIGNED
+            // amount; an unsigned pass-through (a free 200) records 0.
+            recordSettledAmount(url, recordedAmountUsdc);
+          }
+
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                status: resp.status,
+                url,
+                chain: useChain,
+                paid: resp.status === 200,
+                cost_usdc: recordedAmountUsdc,
+                ...(sellerReportedCost !== undefined ? { seller_reported_cost: sellerReportedCost } : {}),
+                daily_spent_usdc: parseFloat(getDailySpent().toFixed(4)),
+                payment_receipt: paymentReceipt,
+                receipt_verified: RECEIPT_VERIFIED,
+                receipt_note: RECEIPT_NOTE,
+                body: bodyResult,
+              }),
+            }],
+          };
+        } finally {
+          // Issue #54 (req 1): the finally guarantees the hold resolves on
+          // every path. After signing, the ledger write accounted the amount
+          // — settle (idempotent: it is also placed right after the ledger
+          // write above, so a throw between the write and this finally
+          // cannot double-count). On every path that did not sign, release:
+          // policy/limit refusal, guarded.ok === false, any throw before
+          // signing, or a signed-but-aborted flow. No reservation is
+          // released merely because the response was slow.
+          if (payloadSigned) settleReservation(reservation.id);
+          else releaseReservation(reservation.id);
+        }
       } catch (err: any) {
         // Log failed payment attempt
         logPayment({

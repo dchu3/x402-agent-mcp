@@ -29,6 +29,12 @@ export interface IntentEnforcementArgs {
   manager: IntentManager;
   /** Free-form label for diagnostics (which executor authorised this). */
   executorLabel: string;
+  /** Issue #53/#54: invoked ONCE immediately after `manager.consume()`
+   * succeeds — the only point in the flow where a signature can exist — so
+   * the caller can settle a pre-sign budget reservation and attribute
+   * spend to the signed payload. Never invoked on abort (nothing was
+   * signed) and never by the blocking hook. */
+  onPayloadSigned?: () => void;
 }
 
 /** Build the enforcement hook for an executable intent. At payload creation
@@ -37,14 +43,16 @@ export interface IntentEnforcementArgs {
  * one authorisation per intent. Abort reasons are machine-parseable:
  * INTENT_<CODE> for validation failures, INTENT_OFFER_MISMATCH:<field> for
  * drift between the probed offer and the selected requirements. */
-export function intentEnforcement({ intent, manager, executorLabel }: IntentEnforcementArgs): BeforePaymentCreationHook {
+export function intentEnforcement({ intent, manager, executorLabel, onPayloadSigned }: IntentEnforcementArgs): BeforePaymentCreationHook {
   void executorLabel;
   return async (context) => {
     const v = manager.validate(intent);
     if (v.valid === false) return { abort: true as const, reason: `INTENT_${v.code}` };
     const m = manager.matchesRequirements(intent, context.selectedRequirements);
     if (m.match === false) return { abort: true as const, reason: `INTENT_OFFER_MISMATCH:${m.field}` };
-    manager.consume(intent);
+    const c = manager.consume(intent);
+    if (c.valid === false) return { abort: true as const, reason: `INTENT_${c.code}` };
+    onPayloadSigned?.();
   };
 }
 
@@ -85,6 +93,12 @@ export interface ExecuteGuardedArgs<T> {
    * the signature can no longer be paid. Deterministic, caller-supplied; the
    * closure performs no network I/O. */
   recheck?: () => { ok: boolean; reason?: string };
+  /** Issue #53/#54: the "was anything signed?" signal. Invoked inside the
+   * enforcement hook right after the intent is consumed (payload creation
+   * succeeded — the only point where a signature may exist). fetch.ts uses it
+   * to settle the pre-sign reservation and to attribute exactly the signed
+   * amount to the ledger. */
+  onPayloadSigned?: () => void;
 }
 
 /** The only sanctioned execution wrapper for paid fetches.
@@ -112,7 +126,7 @@ export async function executeGuarded<T>(args: ExecuteGuardedArgs<T>): Promise<Gu
   if (v.valid === false) return { ok: false, code: v.code, message: v.message };
   const b = manager.beginAttempt(intent, args.now);
   if (b.valid === false) return { ok: false, code: b.code, message: b.message };
-  const enforcement = intentEnforcement({ intent, manager, executorLabel: label });
+  const enforcement = intentEnforcement({ intent, manager, executorLabel: label, onPayloadSigned: args.onPayloadSigned });
   // Issue #34 (L9): when a recheck is supplied it runs FIRST inside the
   // payload-creation hook — the same abort-before-signing pattern as the
   // intent validation — and only then is the intent checked and consumed.
