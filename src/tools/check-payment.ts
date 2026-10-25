@@ -26,6 +26,10 @@ import { getAnomalyInputs } from "../policy/anomaly-store.js";
 // Issue #59/#62 (C9 visibility): the run's explicit mode + the asset table.
 import { modeAllowsNetwork, resolveNetworkMode } from "../networks.js";
 import { assetTableSummary } from "../assets.js";
+// Issue #65/#67 (plan C1): amounts print through the exact atomic formatter —
+// a small value is never rounded to zero (a $0.001 check printed "0.00"
+// through toFixed(2)).
+import { exactUsdString } from "./accounting.js";
 
 /** Directory entry for a hostname, or null. Case-insensitive hostname match —
  * the same rule resolveTrustLevel uses for DISCOVERED classification. */
@@ -109,7 +113,7 @@ export function registerCheckPaymentTool(server: McpServer): void {
       const output = {
         decision: result.decision,
         service: ctx.service,
-        amount: amountUsd.toFixed(2),
+        amount: exactUsdString(amountUsd, 6),
         currency: token,
         chain,
         // Issue #59 (C9 visibility): the run's EXPLICIT network mode — when it

@@ -57,7 +57,10 @@ it('returns ALLOW for a prospective in-policy payment and NEVER touches the paym
   const parsed = JSON.parse(result.content[0].text);
   assert.equal(parsed.decision, 'ALLOW');
   assert.equal(parsed.service, 'analyzer.example');
-  assert.equal(parsed.amount, '0.05');
+  // Issues #65/#67 (C1): amounts print through the exact atomic formatter —
+  // a USD amount renders at its exact 6-decimal width, never a toFixed(2)
+  // rounding that would show a small value as zero.
+  assert.equal(parsed.amount, '0.050000');
   assert.equal(parsed.currency, 'USDC');
   assert.equal(parsed.chain, 'base');
   assert.deepEqual(parsed.reasons, []);
@@ -97,7 +100,17 @@ it('defaults the chain from the directory entry and the amount from the matching
   const analyzer = await handler()({ url: 'https://analyzer.example/score' });
   const parsed = JSON.parse(analyzer.content[0].text);
   assert.equal(parsed.chain, 'base');
-  assert.equal(parsed.amount, '0.05');
+  assert.equal(parsed.amount, '0.050000');
+});
+
+it('prints sub-cent amounts exactly — a small value is never rounded to zero (issues #65/#67, C1)', async () => {
+  payingFetchMock();
+  // The live defect (#67 req 4): a $0.001 check printed "amount": "0.00" via
+  // toFixed(2). Both pins from plan C1: $0.001 non-zero, $0.000001 at 6 dp.
+  const milli = await handler()({ url: 'https://analyzer.example/score', amount: 0.001, chain: 'base', token: 'USDC' });
+  assert.equal(JSON.parse(milli.content[0].text).amount, '0.001000');
+  const micro = await handler()({ url: 'https://analyzer.example/score', amount: 0.000001, chain: 'base', token: 'USDC' });
+  assert.equal(JSON.parse(micro.content[0].text).amount, '0.000001');
 });
 
 it('reflects the operator trust levels: BLOCKED env host is refused, unknown host follows the compat default', async () => {
@@ -322,7 +335,7 @@ it('price anomaly: a Casper inspection stays inert on rule 4.6 (amount 0 by desi
   const parsed = JSON.parse(result.content[0].text);
   assert.equal(parsed.decision, 'ALLOW', 'the mote-denominated leg must not hit the price gate');
   assert.ok(!parsed.reasons.some((r: any) => r.code === 'PRICE_ANOMALY'));
-  assert.equal(parsed.amount, '0.00');
+  assert.equal(parsed.amount, '0.000000');
   assert.equal(payment.calls, 0);
   assert.deepEqual(ledgerLines(), BASELINE_ENTRIES.map((e) => JSON.stringify(e)), 'inspection must not write to the ledger');
 });
