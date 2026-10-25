@@ -6,6 +6,11 @@ import { logPayment } from '../payment-utils.js';
 import { blockingEnforcement, intentEnforcement } from '../payment-intent/executor.js';
 import { intentManager } from '../payment-intent/manager.js';
 import type { IntentRejectCode, PaymentIntent } from '../payment-intent/types.js';
+// Issue #80: the SAME paid-leg bound the USD leg honours — the Casper paid
+// transport takes X402_PAID_TIMEOUT_MS (parsed fail-closed, default 30000)
+// as its request deadline instead of a hardcoded literal, so both rails
+// share the one configured paid-leg budget.
+import { paidTimeoutMs } from '../transport/replay.js';
 
 export async function boundedText(response: Response, limit = 65536, signal?: AbortSignal): Promise<string> {
   if (!response.body) return '';
@@ -82,7 +87,11 @@ export async function fetchCasper(
     registerCasperScheme(client, key, network);
     authorized = guardCasperPayments(client, network);
     const transport: typeof fetch = async (input, init) => {
-      const response = await fetch(input, { ...init, redirect: 'error', signal: AbortSignal.timeout(30000) });
+      // Issue #80: X402_PAID_TIMEOUT_MS bounds the paid Casper leg exactly as
+      // it bounds the USD paid leg — the parsed (fail-closed) value, no
+      // hardcoded 30 s literal; the request's headers AND bounded body read
+      // below run inside this signal.
+      const response = await fetch(input, { ...init, redirect: 'error', signal: AbortSignal.timeout(paidTimeoutMs(process.env)) });
       for (const name of ['payment-required', 'payment-response', 'x-payment-response']) {
         if ((response.headers.get(name)?.length ?? 0) > 65536) throw new Error('Payment header exceeds size limit');
       }
