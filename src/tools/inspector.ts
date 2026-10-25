@@ -31,6 +31,7 @@ import { getBudgets, usdValueOf, railSpendUsd } from "../budget-registry.js";
 import { ceilingState, dailyTotalCeilingUsd, railSpendTotalUsd, reservedUsd, TOTAL_USD_SCOPE } from "../reservations.js";
 import { checkSpendingLimit, spendBucketForNetwork } from "../payment-utils.js";
 import { exactUsdString, formatAtomic } from "./accounting.js";
+import { budgetSnapshotOutput } from "./status.js";
 import { stripUntrusted, untrustedText, CHALLENGE_UNTRUSTED_MAX } from "../transport/untrusted.js";
 
 /** Accepts-extraction bound: the same order of magnitude the paid flow
@@ -344,29 +345,10 @@ export function registerInspectTool(server: McpServer): void {
         };
       }
 
-      // The whole-registry snapshot so an operator sees the full budget state
-      // next to the verdicts (the same listing family x402_status prints).
-      const cel = ceilingState();
-      const snapshotRails = getBudgets().map((rail) => {
-        const dailyCap = rail.dailyCap();
-        const spent = rail.spentToday();
-        let remaining: string | null = null;
-        if (dailyCap !== null && dailyCap.decimals === spent.decimals) {
-          const left = BigInt(dailyCap.atomic) - BigInt(spent.atomic) - BigInt(rail.reservedToday?.()?.atomic ?? "0");
-          remaining = formatAtomic(left > 0n ? left : 0n, dailyCap.decimals);
-        }
-        const rate = rail.usdRate();
-        return {
-          rail: rail.id,
-          unit: rail.unit,
-          spent_today: formatAtomic(BigInt(spent.atomic), rail.decimals),
-          remaining_today: remaining,
-          usd_rate: rate,
-          // The same "the ceiling cannot price → disabled" rule reservations.ts
-          // uses, reported here so an operator sees an unpriced rail's fate.
-          disabled: cel.active && (rate === null || railSpendUsd(rail) === null),
-        };
-      });
+      // The whole-registry snapshot — the shared free-tools listing
+      // (x402_status's, via budgetSnapshotOutput) so all three free tools
+      // show one word list, one shape.
+      const snapshot = budgetSnapshotOutput();
 
       const output = {
         ...(inspectUrl === "" ? {} : { url: inspectUrl }),
@@ -374,7 +356,7 @@ export function registerInspectTool(server: McpServer): void {
         untrusted_challenge: untrustedText(JSON.stringify(acceptsList), CHALLENGE_UNTRUSTED_MAX),
         offers: entries,
         selection: selectionBlock,
-        budget_snapshot: { ceiling: cel, rails: snapshotRails },
+        budget_snapshot: snapshot,
         note: "Read-only inspection — nothing was signed, reserved, paid or fetched. x402_fetch governs every leg the same way at pay time.",
       };
       return {

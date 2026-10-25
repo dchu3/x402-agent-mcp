@@ -28,8 +28,12 @@ import { modeAllowsNetwork, resolveNetworkMode } from "../networks.js";
 import { assetTableSummary } from "../assets.js";
 // Issue #65/#67 (plan C1): amounts print through the exact atomic formatter —
 // a small value is never rounded to zero (a $0.001 check printed "0.00"
-// through toFixed(2)).
+// through toFixed(2)). Issue #67 (plan C6): the check output additionally
+// carries the budget headroom (the shared free-tools snapshot) and a plain
+// verdict_summary so an agent can parse the outcome without re-reading the
+// reasons array.
 import { exactUsdString } from "./accounting.js";
+import { budgetSnapshotOutput } from "./status.js";
 
 /** Directory entry for a hostname, or null. Case-insensitive hostname match —
  * the same rule resolveTrustLevel uses for DISCOVERED classification. */
@@ -46,6 +50,23 @@ function findDirectoryEntry(host: string) {
   } catch {
     return undefined; // directory unavailable — the trust derivation already treats this as UNKNOWN
   }
+}
+
+/** #67 (plan C6): a plain-language one-liner beside the machine verdict —
+ * the reason codes stay the contract, this is only the reading aid. */
+function verdictSummary(decision: string, amountUsd: number, token: string, service: string, chain: string, reasons: Array<{ code: string }>): string {
+  const amount = exactUsdString(amountUsd, 6);
+  const codes = reasons.map((r) => r.code);
+  if (decision === "ALLOW" && codes.length === 0) {
+    return `ALLOW: a ${amount} ${token} payment for ${service} on ${chain} passes the policy rules (0 reasons).`;
+  }
+  if (decision === "ALLOW") {
+    return `ALLOW (with warnings): a ${amount} ${token} payment for ${service} on ${chain} would proceed, with ${codes.length} warning(s): ${codes.join(', ')}.`;
+  }
+  if (decision === "APPROVAL_REQUIRED") {
+    return `APPROVAL_REQUIRED: a ${amount} ${token} payment for ${service} on ${chain} needs approval first — ${codes.length} reason(s): ${codes.join(', ')}.`;
+  }
+  return `DENY: a ${amount} ${token} payment for ${service} on ${chain} was refused by ${codes.length} reason(s): ${codes.join(', ')}.`;
 }
 
 export function registerCheckPaymentTool(server: McpServer): void {
@@ -144,6 +165,13 @@ export function registerCheckPaymentTool(server: McpServer): void {
         // Reasons carry their optional detail payload (issue #30) verbatim.
         reasons: result.reasons.map((r) => ({ code: r.code, message: r.message, ...(r.detail !== undefined ? { detail: r.detail } : {}) })),
         limits: result.limits,
+        // Issue #67 (plan C6): a plain-language reading aid next to the
+        // machine verdict (reasons stay the contract — codes verbatim).
+        verdict_summary: verdictSummary(result.decision, amountUsd, token, ctx.service, chain, result.reasons),
+        // Issue #65/#67 (plan C6): the budget headroom beside the verdict —
+        // the shared free-tools snapshot (caps, spent, remaining, the
+        // optional cross-chain ceiling). Read-only, exact strings.
+        budget: budgetSnapshotOutput(),
         note: "Inspection only — no payment was attempted. Resolve DENY reasons before calling x402_fetch.",
       };
 

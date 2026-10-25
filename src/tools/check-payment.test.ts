@@ -440,3 +440,41 @@ it('endpoint_liveness: require_fresh_402: false leaves inspection ALLOW for an u
     restoreDirectory34();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Issue #67 (plan C6): clearer check output — the verdict beside its reading
+// aid, and the budget headroom (the shared free-tools snapshot) beside it.
+// ---------------------------------------------------------------------------
+
+it('the ALLOW verdict names what passed, and the budget headroom sits beside it (#67, C6)', async () => {
+  const result = await handler()({ url: 'https://analyzer.example/score', amount: 0.05, chain: 'base', token: 'USDC' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.ok(parsed.verdict_summary.startsWith('ALLOW:'), JSON.stringify(parsed.verdict_summary));
+  assert.ok(parsed.verdict_summary.includes('passes the policy rules (0 reasons)'));
+  assert.ok(parsed.verdict_summary.includes('0.050000'));
+  const usd = parsed.budget.rails.find((r: any) => r.rail === 'usd');
+  assert.ok(usd, 'the USD rail’s headroom is part of the verdict context');
+  assert.equal(usd.per_call_cap, '0.500000');
+  assert.equal(usd.daily_cap, '10.000000');
+  assert.equal(usd.spent_today, '0.000000');
+  assert.equal(usd.remaining_today, '10.000000');
+  assert.equal(parsed.budget.ceiling.active, false, 'unset ceiling → inactive, no assumed limits');
+});
+
+it('remaining today is exact after a settled spend — never rounded to zero (#67, C6)', async () => {
+  const { logPayment } = await import('../payment-utils.js') as typeof import('../payment-utils.js');
+  logPayment({ timestamp: new Date().toISOString(), url: 'https://analyzer.example/score', method: 'GET', chain: 'base', amount_usdc: 8, status: 'success' });
+  const result = await handler()({ url: 'https://analyzer.example/score', amount: 0.05, chain: 'base', token: 'USDC' });
+  const parsed = JSON.parse(result.content[0].text);
+  const usd = parsed.budget.rails.find((r: any) => r.rail === 'usd');
+  assert.equal(usd.spent_today, '8.000000');
+  assert.equal(usd.remaining_today, '2.000000');
+});
+
+it('the DENY verdict lists its reason codes in the reading aid (#67, C6)', async () => {
+  const result = await handler()({ url: 'https://analyzer.example/score', amount: 5, chain: 'base', token: 'USDC' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.decision, 'DENY');
+  assert.ok(parsed.verdict_summary.startsWith('DENY:'), JSON.stringify(parsed.verdict_summary));
+  assert.ok(parsed.verdict_summary.includes('REQUEST_LIMIT_EXCEEDED'));
+});

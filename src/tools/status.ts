@@ -40,7 +40,7 @@ function atomicOr(amount: { atomic: string; decimals: number } | null | undefine
 }
 
 /** One rail's listing entry: exact strings for every money field. */
-function railEntry(rail: BudgetRail, disabledRails: CeilingState["disabled_rails"]): Record<string, unknown> {
+export function railListingEntry(rail: BudgetRail, disabledRails: CeilingState["disabled_rails"]): Record<string, unknown> {
   const dailyCap = rail.dailyCap();
   const spent = rail.spentToday();
   const reserved = rail.reservedToday?.() ?? null;
@@ -70,6 +70,15 @@ function railEntry(rail: BudgetRail, disabledRails: CeilingState["disabled_rails
   };
 }
 
+/** The shared free-tools budget snapshot: every registered rail's listing
+ * plus the optional ceiling's state (issue #65 req 2/4, #67 sharing ONE
+ * listing across x402_status, x402_inspect and x402_check_payment — never
+ * three word lists). All reads happen live per call. */
+export function budgetSnapshotOutput(): { ceiling: CeilingState; rails: Record<string, unknown>[] } {
+  const ceiling = ceilingState();
+  return { ceiling, rails: getBudgets().map((rail) => railListingEntry(rail, ceiling.disabled_rails)) };
+}
+
 export function registerStatusTool(server: McpServer): void {
   server.tool(
     "x402_status",
@@ -78,8 +87,8 @@ export function registerStatusTool(server: McpServer): void {
     async () => {
       // Read live per call: registry state, ceiling config and the mode can
       // all change across a long-lived stdio session — nothing is cached.
-      const ceiling = ceilingState();
       const modeState = resolveNetworkMode();
+      const { ceiling, rails } = budgetSnapshotOutput();
       const output = {
         network_mode: modeState.mode ?? null,
         ...(modeState.error ? { network_mode_error: modeState.error } : {}),
@@ -93,7 +102,7 @@ export function registerStatusTool(server: McpServer): void {
             ? { disabled_rails: ceiling.disabled_rails }
             : {}),
         },
-        rails: getBudgets().map((rail) => railEntry(rail, ceiling.disabled_rails)),
+        rails,
         note: "Read-only listing — nothing was signed, reserved or written. Paid tools still govern every leg by policy.",
       };
       return {
