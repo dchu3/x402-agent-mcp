@@ -10,6 +10,11 @@ import { registerBatchDiscoverTool } from "./tools/batch-discover.js";
 import { registerCrawlX402ScanTool } from "./tools/crawl-directory.js";
 import { registerCheckPaymentTool } from "./tools/check-payment.js";
 import { registerProbeAllowlistTool } from "./tools/probe-allowlist.js";
+// Issue #59 (req 8 — C9 visibility): the run's EXPLICIT network mode + the
+// mode's Solana RPC host render at startup (the RPC HOST only — never a full
+// URL, one can carry credentials; a non-URL value must never crash startup).
+import { resolveNetworkMode, solanaRpcHostForMode } from "./networks.js";
+import { assetTableSummary } from "./assets.js";
 import { VERSION } from "./version.js";
 
 const server = new McpServer({
@@ -30,5 +35,22 @@ registerProbeAllowlistTool(server);
 registerFetchTool(server);
 
 // Start server
+// Issue #59 (req 8): the startup log — the operator sees the run's mode and
+// network identity exactly once, on stderr (stdout is the MCP protocol).
+// When the mode is unset over a loaded key, the same line names the
+// NETWORK_NOT_CONFIGURED condition the paid tool refuses with.
+const networkModeState = resolveNetworkMode();
+const networkModeForLog = networkModeState.mode ?? "(unset)";
+const solanaRpcHost = networkModeState.mode
+  ? solanaRpcHostForMode(networkModeState.mode)
+  : "";
+const assetTable = assetTableSummary();
+console.error(
+  `x402-agent-mcp v${VERSION} | network_mode=${networkModeForLog}` +
+  (networkModeState.error ? ` — NETWORK_NOT_CONFIGURED: paid tools refuse until X402_NETWORK_MODE is set` : "") +
+  ` | solana_rpc_host=${solanaRpcHost || "(inactive)"}` +
+  ` | assets=${assetTable.table_entries} entries on [${assetTable.networks.join(", ")}]`,
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);

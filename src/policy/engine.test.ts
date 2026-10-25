@@ -20,6 +20,9 @@ function cfg(overrides: Partial<PolicyConfig> = {}): PolicyConfig {
     },
     networks: { allowed: ['base', 'solana', 'casper'] },
     tokens: { allowed: ['USDC', 'wCSPR'] },
+    // Issue #62 REQUIRED member: no operator asset extensions by default —
+    // the shipped per-network asset table alone (fail-closed default).
+    assets: { extensions: [] },
     recipients: { mode: 'change-detect', allowed: [], perService: {}, known: {} },
     // Issue #30 compat default: the price anomaly gate ships DISABLED —
     // enabling it is an operator opt-in (conflict B), so existing decisions

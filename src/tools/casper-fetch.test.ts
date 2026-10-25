@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { WCSPR_ASSETS } from '../casper/accepts.js';
 const dir = mkdtempSync(join(tmpdir(), 'x402-test-'));
+process.env.X402_NETWORK_MODE = 'mainnet'; // issue #59: these suites must name the MAINNET mode explicitly — set BEFORE the env capture so every afterEach restore keeps it
 const env = { ...process.env };
 process.env.PAYMENT_LOG_PATH = join(dir, 'ledger.jsonl');
 // Hermetic directory (issue #37): this suite set no X402_DIRECTORY_PATH, so

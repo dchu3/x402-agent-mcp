@@ -1,8 +1,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { wrapFetchWithPayment, x402Client, type SelectPaymentRequirements, type PaymentRequirements } from "@x402/fetch";
-import { ExactSvmScheme, toClientSvmSigner, SOLANA_MAINNET_CAIP2, DEFAULT_ASSETS as SVM_DEFAULT_ASSETS } from "@x402/svm";
-import { ExactEvmScheme, toClientEvmSigner, DEFAULT_ASSETS as EVM_DEFAULT_ASSETS } from "@x402/evm";
+import { ExactSvmScheme, toClientSvmSigner, SOLANA_MAINNET_CAIP2 } from "@x402/svm";
+import { ExactEvmScheme, toClientEvmSigner } from "@x402/evm";
 import { createKeyPairSignerFromBytes } from "@solana/kit";
 import bs58 from "bs58";
 import { privateKeyToAccount } from "viem/accounts";
@@ -10,11 +10,17 @@ import { fetchCasper, boundedText } from "./casper-fetch.js";
 import { casperBudget } from "../casper/budget.js";
 import { selectCasperAccept, assertPayableCasperAccept, casperAmountMotes } from "../casper/accepts.js";
 import { CASPER_CHAIN, toCasperCaip2 } from "../casper/networks.js";
-import { caip2Of, isEvmNetwork, isUsdChain } from "../evm/networks.js";
+import { caip2Of, isEvmNetwork, isUsdChain, normalizeCaip2Evm } from "../evm/networks.js";
 import { parseChainFromNetwork } from "./probe-utils.js";
-import { checkSpendingLimit, logPayment, getDailySpent, getMaxPerCall, getMaxDailySpend } from "../payment-utils.js";
+// Issue #59: the EXPLICIT network mode + the mode's registration/RPC.
+import { casperNetworkResolved, modeAllowsNetwork, resolveNetworkMode, solanaNetworkForMode, solanaRpcUrlForMode } from "../networks.js";
+import type { NetworkMode } from "../networks.js";
+import { checkSpendingLimit, logPayment, getDailySpent, spendBucketForNetwork, getMaxPerCall, getMaxPerCallAtomic, getMaxDailySpend } from "../payment-utils.js";
+// Issue #59 (D7): the DEVNET CAIP-2 decides the spend bucket of a leg.
+import { SOLANA_DEVNET_CAIP2 } from "@x402/svm";
 import { getPolicyEngine, buildPolicyContext, livenessVerdictForUrl, loadPolicyConfig } from "../policy/config.js";
 import { getPerServiceSpent, recordServicePayment } from "../policy/budget-store.js";
+import type { OperatorAssetEntry } from "../policy/types.js";
 // Issue #54 (req 1): the reserve-before-sign registry — overlapping calls
 // cannot each pass the same remaining budget while one is still being paid.
 import { releaseReservation, reserveSpend, reservedUsd, settleReservation } from "../reservations.js";
@@ -41,8 +47,13 @@ import { untrustedText, stripUntrusted, PROBE_UNTRUSTED_MAX, CHALLENGE_UNTRUSTED
 import { usdFromAtomic, sellerReportedCostUsd, parseBoundedBody } from "./accounting.js";
 import { createFromOffer, intentManager } from "../payment-intent/manager.js";
 import { executeGuarded } from "../payment-intent/executor.js";
-// Issue #61: deterministic offer selection — the payable offer is chosen by
-// integer atomic ranking over ALL accepts (never simply accepts[0]).
+// Issue #62: the per-network asset table — the offer's asset id resolves to a
+// real symbol + decimals + USD price (exact integer conversion via
+// usdFromAtomic); unlisted assets are refused with a stable code BEFORE any
+// pricing, binding or signing. Injected into selectOffer so the selector
+// stays pure (src/assets.ts is the single table; no fixed-6 float anywhere).
+import { ASSET_TABLE, priceAtomicAsUsd, resolveAsset } from "../assets.js";
+import type { SpendControlAsset, SpendControls } from "@x402/core/client";
 import { DEFAULT_CHAIN_ORDER, selectOffer, type OfferCandidate, type RejectedOffer } from "./offer-selection.js";
 // Issue #55: the challenge-scope boundary — the contract an offer/challenge
 // must satisfy before the intent binds it (config from env + call-site keys;
@@ -82,22 +93,35 @@ function scopeRefusalMessage(code: ScopeRefusalCode): string {
   }
 }
 
-/** The SDK's own default-asset universe across both default tables — the
- * same set the SDK's spend controls accept, so the selector's asset filter
- * matches the signing gate's behavior exactly (no new asset is introduced). */
-function sdkDefaultAssetIds(): string[] {
-  const ids = new Set<string>();
-  for (const table of [EVM_DEFAULT_ASSETS, SVM_DEFAULT_ASSETS]) {
-    for (const entries of Object.values(table as Record<string, unknown>)) {
-      if (!Array.isArray(entries)) continue;
-      for (const entry of entries) {
-        if (entry && typeof entry === "object" && typeof (entry as any).asset === "string" && (entry as any).asset !== "") {
-          ids.add((entry as { asset: string }).asset);
-        }
-      }
-    }
+/** Issue #62 (D4): the explicit SDK spend-control object for a registered
+ * network. `maxAmountPerPayment` is the project's own per-call USD cap (the
+ * same getMaxPerCall() the policy gate reads, Money number form);
+ * `allowedAssets` carries ONE entry per listed asset on the registered
+ * network — the shipped asset table PLUS the operator's
+ * config-validated assets.extensions — each capped at the cap's exact integer
+ * ATOMIC equivalent (the SDK requires the integer atomic form for per-asset
+ * entries, never a "$1"-style money string; getMaxPerCallAtomic's BigInt
+ * derivation is exact). By the SDK's own rule the default assets stay
+ * payable under the top-level USD cap; the PROJECT asset boundary upstream
+ * decides what is actually signable — these controls are the OUTER bound.
+ * This helper never returns `false`: the control set can only ever be the
+ * project's caps (D4: an invalid per-call cap refuses the call upstream). */
+function sdkSpendControls(registeredNetwork: string, extensions: readonly OperatorAssetEntry[]): SpendControls {
+  const networkOf = (n: string): string => normalizeCaip2Evm(n);
+  const entries: SpendControlAsset[] = [];
+  const pushEntry = (network: string, asset: string, decimals: number): void => {
+    if (entries.some((e) => e.network === network && e.asset === asset)) return;
+    const cap = getMaxPerCallAtomic(decimals);
+    if (cap === undefined) return; // out-of-domain decimals — the entry stays excluded (fail closed); the top-level USD cap still bounds
+    entries.push({ network: network as `${string}:${string}`, asset, maxAmountPerPayment: cap.toString() });
+  };
+  for (const entry of ASSET_TABLE) {
+    if (networkOf(entry.network) === networkOf(registeredNetwork)) pushEntry(entry.network, entry.asset, entry.decimals);
   }
-  return [...ids];
+  for (const entry of extensions) {
+    if (networkOf(entry.network) === networkOf(registeredNetwork)) pushEntry(entry.network, entry.asset, entry.decimals);
+  }
+  return { maxAmountPerPayment: getMaxPerCall(), allowedAssets: entries };
 }
 
 function policyRefusal(
@@ -153,6 +177,35 @@ function intentRefusal(
   };
 }
 
+/** The tool-callback result's shape this module builds (single exit wrapper). */
+interface ToolResult { content: Array<{ type: "text"; text: string; [key: string]: unknown }>; [key: string]: unknown }
+
+// Issue #59 (req 8 — visibility): EVERY x402_fetch result carries the run's
+// `network_mode` (when the mode is explicit) and, when the flow observed a
+// leg network (the exact CAIP-2 the offer/the casper accept named), the
+// `network` field. The overlay parses the result's JSON once at the
+// handler's single exit; results without a JSON body pass through untouched;
+// a mode-less run (no keys) adds NOTHING (free behavior — immunity).
+// Generic over the result type: the SDK's inferred shape flows through.
+function overlayVisibility<T extends { content?: Array<{ type?: unknown; text?: unknown }> }>(
+  result: T,
+  mode: NetworkMode | undefined,
+  network: string | undefined,
+): T {
+  try {
+    const first = result.content?.[0];
+    if (!first || first.type !== "text" || typeof first.text !== "string" || first.text === "") return result;
+    const parsed = JSON.parse(first.text) as Record<string, unknown>;
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return result;
+    if (mode !== undefined && parsed.network_mode === undefined) parsed.network_mode = mode;
+    if (network !== undefined && network !== "" && parsed.network === undefined) parsed.network = network;
+    first.text = JSON.stringify(parsed);
+    return result;
+  } catch {
+    return result; // never invent, never crash the visibility layer
+  }
+}
+
 /** Parse an SDK abort marker out of a payment failure (`Failed to create
  * payment payload: Payment creation aborted: INTENT_<CODE>[:<field>]`). The
  * raw SDK string is never returned as the whole message — it is attached as a
@@ -182,6 +235,11 @@ export function registerFetchTool(server: McpServer): void {
       chain: z.enum(["base", "solana", "casper", "polygon", "arbitrum"]).optional().describe("Force chain: 'base', 'polygon', 'arbitrum', 'solana' or 'casper'. Auto-detected if omitted."),
     },
         async (args) => {
+      // Issue #59 (req 8): the exact network the flow observed — set at the
+      // SEAM (the selected/casper-leg network) and carried into the overlay.
+      const observed: { network?: string } = {};
+      const observeNetwork = (n: string | undefined): void => { if (n && observed.network === undefined) observed.network = stripUntrusted(n, 64); };
+      const runResult: ToolResult = await (async (): Promise<ToolResult> => {
       const url = args.url;
       const method = (args.method || "GET").toUpperCase();
 
@@ -214,13 +272,69 @@ export function registerFetchTool(server: McpServer): void {
       const solanaKey = process.env.SOLANA_PRIVATE_KEY;
       const evmKey = process.env.EVM_PRIVATE_KEY || process.env.BASE_PRIVATE_KEY;
       const casperKey = process.env.CASPER_PRIVATE_KEY;
-      const solanaRpc = process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
+
+      // Issue #59 (req 1 + option A): the EXPLICIT network mode — with a
+      // payment key loaded, an unset (or invalid) X402_NETWORK_MODE refuses
+      // EVERY call with the stable code NETWORK_NOT_CONFIGURED BEFORE the
+      // probe; there is no mainnet-by-accident and no invalid-mode
+      // half-state. Free tools are immune (this gate lives in the paid
+      // tool only). The mode decides the registration network (Step 3), the
+      // Solana RPC (below) and the payable-offer boundary (post-detection).
+      const modeState = resolveNetworkMode();
+      if (modeState.error) {
+        console.error(`[x402_fetch] NETWORK_NOT_CONFIGURED: ${modeState.error}`);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              error: `NETWORK_NOT_CONFIGURED: ${modeState.error}`,
+              reasons: [{ code: "NETWORK_NOT_CONFIGURED", message: modeState.unset
+                ? `${modeState.error} — set X402_NETWORK_MODE=mainnet or devnet (breaking change: #59 removed the implicit mainnet default)`
+                : modeState.error }],
+            }),
+          }],
+        };
+      }
+      const networkMode: NetworkMode | undefined = modeState.mode;
+
+      // Issue #59 (req 5): the Solana RPC follows the mode — devnet payloads
+      // never reach a mainnet RPC. SOLANA_DEVNET_RPC_URL's documented public
+      // fallback is the SDK's DEVNET_RPC_URL; mainnet keeps today's value.
+      const solanaRpc = solanaRpcUrlForMode(networkMode ?? "mainnet");
       const baseRpc = process.env.BASE_RPC_URL || "https://mainnet.base.org";
 
       // Step 1: Probe to detect chain from 402 response
       let useChain = (args.chain || "").toLowerCase();
       let probedAmountUsdc = 0; // captured from 402 response
+      // Issue #62: the asset table's resolution of the chosen offer — the real
+      // symbol (policy vocabulary) and decimals (exact USD conversion). Used
+      // ONLY when an asset was table-priced; the legacy fallback paths keep
+      // today's literals ('USDC' / 6) and estimate.
+      let probedSymbol: string | undefined;
+      let probedDecimals: number | undefined;
       let casperNetwork = process.env.CASPER_NETWORK || "";
+
+      // Issue #59 (req 3 + D6): the CASPER leg agrees with the mode — mainnet
+      // mode refuses the Casper testnet and vice versa; an explicit mode with
+      // the env unset follows the mode. A rejected value is refused here (the
+      // stable CHAIN_NOT_ALLOWED code) — the leg never starts.
+      const casperResolution = casperNetworkResolved(networkMode, process.env.CASPER_NETWORK);
+      if (casperResolution.ok === false) {
+        const casperEnvRaw = (process.env.CASPER_NETWORK ?? "").trim();
+        console.error(`[x402_fetch] CHAIN_NOT_ALLOWED: CASPER_NETWORK=${casperEnvRaw || "(unset, following the mode)"} disagrees with X402_NETWORK_MODE=${networkMode} — refusing (issue #59 req 3)`);
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              error: "Payment refused: the CASPER_NETWORK setting disagrees with X402_NETWORK_MODE (CHAIN_NOT_ALLOWED)",
+              reasons: [{ code: "CHAIN_NOT_ALLOWED", message: networkMode === "mainnet"
+                ? `X402_NETWORK_MODE=mainnet refuses the Casper TESTNET (CASPER_NETWORK=${casperEnvRaw || "unset → casper-test"}) — set CASPER_NETWORK=casper to pay the Casper mainnet, or use devnet mode`
+                : `X402_NETWORK_MODE=devnet refuses the Casper MAINNET (CASPER_NETWORK=${casperEnvRaw || "unset → casper"}) — set CASPER_NETWORK=casper-test for the devnet` }],
+            }),
+          }],
+        };
+      }
+      if (networkMode) casperNetwork = casperResolution.network;
       // Issue #25: the concrete probe offer, retained so the payment intent
       // can bind exactly what policy evaluated (the USD estimate alone is not
       // an authorisation). Undefined only when the probe cannot yield an
@@ -324,23 +438,37 @@ export function registerFetchTool(server: McpServer): void {
               payTo: firstAccept?.payTo,
             };
 
-            // Capture amount for spending limit check
-            if (firstAccept?.amount) {
+            // Issue #25+#62: the USD estimate for a LEGACY (asset-less) offer
+            // keeps the pre-#62 conversion exactly (Number(amount)/1e6) — the
+            // table cannot key on an offer that names no asset, and the
+            // policy gate's estimate context for those calls is unchanged.
+            // For offers that DO name an asset, this stays 0: the table
+            // prices the CHOSEN offer in the selection block below (and the
+            // asset boundary refuses anything it cannot price) — the money
+            // binding is never an estimate (the intent binds amountAtomic
+            // and the settlement is usdFromAtomic at the signed decimals).
+            // No fixed-6 float feeds a table-priced offer's gates.
+            if (firstAccept?.amount && (firstAccept?.asset ?? "") === "") {
               probedAmountUsdc = Number(firstAccept.amount) / 1e6;
             }
 
             // Issue #61: deterministic offer selection across ALL accepts.
             // The chosen offer is the cheapest payable one: a key on its
-            // chain, on the policy network/asset allowlists (the SAME config
-            // load the Step 3.5 gate reads — read-only; never widened), and
-            // the same policy gate, evaluated per candidate here. A forced
-            // chain constrains the selection to the caller's chain (the
-            // caller's chain is never replaced). Everything below reads the
-            // same single probe observation; nothing seller-visible widened.
-            // On NO_PAYABLE_OFFER the flow falls back to accepts[0] exactly
-            // as the pre-#61 flow did (the unpayable offers stay unpayable).
+            // chain, on the policy network allowlist (the SAME config load
+            // the Step 3.5 gate reads — read-only; never widened), priced
+            // through the per-network ASSET TABLE (issue #62: ranking by
+            // real-symbol/real-decimals USD — never the raw atomic string,
+            // never a fixed-6 float; unlisted offers are REPORTED refusals),
+            // and the same policy gate, evaluated per candidate here with
+            // the TABLE's symbol. A forced chain constrains the selection to
+            // the caller's chain (the caller's chain is never replaced).
+            // Everything below reads the same single probe observation;
+            // nothing seller-visible widened. On NO_PAYABLE_OFFER the flow
+            // falls back to accepts[0] exactly as the pre-#61 flow did (the
+            // unpayable offers stay unpayable).
             if (Array.isArray(accepts) && useChain !== CASPER_CHAIN) {
               const policyState = loadPolicyConfig();
+              const assetExtensions = policyState.config.assets.extensions;
               const selection = selectOffer({
                 accepts,
                 keysLoaded: { solana: !!solanaKey, evm: !!evmKey },
@@ -349,11 +477,40 @@ export function registerFetchTool(server: McpServer): void {
                   : policyState.configErrors.length > 0
                     ? []
                     : policyState.config.networks.allowed,
-                allowedAssets: sdkDefaultAssetIds(),
+                // Issue #59 (req 4): the MODE is part of the selection's own
+                // network gate — a cross-mode offer is a reported selection
+                // refusal (network_not_allowed) and never chosen; the exact
+                // network comparison lives in modeAllowsNetwork.
+                networkAllowed: (network) => !networkMode || modeAllowsNetwork(networkMode, network),
+                // Issue #62: the table decides, not the SDK's implicitly
+                // allowed default-asset universe (spend controls at Step 3
+                // enforce an OUTER bound now; the table is the source of
+                // truth).
+                usdOf: (assetId, networkCaip2, atomicAmount) => {
+                  const priced = priceAtomicAsUsd(networkCaip2, assetId, atomicAmount, assetExtensions);
+                  if (priced.ok === true) return priced;
+                  return priced.code === "ASSET_NOT_LISTED"
+                    ? { ok: false, code: "asset_not_listed" }
+                    : { ok: false, code: "asset_no_usd_rate" };
+                },
                 policyFor: (c) => {
+                  // Issue #62: the policy gate reads the TABLE's real symbol
+                  // (tokens.allowed means what the table says), priced USD.
+                  // Issue #59 (D7): each CANDIDATE is evaluated against its
+                  // OWN spend bucket — a devnet candidate reads the devnet
+                  // daily total and its devnet-prefixed reservations, every
+                  // other candidate the mainnet totals — the same bucket rule
+                  // Step 3.5 enforces for the chosen offer below, so the
+                  // selection verdict and the Step 3.5 verdict agree for the
+                  // same offer (getDailySpent(undefined) reads the mainnet
+                  // whole-map total, which excludes the devnet bucket).
+                  const candidateBucket = spendBucketForNetwork(c.network);
+                  const candidateServiceScope = candidateBucket
+                    ? `net:${candidateBucket}:service:${serviceHost}`
+                    : `service:${serviceHost}`;
                   const evaluation = getPolicyEngine().evaluate(
-                    buildPolicyContext(url, c.chain, "USDC", c.usd, { recipient: c.payTo }),
-                    { dailySpentUsd: getDailySpent(), perServiceSpentUsd: getPerServiceSpent(serviceHost) + reservedUsd(`service:${serviceHost}`) },
+                    buildPolicyContext(url, c.chain, c.symbol, c.usd, { recipient: c.payTo }),
+                    { dailySpentUsd: getDailySpent(spendBucketForNetwork(c.network)), perServiceSpentUsd: getPerServiceSpent(serviceHost) + reservedUsd(candidateServiceScope) },
                     getAnomalyInputs(url),
                   );
                   return evaluation.decision === "ALLOW" ? "ALLOW" : "REFUSE";
@@ -411,6 +568,38 @@ export function registerFetchTool(server: McpServer): void {
               }
             }
 
+            // Issue #59 (req 8): record the network the flow observed — the
+            // SEAM (mode boundary + asset boundary) and everything downstream
+            // (refusals, the paid result) report it; the check_payment tool
+            // and the startup log render it. CASPER legs observe their
+            // resolved network in their own branch below.
+            observeNetwork(useChain === CASPER_CHAIN ? undefined : probedOffer?.network);
+
+            // Issue #59 (req 4): THE MODE BOUNDARY. An offer's exact network
+            // must be the registered network of the run's mode: a devnet
+            // genesis is not "the solana chain" — the chain vocabulary cannot
+            // express this, the exact CAIP-2 can. The boundary fires BEFORE
+            // the asset-table boundary below (the mode is the outer
+            // decision) and before any client construction, so a cross-mode
+            // offer never probed further, never priced, never signed.
+            if (networkMode && probedOffer?.network && !modeAllowsNetwork(networkMode, probedOffer.network)) {
+              const offModeNetwork = stripUntrusted(probedOffer.network, 64);
+              console.error(`[x402_fetch] CHAIN_NOT_ALLOWED: network ${offModeNetwork} is not the registered network of X402_NETWORK_MODE=${networkMode} — refusing before the asset boundary (issue #59 req 4)`);
+              return {
+                content: [{
+                  type: "text" as const,
+                  text: JSON.stringify({
+                    error: "Payment refused at the mode boundary (CHAIN_NOT_ALLOWED)",
+                    url,
+                    chain: useChain,
+                    network: offModeNetwork,
+                    network_mode: networkMode,
+                    reasons: [{ code: "CHAIN_NOT_ALLOWED", message: `network <${offModeNetwork}> is not the registered network of X402_NETWORK_MODE=${networkMode} — in mainnet mode only mainnet networks pay, in devnet mode only the solana devnet id pays (issue #59 req 4)` }],
+                  }),
+                }],
+              };
+            }
+
             // Casper settles in wCSPR motes (9 decimals), not 6-decimal USDC.
             if (useChain === CASPER_CHAIN) {
               // Issue #26: the Casper recipient is only knowable after accept
@@ -453,6 +642,27 @@ export function registerFetchTool(server: McpServer): void {
               }
               if (casperAccept) {
                 casperNetwork = toCasperCaip2(casperAccept.network);
+                // Issue #59 (req 8): the casper leg's observed network.
+                observeNetwork(casperNetwork);
+                // Issue #59 (req 3 + D6): the offer's own network must equal
+                // the RESOLVED network — the mode pinned what this leg may
+                // settle on; an offer pointing at the other Casper network is
+                // refused here, before any binding, budget hold or signing.
+                if (networkMode && casperNetwork !== casperResolution.network) {
+                  return {
+                    content: [{
+                      type: "text" as const,
+                      text: JSON.stringify({
+                        error: "Payment refused: the offer's Casper network disagrees with X402_NETWORK_MODE (CHAIN_NOT_ALLOWED)",
+                        url,
+                        chain: CASPER_CHAIN,
+                        network: stripUntrusted(casperNetwork, 64),
+                        network_mode: networkMode,
+                        reasons: [{ code: "CHAIN_NOT_ALLOWED", message: `the offer settles on <${stripUntrusted(casperNetwork, 64)}> but X402_NETWORK_MODE=${networkMode} pins <${casperResolution.network}> (issue #59 req 3)` }],
+                      }),
+                    }],
+                  };
+                }
                 try {
                   assertPayableCasperAccept(casperAccept);
                   // Issue #25: bind the validated offer to a payment intent now
@@ -463,10 +673,17 @@ export function registerFetchTool(server: McpServer): void {
                     decision: casperPolicy,
                     url,
                     chain: CASPER_CHAIN,
-                    token: "wCSPR",
+                    // Issue #62: the Casper entry resolves through the SAME
+                    // per-network asset table (the shipped wCSPR rows carry
+                    // the 9-decimal mote shape; operator extensions may
+                    // relabel them, their word wins). A drifted table keeps
+                    // the constants as the fallback so the intent remains
+                    // bindable — assertPayableCasperAccept still pins the
+                    // canonical wCSPR package hash above.
+                    token: resolveAsset(casperNetwork, casperAccept.asset)?.symbol ?? "wCSPR",
                     asset: casperAccept.asset,
                     amountAtomic: casperAmountMotes(casperAccept).toString(),
-                    decimals: 9,
+                    decimals: resolveAsset(casperNetwork, casperAccept.asset)?.decimals ?? 9,
                     recipient: casperAccept.payTo,
                     network: casperNetwork,
                     scheme: casperAccept.scheme,
@@ -550,10 +767,62 @@ export function registerFetchTool(server: McpServer): void {
         return fetchCasper(url, method, args.body, casperKey!, casperNetwork, casperIntent, casperBlockedCode);
       }
 
+      // Issue #62: the ASSET-TABLE boundary. An offer's asset id must resolve
+      // through the per-network asset table (symbol + decimals + USD-peg or
+      // rate) BEFORE any client construction, challenge scope, intent binding
+      // or signing. There is no assumed unit and no assumed peg: an unlisted
+      // asset is refused with the STABLE code ASSET_NOT_LISTED; a listed
+      // asset the table prices nothing on the USD leg with ASSET_NO_USD_RATE.
+      // The operator's assets.extensions (config-validated, fail closed) are
+      // in scope here and are KEPT so the D4 spend controls below can list
+      // them per network. Legacy offers that never produced an asset (an
+      // unpayable/unbindable probe) keep today's behavior — nothing to
+      // resolve, nothing to refuse here.
+      let probedAssetExtensions: OperatorAssetEntry[] = [];
+      if (probedOffer?.asset) {
+        const assetPolicyState = loadPolicyConfig();
+        probedAssetExtensions = assetPolicyState.config.assets.extensions;
+        const assetPricing = priceAtomicAsUsd(
+          probedOffer.network ?? "",
+          probedOffer.asset,
+          probedOffer.amount ?? "",
+          probedAssetExtensions,
+        );
+        if (assetPricing.ok === false) {
+          const assetReason = assetPricing.code === "ASSET_NOT_LISTED"
+            ? `asset id <${stripUntrusted(probedOffer.asset ?? "", 64)}> is not listed for network <${stripUntrusted(probedOffer.network ?? "", 64)}> — refusing before any pricing, binding or signing; the asset table never assumes a unit or rate (operator extensions: policy config assets.extensions)`
+            : `asset <${stripUntrusted(probedOffer.asset ?? "", 64)}> is listed but priced nothing on the USD leg (no usdPeg and no positive usdRate) — spend caps need a USD value, so refusing (fail closed)`;
+          console.error(`[x402_fetch] asset-table refusal ${assetPricing.code} for ${stripUntrusted(probedOffer.asset ?? "", 64)}`);
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                error: `Payment refused at the asset boundary (${assetPricing.code})`,
+                url,
+                chain: useChain,
+                network: stripUntrusted(probedOffer.network ?? "", 64),
+                reasons: [{ code: assetPricing.code, message: assetReason }],
+              }),
+            }],
+          };
+        }
+        probedAmountUsdc = assetPricing.usd;
+        probedSymbol = assetPricing.symbol;
+        probedDecimals = assetPricing.decimals;
+      }
+
       // USD estimate for policy evaluation (informational — the intent binds
       // the atomic amount, never this estimate). Hoisted so the catch block
       // can render intent refusals with the same estimated_cost_usdc key.
       const amountUsdc = probedAmountUsdc || 0.01;
+
+      // Issue #59 (D7): the spend bucket of this leg. Exactly the DEVNET
+      // network pays and accounts in its own bucket (the daily gate, the
+      // spending-limit check and the reservations all read the devnet
+      // bucket); every mainnet leg keeps today's global/mainnet buckets.
+      const spendBucket = spendBucketForNetwork(probedOffer?.network);
+      const serviceScope = spendBucket ? `net:${spendBucket}:service:${serviceHost}` : `service:${serviceHost}`;
+      const dailySpentOfBucket = spendBucket ? getDailySpent(spendBucket) : getDailySpent();
 
       // Step 3: Create x402 client with the right scheme
       try {
@@ -588,6 +857,7 @@ export function registerFetchTool(server: McpServer): void {
         // Issue #55: our own payer address, for the scope boundary's fee-payer
         // rule (the agent never pays fee to itself unless the operator opted in).
         let payerAddress: string | undefined;
+        let registeredNetwork = "";
 
         if (useChain === "solana") {
           const secretKeyBytes = bs58.decode(solanaKey!);
@@ -595,7 +865,12 @@ export function registerFetchTool(server: McpServer): void {
           const svmSigner = toClientSvmSigner(keypairSigner);
           const scheme = new ExactSvmScheme(svmSigner, { rpcUrl: solanaRpc });
           payerAddress = keypairSigner.address;
-          client.register(SOLANA_MAINNET_CAIP2 as `${string}:${string}`, scheme);
+          // Issue #59 (req 2): the mode's REGISTRATION — the exact CAIP-2 of
+          // this run's network (mainnet in mainnet mode; the solana devnet
+          // id in devnet mode). The chain detection above cannot distinguish
+          // the two (both resolve to the chain "solana"); the mode does.
+          registeredNetwork = solanaNetworkForMode(networkMode ?? "mainnet");
+          client.register(registeredNetwork as `${string}:${string}`, scheme);
 
         } else {
           const account = privateKeyToAccount(evmKey! as `0x${string}`);
@@ -621,8 +896,37 @@ export function registerFetchTool(server: McpServer): void {
           // undetermined registration matches nothing at selection time (fail
           // closed, never a default chain).
           const registerNetwork = caip2Of(useChain) ?? caip2Of(probedOffer?.network ?? "");
+          registeredNetwork = registerNetwork;
           client.register(registerNetwork as `${string}:${string}`, scheme);
         }
+
+        // Issue #62 (D4): EXPLICIT SDK spend controls — the SDK's implicit
+        // "$1 default cap + default-asset allowlist" must never be the reason
+        // an allowed payment fails. The project's own per-call cap is the
+        // single source of truth: the top-level USD cap (the same
+        // getMaxPerCall() the policy gate reads) plus ONE per-asset entry per
+        // listed asset on the registered network (table + operator
+        // extensions), each at the cap's exact ATOMIC equivalent (the SDK
+        // requires the integer atomic form there). D4: an non-finite or
+        // non-positive cap refuses the call here rather than ever passing
+        // `false` — the SDK layer is NEVER left uncapped.
+        const sdkPerCallUsd = getMaxPerCall();
+        if (!(Number.isFinite(sdkPerCallUsd) && sdkPerCallUsd > 0)) {
+          console.error(`[x402_fetch] CONFIG_INVALID: MAX_PAYMENT_PER_CALL read ${sdkPerCallUsd} — the SDK spend controls take the project's per-call cap as their source of truth, so refusing instead of any uncapped/invalid control set`);
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                error: "CONFIG_INVALID: MAX_PAYMENT_PER_CALL must be a finite positive number — the SDK spend controls take the project's per-call cap as their source of truth (never uncapped at the SDK layer)",
+                url,
+                chain: useChain,
+                estimated_cost_usdc: amountUsdc,
+                reasons: [{ code: "CONFIG_INVALID", message: `Issue #62 (D4): the per-call cap reads ${sdkPerCallUsd}; refuse rather than leave the SDK spend controls uncapped` }],
+              }),
+            }],
+          };
+        }
+        client.setSpendControls(sdkSpendControls(registeredNetwork, probedAssetExtensions));
 
         // Step 3.5: POLICY GATE (issue #19) — the outer gate every payment
         // must pass before payment code runs. APPROVAL_REQUIRED is refused
@@ -636,11 +940,20 @@ export function registerFetchTool(server: McpServer): void {
         // advertised directory price — built OUTSIDE the engine so the pure
         // core never touches the ledger or the directory.
         const policyResult = getPolicyEngine().evaluate(
-          buildPolicyContext(url, useChain, "USDC", amountUsdc, { recipient: probedOffer?.payTo }),
+          // Issue #62: the token label is the ASSET TABLE's real symbol (the
+          // priced entry), never the legacy literal — tokens.allowed means
+          // what the table says.
+          buildPolicyContext(url, useChain, probedSymbol ?? "USDC", amountUsdc, { recipient: probedOffer?.payTo, ...(probedSymbol === undefined ? {} : { currency: probedSymbol }) }),
           // Issue #54 (req 1): outstanding reservations hold budget that is
           // not in the ledger yet — the per-service context must include this
           // host's holds or overlapping calls read a stale picture.
-          { dailySpentUsd: getDailySpent(), perServiceSpentUsd: getPerServiceSpent(serviceHost) + reservedUsd(`service:${serviceHost}`) },
+          // Issue #59 (D7): the bucket scoping — the gate's daily total is
+          // `dailySpentOfBucket` (computed above): the DEVNET bucket's own
+          // total (getDailySpent(spendBucket)) for a devnet leg, the mainnet
+          // whole-map total (which NEVER includes the devnet bucket) for
+          // every other leg — the per-service context's holds stay scoped to
+          // the devnet-prefixed service scope exactly as computed above.
+          { dailySpentUsd: dailySpentOfBucket, perServiceSpentUsd: getPerServiceSpent(serviceHost) + reservedUsd(serviceScope) },
           getAnomalyInputs(url),
         );
         if (policyResult.decision !== "ALLOW") {
@@ -710,10 +1023,14 @@ export function registerFetchTool(server: McpServer): void {
             decision: policyResult,
             url,
             chain: useChain,
-            token: "USDC",
+            // Issue #62: the intent binds the TABLE's resolved symbol and
+            // decimals for the chosen asset (never the legacy literals) — so
+            // matchRequirements compares against what was actually priced and
+            // the ledger row carries the signed asset's own shape.
+            token: probedSymbol ?? "USDC",
             asset: probedOffer.asset ?? "",
             amountAtomic: probedOffer.amount ?? "",
-            decimals: 6,
+            decimals: probedDecimals ?? 6,
             recipient: probedOffer.payTo ?? "",
             network: probedOffer.network ?? "",
             scheme: probedOffer.scheme ?? "",
@@ -743,7 +1060,10 @@ export function registerFetchTool(server: McpServer): void {
         // Belt-and-braces INSIDE the payment layer (operator decision #5):
         // payment-utils.checkSpendingLimit stays in place — the policy engine
         // is the outer gate, not a replacement.
-        const limitCheck = checkSpendingLimit(amountUsdc);
+        // Issue #59 (D7): the spending-limit check reads this leg's bucket —
+        // the devnet bucket is a separate account (getDailySpent's mainnet
+        // sum excludes it).
+        const limitCheck = checkSpendingLimit(amountUsdc, spendBucket);
         if (!limitCheck.allowed) {
           return {
             content: [{
@@ -793,7 +1113,10 @@ export function registerFetchTool(server: McpServer): void {
         // because the response was slow — only signing, or its absence, resolves it.
         const reservation = reserveSpend({
           amountUsd: signedAmountUsdc ?? amountUsdc,
-          scopes: [`service:${serviceHost}`],
+          scopes: [serviceScope],
+          // Issue #59 (D7): a devnet hold lives in the devnet bucket (its
+          // own daily read, its own scope) — never the mainnet 'global'.
+          ...(spendBucket ? { networkBucket: spendBucket } : {}),
         });
         if (reservation.ok === false) {
           return {
@@ -969,6 +1292,9 @@ export function registerFetchTool(server: McpServer): void {
             url,
             method,
             chain: useChain,
+            // Issue #59 (req 7+D7): the exact network the row settles on — the
+            // devnet rows are bucketed by it, never into the mainnet totals.
+            ...(probedOffer?.network ? { network: probedOffer.network } : {}),
             ...(isSuccessfulPayment ? { amount_usdc: recordedAmountUsdc, ...intentTrail } : failureRowFields),
             tx_hash: txHash,
             status: isSuccessfulPayment ? "success" : "failed",
@@ -1055,6 +1381,10 @@ export function registerFetchTool(server: McpServer): void {
           url,
           method,
           chain: useChain,
+          // Issue #59: the exact network of the attempted leg (failed rows
+          // carry it too — the audit trail is complete; only SUCCESS devnet
+          // rows feed the devnet bucket).
+          ...(probedOffer?.network ? { network: probedOffer.network } : {}),
           amount_usdc: 0,
           status: "failed",
           error: err.message,
@@ -1118,6 +1448,10 @@ export function registerFetchTool(server: McpServer): void {
           }],
         };
       }
+    })();
+      // Issue #59 (req 8): the single exit — every result carries the run's
+      // mode (+ the observed network) — see overlayVisibility above.
+      return overlayVisibility(runResult, resolveNetworkMode().mode, observed.network);
     }
   );
 }

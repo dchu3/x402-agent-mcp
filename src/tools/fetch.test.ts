@@ -9,6 +9,7 @@ import bs58 from 'bs58';
 // Isolate the payment ledger BEFORE importing fetch.js (PAYMENT_LOG_PATH
 // pattern from casper-fetch.test.ts / payment-utils.rehydrate.test.ts).
 const dir = mkdtempSync(join(tmpdir(), 'x402-fetch-test-'));
+process.env.X402_NETWORK_MODE = 'mainnet'; // issue #59: these suites must name the MAINNET mode explicitly — set BEFORE the env capture so every afterEach restore keeps it
 const env = { ...process.env };
 process.env.PAYMENT_LOG_PATH = join(dir, 'ledger.jsonl');
 // Hermetic directory for trust derivation (#19): an empty temp directory keeps

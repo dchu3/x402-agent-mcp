@@ -87,6 +87,12 @@ const DENY_CODES: ReadonlySet<ReasonCode> = new Set([
   "CONFIG_INVALID",
   "RECIPIENT_NOT_ALLOWED", // rule 4.5 (issue #26): the recipient gate — emitted by the engine since #26
   "ENDPOINT_NOT_LIVE", // rule 4.7 (issue #34): the liveness gate — a liveness refusal has no approval band
+  // Issue #62: the per-network asset-table gates — there is no symbol/decimals
+  // to price with (ASSET_NOT_LISTED), or no USD price exists for the USD leg
+  // (ASSET_NO_USD_RATE). Both are fail-closed (never an assumed unit) with no
+  // approval band.
+  "ASSET_NOT_LISTED",
+  "ASSET_NO_USD_RATE",
 ]);
 
 export class PolicyEngine {

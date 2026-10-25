@@ -1,5 +1,7 @@
 import { CASPER_CHAIN, isCasperNetwork } from "../casper/networks.js";
 import { aliasForCaip2 } from "../evm/networks.js";
+// Issue #59 (req 6): exact Solana CAIP-2 ids (public protocol identifiers).
+import { SOLANA_MAINNET_CAIP2, SOLANA_DEVNET_CAIP2, SOLANA_TESTNET_CAIP2 } from "@x402/svm";
 // Issue #58: every fetch site in this shared probe surface goes through the
 // one transport guard — private/loopback/link-local hosts are refused before
 // any request and redirects are refused (REDIRECT_REFUSED), never followed.
@@ -45,10 +47,23 @@ export function isX402Manifest(data: any): boolean {
  * ids resolve through the shared CAIP-2 vocabulary (src/evm/networks.ts) —
  * eip155:137 ⇒ "polygon", eip155:42161 ⇒ "arbitrum", eip155:1 ⇒ "ethereum",
  * and an UNKNOWN eip155:* id returns VERBATIM (never "base" — that substring
- * collapse was the #32 bug). Solana/Casper checks and the raw-string fallback
- * are unchanged. */
+ * collapse was the #32 bug).
+ * Issue #59 (req 6): the SOLANA side is exact now too — the chain vocabulary
+ * is reached ONLY through the protocol's exact identifiers: the SDK's Solana
+ * CAIP-2 ids (mainnet/devnet/testnet), the V1 protocol network name and the
+ * bare mainnet genesis (the pre-#59 vocabulary). A namespace whose NAME
+ * happens to contain "solana" (<prefix>;solana) or an UNKNOWN solana:*
+ * genesis stays VERBATIM — classification is never substring matching. */
 export function parseChainFromNetwork(network: string): string {
-  if (network.includes("solana") || network.includes("5eykt4")) return "solana";
+  if (
+    network === "solana"
+    || network === SOLANA_MAINNET_CAIP2
+    || network === SOLANA_DEVNET_CAIP2
+    || network === SOLANA_TESTNET_CAIP2
+    || network === "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
+  ) {
+    return "solana";
+  }
   const evmAlias = aliasForCaip2(network);
   if (evmAlias !== "") return evmAlias;
   if (isCasperNetwork(network)) return CASPER_CHAIN;
