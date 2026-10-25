@@ -7,19 +7,42 @@ import { blockingEnforcement, intentEnforcement } from '../payment-intent/execut
 import { intentManager } from '../payment-intent/manager.js';
 import type { IntentRejectCode, PaymentIntent } from '../payment-intent/types.js';
 
-export async function boundedText(response: Response, limit = 65536): Promise<string> {
+export async function boundedText(response: Response, limit = 65536, signal?: AbortSignal): Promise<string> {
   if (!response.body) return '';
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
   let size = 0;
+  // Issue #80 (R1a): an optional caller signal bounds the read in TIME, not
+  // just in bytes — a mid-body stall is the unbounded read the issue pins.
+  // The read races the abort (one shared rejector per call); on abort the
+  // signal's reason (the paid-leg deadline's TimeoutError) propagates.
+  const aborted = signal === undefined
+    ? undefined
+    : new Promise<never>((_resolve, reject) => {
+      const onAbort = () => reject(signal.reason);
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    });
   try {
     for (;;) {
-      const { value, done } = await reader.read();
+      const { value, done } = aborted === undefined
+        ? await reader.read()
+        : await Promise.race([reader.read(), aborted]);
       if (done) break;
       size += value.byteLength;
       if (size > limit) { await reader.cancel(); throw new Error('Payment response exceeds size limit'); }
       chunks.push(value);
     }
+  } catch (err) {
+    // Best-effort stream hygiene (never masks the real error): free the
+    // socket promptly when the read stopped early — an abort or the size cap.
+    await reader.cancel().catch(() => undefined);
+    if (aborted !== undefined && signal!.aborted) {
+      // The abort stopped this read — the call surfaces the caller's reason
+      // (the paid-leg deadline's TimeoutError), never a stream detail.
+      throw signal!.reason;
+    }
+    throw err;
   } finally { reader.releaseLock(); }
   return Buffer.concat(chunks).toString('utf8');
 }

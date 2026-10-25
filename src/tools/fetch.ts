@@ -36,7 +36,7 @@ import { guardedFetch, isTransportRefusal } from "../transport/guard.js";
 // Issue #61 (C7): the probe-replay transport — the SDK's first (unpaid) request
 // to the same method+url is answered from the probe's own bytes instead of a
 // second network hit, closing the offer-swap window at its root.
-import { replayFirstProbe, recordForReplay, paidTimeoutMs, type ProbedResponseRecord } from "../transport/replay.js";
+import { replayFirstProbe, recordForReplay, paidTimeoutMs, paidLegDeadline, type PaidLegDeadline, type ProbedResponseRecord } from "../transport/replay.js";
 // Issue #64: deny-by-default caller headers — validated (allowlist, hard deny
 // list, token/CR-LF-NUL/length/count checks) BEFORE any request; values are
 // never logged (names only below).
@@ -830,6 +830,11 @@ export function registerFetchTool(server: McpServer): void {
       // Issue #53/#54: flips inside the enforcement hook right after the
       // intent is consumed — the only point where a signature may exist.
       let payloadSigned = false;
+      // Issue #80 (R1a): the ONE repo-owned deadline spanning the paid call
+      // (SDK paid fetch) and the paid BODY read. Created inside run() (the
+      // start of the paid leg — and, when it throws, after beginAttempt,
+      // preserving the pre-#80 ordering); read by the boundedText race below.
+      let paidDeadline: PaidLegDeadline | undefined;
 
       // Step 3: Create x402 client with the right scheme
       try {
@@ -1211,19 +1216,24 @@ export function registerFetchTool(server: McpServer): void {
                   ? replayFirstProbe(probeRecord, guardedFetch)
                   : guardedFetch;
               const paidFetch = wrapFetchWithPayment(transport, client);
-              // Issue #56: the paid request carries the flow's own timeout
-              // (AbortSignal.timeout) — a seller that never answers cannot
-              // hang the flow past X402_PAID_TIMEOUT_MS (default 30000 ms,
-              // parsed fail-closed by replay.paidTimeoutMs). The signal is
-              // set on the init, so it rides the Request object the SDK
-              // builds (and its retry clone).
-              return paidFetch(url, {
+              // Issue #56+#80: the paid leg carries ONE repo-owned deadline
+              // (X402_PAID_TIMEOUT_MS, default 30000 ms, parsed fail-closed by
+              // replay.paidTimeoutMs): the controller's signal rides the SDK
+              // init (bounding the pre-headers wait wherever undici propagates
+              // it), and the deadline's OWN timer races the paid call itself —
+              // the bound no longer depends on the init signal surviving the
+              // SDK's Request clone chain (measured unreliable through
+              // new Request → clone → headers.set → clone). It is created
+              // here, not above executeGuarded, so a paidTimeoutMs RangeError
+              // still throws where beginAttempt already ran (pre-#80 order).
+              paidDeadline = paidLegDeadline(paidTimeoutMs(process.env));
+              return paidDeadline.race(paidFetch(url, {
                 method,
                 headers: requestHeaders(),
                 body: args.body || undefined,
                 redirect: "manual",
-                signal: AbortSignal.timeout(paidTimeoutMs(process.env)),
-              });
+                signal: paidDeadline.signal,
+              }));
             },
           });
           if (guarded.ok === false) {
@@ -1240,7 +1250,11 @@ export function registerFetchTool(server: McpServer): void {
           // memory. Over the bound the read throws; the catch below audits
           // it as any other failure (a zero-spend failed row naming the
           // cap). No paid retry happens after this point.
-          const text = await boundedText(resp, 1_048_576);
+          // Issue #80 (R1a): the read is bounded in TIME as well — it races
+          // the same paid-leg deadline (headers + body share the one budget)
+          // and carries its signal, so a seller that answers headers and then
+          // stalls the body surfaces PAID_TIMEOUT at the configured bound.
+          const text = await paidDeadline!.race(boundedText(resp, 1_048_576, paidDeadline!.signal));
           const bodyResult = parseBoundedBody(text);
 
           const { receipt: paymentReceipt, txHash } = extractSettlementReceipt(resp.headers);
@@ -1428,6 +1442,9 @@ export function registerFetchTool(server: McpServer): void {
           // policy/limit refusal, guarded.ok === false, any throw before
           // signing, or a signed-but-aborted flow. No reservation is
           // released merely because the response was slow.
+          // Issue #80 (R1a): the paid-leg deadline is cleared exactly here —
+          // the paid fetch AND its body read completed (or threw) by now.
+          paidDeadline?.end();
           if (payloadSigned) settleReservation(reservation.id);
           else releaseReservation(reservation.id);
         }
