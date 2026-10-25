@@ -23,6 +23,9 @@ import { normalizeRecipient } from "../policy/recipient.js";
 import { getDailySpent } from "../payment-utils.js";
 import { getPerServiceSpent } from "../policy/budget-store.js";
 import { getAnomalyInputs } from "../policy/anomaly-store.js";
+// FIX 3 — issue #67 (req 1/5): the EXISTING CAIP-2 → chain-name vocabulary
+// (no second table) — the check maps an exact network id to the chain name.
+import { parseChainFromNetwork } from "./probe-utils.js";
 // Issue #59/#62 (C9 visibility): the run's explicit mode + the asset table.
 import { modeAllowsNetwork, resolveNetworkMode } from "../networks.js";
 import { assetTableSummary } from "../assets.js";
@@ -90,7 +93,35 @@ export function registerCheckPaymentTool(server: McpServer): void {
       }
 
       const entry = findDirectoryEntry(host);
-      const chain = (args.chain || (entry && entry.chain && entry.chain !== "unknown" ? entry.chain : "") || "base").toLowerCase();
+      // Issue #67 (req 1/5, FIX 3): NEVER invent a chain. Precedence:
+      //   args.chain → args.network (the exact CAIP-2 mapped to the project
+      //   chain name through the EXISTING vocabulary — parseChainFromNetwork,
+      //   the same mapper every probe surface shares; no second table) →
+      //   directory entry → 'base' as the last resort for the POLICY
+      //   evaluation only. The output names its source, so an assumption is
+      //   visible instead of silent: a devnet Solana seller is never again
+      //   reported as "base" when the caller passed the exact network id.
+      // A CAIP-2 that maps OUTSIDE the project's chain set (an unmapped id)
+      // never claims a chain — it falls through, and the network itself stays
+      // echoed verbatim with its mode-match result.
+      const PROJECT_CHAINS = new Set(["base", "polygon", "arbitrum", "solana", "casper"]);
+      const directoryChain = entry && entry.chain && entry.chain !== "unknown" && PROJECT_CHAINS.has(entry.chain.toLowerCase()) ? entry.chain.toLowerCase() : "";
+      const networkChain = args.network !== undefined ? parseChainFromNetwork(args.network) : "";
+      let chain: string;
+      let chainSource: "argument" | "network" | "directory" | "assumed_default";
+      if (args.chain !== undefined) {
+        chain = args.chain.toLowerCase();
+        chainSource = "argument";
+      } else if (PROJECT_CHAINS.has(networkChain)) {
+        chain = networkChain;
+        chainSource = "network";
+      } else if (directoryChain !== "") {
+        chain = directoryChain;
+        chainSource = "directory";
+      } else {
+        chain = "base";
+        chainSource = "assumed_default";
+      }
       // Token passes through verbatim: the engine's allowlist match is exact
       // and the default list contains mixed-case entries ("wCSPR"). Case
       // normalization here would turn a valid wCSPR check into a false
@@ -137,6 +168,10 @@ export function registerCheckPaymentTool(server: McpServer): void {
         amount: exactUsdString(amountUsd, 6),
         currency: token,
         chain,
+        // Issue #67 (req 1/5, FIX 3): the chain's PROVENANCE — an agent can
+        // see whether the chain was named (argument/network), derived from
+        // the directory, or assumed ('base' for the policy evaluation only).
+        chain_source: chainSource,
         // Issue #59 (C9 visibility): the run's EXPLICIT network mode — when it
         // is unset over a loaded key the paid tool refuses, so this tool
         // surfaces the same condition with the stable code's message.

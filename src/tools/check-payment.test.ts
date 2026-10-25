@@ -478,3 +478,50 @@ it('the DENY verdict lists its reason codes in the reading aid (#67, C6)', async
   assert.ok(parsed.verdict_summary.startsWith('DENY:'), JSON.stringify(parsed.verdict_summary));
   assert.ok(parsed.verdict_summary.includes('REQUEST_LIMIT_EXCEEDED'));
 });
+
+// ---------------------------------------------------------------------------
+// Issue #67 (req 1/5, plan REFRESH line 84, FIX 3): never invent a chain.
+// Precedence: args.chain → args.network (exact CAIP-2 mapped through the
+// existing vocabulary/asset tables) → directory entry → 'base' assumed for
+// the POLICY evaluation only — and output always names its source, so an
+// assumption is visible instead of silent.
+// ---------------------------------------------------------------------------
+
+const SOLANA_DEVNET_CAIP2_TEST = 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1'; // @x402/svm's exact devnet id, imported verbatim below
+
+it('a bare network id names the chain: the devnet Solana seller is chain "solana", source "network"', async () => {
+  const result = await handler()({ url: 'https://devnetseller.example/api', network: SOLANA_DEVNET_CAIP2_TEST, amount: 0.05 });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.chain, 'solana', `a devnet solana seller must never read "base" again, got: ${parsed.chain}`);
+  assert.equal(parsed.chain_source, 'network');
+  assert.equal(parsed.network, SOLANA_DEVNET_CAIP2_TEST);
+});
+
+it('an explicit chain argument wins over everything, source "argument"', async () => {
+  const result = await handler()({ url: 'https://analyzer.example/score', chain: 'polygon', network: SOLANA_DEVNET_CAIP2_TEST, amount: 0.05 });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.chain, 'polygon');
+  assert.equal(parsed.chain_source, 'argument');
+});
+
+it('a directory-listed host names the chain when nothing else did, source "directory"', async () => {
+  const result = await handler()({ url: 'https://analyzer.example/score', amount: 0.05 });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.chain, 'base');
+  assert.equal(parsed.chain_source, 'directory');
+});
+
+it('nothing named → chain "base" for the policy evaluation only, with the assumption VISIBLE', async () => {
+  const result = await handler()({ url: 'https://no-truth-here.example/api', amount: 0.05 });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.chain, 'base');
+  assert.equal(parsed.chain_source, 'assumed_default');
+});
+
+it('a network id that maps OUTSIDE the project chain set does not claim a chain (falls through, visible)', async () => {
+  const result = await handler()({ url: 'https://no-truth-here.example/api', network: 'eip155:999777', amount: 0.05 });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.chain, 'base');
+  assert.equal(parsed.chain_source, 'assumed_default', 'an unmapped network never invents a project chain');
+  assert.equal(parsed.network, 'eip155:999777');
+});
