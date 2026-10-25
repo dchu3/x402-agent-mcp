@@ -169,7 +169,13 @@ export function registerInspectTool(server: McpServer): void {
     "x402_inspect",
     "Inspect what a 402 payment would be WITHOUT paying. Pass the payment-required payload in `offer` (a whole payload, an accepts array or a single offer object — no request is made) and get the deterministic selection's verdict for every listed offer (the SAME wiring as x402_fetch), the exact atomic and unit amounts, the USD value when the asset table prices it, the rejection token for every offer the flow would skip, a budget verdict for the chosen leg (per-call cap, daily cap, the optional MAX_DAILY_SPEND_TOTAL_USD cross-chain ceiling — an unpriced rail reports RAIL_DISABLED_NO_RATE) and a snapshot of every registered budget rail. With `url` and NO `offer`, the tool itself performs the same guarded probe x402_fetch's probe performs — ONE credential-less request through the shared transport guard (private hosts refused PRIVATE_HOST_REFUSED, redirects refused REDIRECT_REFUSED, per-call timeout, oversized payment data refused with the paid flow's own size caps); the fetched challenge feeds the same report and refusals are REPORTED, never a payment attempt. If both are given, `offer` wins and NO request is made. Read-only: this tool never signs, never reserves budget and never pays.",
     {
-      offer: z.unknown().describe("The 402 payment-required payload (object with accepts/accept), an accepts array, a single offer object, or any of those as a JSON string; omitted together with `url` when the tool should probe the endpoint itself"),
+      // Issue #77: optional — a real client passing ONLY `url` must reach the
+      // handler and its guarded-probe path (a non-optional `offer` rejected the
+      // call with a -32602 input-validation error before the handler ever ran;
+      // an explicit null never helped: it counted as supplied and fell into the
+      // offline not-parseable path). Still ANY JSON shape: the offer payload
+      // itself is normalized at runtime, not by the schema.
+      offer: z.unknown().optional().describe("The 402 payment-required payload (object with accepts/accept), an accepts array, a single offer object, or any of those as a JSON string; omitted together with `url` when the tool should probe the endpoint itself"),
       url: z.string().optional().describe("The endpoint to inspect — with `offer` supplied it only sharpens per-service policy inputs (the same rule x402_fetch enforces); with NO `offer` it is probed directly with the same guarded request x402_fetch's probe makes (never a payment attempt)"),
       timeout_ms: z.number().int().min(1).max(PROBE_TIMEOUT_MAX_MS).optional().describe("Probe timeout in milliseconds for the url-only path (1–30000, default 10000; never wider than the paid flow's own 30s probe timeout)"),
     },
@@ -208,12 +214,13 @@ export function registerInspectTool(server: McpServer): void {
       let probeAccepts: unknown[] | null | undefined = undefined;
       if (accepts === null) {
         if (inspectUrl === "") {
-          // Neither an offer payload nor a url — exactly today's report.
+          // Neither an offer payload nor a url (issue #77): one clear report —
+          // naming BOTH inputs — and ZERO network requests.
           return {
             content: [{
               type: "text" as const,
               text: JSON.stringify({
-                error: missingReason,
+                error: "url or offer is required — pass the payment-required payload in `offer` (an object with accepts/accept, an accepts array, a single offer object, or any of those as a JSON string; no request is made) or the endpoint to probe in `url`",
                 offers: [],
                 selection: { code: "NO_PAYABLE_OFFER", rejected: [] },
                 note: "Read-only inspection — nothing was signed, reserved, paid or fetched.",
