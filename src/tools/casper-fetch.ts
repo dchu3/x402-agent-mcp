@@ -118,7 +118,20 @@ export async function fetchCasper(
   } catch {
     // Never echo SDK/key-loading errors: they may contain secret key material.
     error = 'Casper payment failed validation, signing or transport; authorization budget remains reserved if signing was attempted';
-    return { content: [{ type: 'text' as const, text: JSON.stringify({ error, url, chain: 'casper' }) }] };
+    // Issue #80: the catch path reports the SAME tri-state the USD leg uses
+    // — when the leg threw AFTER the authorization was sent (e.g. a paid-leg
+    // transport error), the caller is told paid:'unknown' (never paid:false
+    // after a send), with the explicit authorization_sent flag and the
+    // authorized mote amount, so a sent attempt is never retried blindly
+    // (the ledger counts this row as authorized_unserved below — output and
+    // ledger agree). Nothing authorized ⇒ paid:false, exactly as before.
+    const authorizationSent = authorized() > 0n;
+    return { content: [{ type: 'text' as const, text: JSON.stringify({
+      error, url, chain: 'casper',
+      paid: authorizationSent ? 'unknown' : false,
+      authorization_sent: authorizationSent,
+      authorized_motes: authorized().toString(),
+    }) }] };
   } finally {
     // Issue #54 (req 6): the Casper row keeps the TRUE outcome too — a
     // verified success receipt settles; a nonzero authorization with no
