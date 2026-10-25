@@ -2,6 +2,23 @@
   "name": "x402-agent-mcp",
   "version": "1.3.0",
   "description": "Universal x402 agent MCP — discover and pay for any x402 endpoint on Base, Polygon, Arbitrum, Solana or Casper",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dchu3/x402-agent-mcp.git"
+  },
+  "keywords": [
+    "x402",
+    "mcp",
+    "model-context-protocol",
+    "ai-agents",
+    "solana",
+    "base",
+    "polygon",
+    "arbitrum",
+    "casper",
+    "payments"
+  ],
   "type": "module",
   "main": "dist/index.js",
   "scripts": {

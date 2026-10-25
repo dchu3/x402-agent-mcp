@@ -252,3 +252,50 @@ it('positive + negative control (#73): the local-link scanner filters external U
   assert.deepEqual(localMarkdownLinkTargets(fixture), ['.env.example']);
   assert.equal(existsSync(join(REPO_ROOT, 'does-not-exist.md')), false);
 });
+
+// ---- Discovery metadata (#73): MIT licence fields -----------------------
+
+// The standard MIT template text the LICENSE file must carry (the canonical
+// template, with the public repo handle as the copyright line).
+const MIT_TEMPLATE_HEAD = [
+  'MIT License',
+  '',
+  'Copyright (c) 2026 dchu3',
+  '',
+  'Permission is hereby granted, free of charge, to any person obtaining a copy',
+].join('\n');
+const MIT_TEMPLATE_BODY_PHRASES = [
+  'to use, copy, modify, merge, publish, distribute, sublicense, and/or sell',
+  'The above copyright notice and this permission notice shall be included in all',
+  'THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR',
+  'OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE',
+];
+
+it('metadata (#73): package.json carries MIT licence + repository + keywords', () => {
+  const pkg = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8')) as {
+    license?: string;
+    repository?: { type?: string; url?: string };
+    keywords?: string[];
+  };
+  assert.equal(pkg.license, 'MIT');
+  assert.equal(pkg.repository?.type, 'git');
+  assert.equal(pkg.repository?.url, 'git+https://github.com/dchu3/x402-agent-mcp.git');
+  assert.ok(
+    pkg.keywords,
+    'package.json must declare keywords for discovery',
+  );
+  for (const keyword of [
+    'x402', 'mcp', 'model-context-protocol', 'ai-agents', 'solana',
+    'base', 'polygon', 'arbitrum', 'casper', 'payments',
+  ]) {
+    assert.ok(pkg.keywords.includes(keyword), `package.json keywords must include ${keyword}`);
+  }
+});
+
+it('metadata (#73): LICENSE matches the standard MIT template', () => {
+  const license = readFileSync(join(REPO_ROOT, 'LICENSE'), 'utf8');
+  assert.ok(license.startsWith(MIT_TEMPLATE_HEAD), 'LICENSE must start with the standard MIT template head');
+  for (const phrase of MIT_TEMPLATE_BODY_PHRASES) {
+    assert.ok(license.includes(phrase), `LICENSE must carry the standard MIT template phrase: ${phrase}`);
+  }
+});
