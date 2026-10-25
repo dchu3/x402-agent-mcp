@@ -148,8 +148,9 @@ function resetDailyIfNewDay(): void {
  * logs one stderr line and reads as 0, denying all payments until the env is
  * fixed. Absent vars keep the documented fallbacks (zero behavior change for
  * ordinary operators). The policy layer's own defaults (policy/config.ts
- * legacyNumber) already fail closed on their side. */
-function readCapUsd(name: string, fallback: number): number {
+ * legacyNumber) already fail closed on their side. The budget registry's #65
+ * ceiling reader reuses this exact discipline, so it is exported. */
+export function readCapUsd(name: string, fallback: number): number {
   const raw = process.env[name];
   if (raw === undefined) return fallback;
   if (!/^\d+(\.\d+)?$/.test(raw)) {

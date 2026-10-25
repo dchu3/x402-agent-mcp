@@ -19,12 +19,15 @@ export const MAX_SELLER_COST_LENGTH = 32;
  * fraction zero-padded to exactly `decimals` digits (the mirror image of
  * usdFromAtomic's internal decimal string). A small value is therefore never
  * rounded to zero: 1 atomic unit at 6 decimals is "0.000001", the measured
- * $0.001 devnet ping is "0.001000". `decimals` must be an integer in 0..18
- * (the usdFromAtomic domain) — anything else is a programmer error and fails
- * loud rather than mis-rendering money. Negative amounts carry a minus sign. */
+ * $0.001 devnet ping is "0.001000". `decimals` must be an integer in 0..30 —
+ * the display/conversion domain of every unit the rails may settle in (USDC
+ * 6, wCSPR 9, Nano 30) — anything else is a programmer error and fails loud
+ * rather than mis-rendering money. Negative amounts carry a minus sign.
+ * (The USD-facing converters keep their tighter 0..18 float-narrowing domain;
+ * this renderer is pure string math and stays exact at any width.) */
 export function formatAtomic(atomic: bigint, decimals: number): string {
-  if (typeof atomic !== "bigint" || !Number.isInteger(decimals) || decimals < 0 || decimals > 18) {
-    throw new TypeError(`formatAtomic needs a bigint amount and an integer decimals in 0..18 (got ${String(decimals)})`);
+  if (typeof atomic !== "bigint" || !Number.isInteger(decimals) || decimals < 0 || decimals > 30) {
+    throw new TypeError(`formatAtomic needs a bigint amount and an integer decimals in 0..30 (got ${String(decimals)})`);
   }
   const negative = atomic < 0n;
   const value = negative ? -atomic : atomic;
@@ -46,8 +49,8 @@ export function atomicStringFromUsdString(usd: string, decimals: number): string
   if (typeof usd !== "string" || !/^[0-9]+(\.[0-9]+)?$/.test(usd)) {
     throw new TypeError(`atomicStringFromUsdString needs a plain non-negative decimal string, got: ${String(usd).slice(0, 32)}`);
   }
-  if (!Number.isInteger(decimals) || decimals < 0 || decimals > 18) {
-    throw new TypeError(`atomicStringFromUsdString needs an integer decimals in 0..18 (got ${String(decimals)})`);
+  if (!Number.isInteger(decimals) || decimals < 0 || decimals > 30) {
+    throw new TypeError(`atomicStringFromUsdString needs an integer decimals in 0..30 (got ${String(decimals)})`);
   }
   const [whole, frac = ""] = usd.split(".");
   const atomicFraction = BigInt((frac + "0".repeat(decimals)).slice(0, decimals) || "0");

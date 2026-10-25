@@ -36,8 +36,13 @@ it('formatAtomic is exact for every 18-decimal value the domain allows', () => {
   assert.equal(formatAtomic(value, 18), '98.765432100000000000', 'BigInt math — no float ever enters the rendering');
 });
 
+it('formatAtomic stays exact through the display domain’s top (a 30-decimal Nano-shaped rail)', () => {
+  assert.equal(formatAtomic(1n, 30), '0.000000000000000000000000000001', 'a single atomic unit at 30 decimals refuses to vanish');
+  assert.equal(formatAtomic(1500000000000000000000000000000n, 30), '1.500000000000000000000000000000');
+});
+
 it('formatAtomic refuses out-of-domain decimals (programmer error, fail loud)', () => {
-  for (const decimals of [-1, 19, 2.5, NaN]) {
+  for (const decimals of [-1, 31, 2.5, NaN]) {
     assert.throws(() => formatAtomic(1n, decimals as number), /decimals/, `decimals ${decimals} must be refused`);
   }
 });
@@ -63,6 +68,7 @@ it('atomicStringFromUsdString converts a configured USD cap string to exact atom
   assert.equal(atomicStringFromUsdString('10.00', 6), '10000000', 'MAX_DAILY_SPEND default');
   assert.equal(atomicStringFromUsdString('5', 6), '5000000', 'a whole-unit string carries no fraction');
   assert.equal(atomicStringFromUsdString('1', 9), '1000000000', '9-decimal units scale exactly');
+  assert.equal(atomicStringFromUsdString('1', 30), '1000000000000000000000000000000', 'the 30-decimal display domain scales exactly too');
   assert.equal(atomicStringFromUsdString('0', 6), '0', 'the fail-closed cap 0 stays 0');
   assert.equal(
     atomicStringFromUsdString('0.0000001', 6),
