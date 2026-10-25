@@ -25,6 +25,8 @@ Chain is auto-detected from the 402 response's real CAIP-2 network id (`eip155:8
 | `devnet` | Pays the Solana devnet only (`solana:EtWTRAB…` — the x402 lab devnet, USDC `4zMMC9sr…` at the measured $0.001 ping). A mainnet or EVM offer is refused; the Casper testnet (`casper-test`) is the matching Casper network. |
 | unset / invalid | With a payment key loaded, **every** `x402_fetch` refuses with `NETWORK_NOT_CONFIGURED` BEFORE the probe (zero network activity, zero payment headers). Free tools are immune: the directory, `x402_check_payment` and everything read-only keep working. |
 
+**`mainnet` settles real, irreversible funds.** A mainnet payment is a live on-chain transaction you cannot claw back. Start on `devnet` with a throwaway key first (see the quick start just below) — devnet mode exists precisely so a key that holds no real value can exercise the whole payment flow, and **devnet spend has its own daily bucket** that never moves the mainnet totals.
+
 Mechanics: the registration network is the MODE's exact CAIP-2 (req 2 — a devnet wallet never signs a mainnet challenge, and vice versa); the Solana devnet runs `SOLANA_DEVNET_RPC_URL` (its documented public fallback is the SDK's devnet RPC; a mainnet RPC is never touched in devnet mode and vice versa); every result carries `network_mode` and the leg's exact `network` (req 8), and one stderr line at startup renders the mode, the RPC host (host only) and the asset table. The ledger rows carry `network`; **devnet spend has its own daily bucket** (req 7) — a devnet payment never moves the mainnet daily totals or the mainnet reservations, and vice versa.
 
 ### Devnet quick start (throwaway key only)
