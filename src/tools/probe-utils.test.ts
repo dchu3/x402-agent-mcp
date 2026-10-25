@@ -351,4 +351,34 @@ describe('probePaymentChallenge — the discriminated liveness probe (issue #34)
     assert.ok(result.latency_ms >= 10, 'latency reflects the real wait');
     assert.ok(Date.now() - started < 5000, 'the timeout must actually cut the probe short');
   });
+
+  // Issue #67 req 1 (fix round 2): the probe refuses the SAME oversized
+  // payment data as the paid flow's probe (fetch.ts's 64 KiB payment-required
+  // cap, boundedText's 64 KiB body cap) — reported error outcomes, never
+  // parsed, never a payment attempt.
+  it('a 402 whose payment-required header exceeds the paid-path cap is an error outcome (never parsed)', async () => {
+    globalThis.fetch = (async () =>
+      new Response('Payment Required', { status: 402, headers: { 'payment-required': 'a'.repeat(65537) } })) as any;
+    const result = await probePaymentChallenge('https://probe.invalid/api');
+    assert.equal(result.kind, 'error');
+    assert.equal(result.error, 'Payment header exceeds size limit', "the paid path's own cap wording");
+    assert.equal(result.challenge, undefined, 'an oversized payload is never handed to the inspector');
+  });
+
+  it('a 402 with no payment-required header falls back to the bounded BODY read (the paid probe parses the body then)', async () => {
+    const payload = { x402Version: 2, accepts: [{ scheme: 'exact', network: 'eip155:8453', amount: '10000', payTo: '0xabc' }] };
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify(payload), { status: 402, headers: { 'content-type': 'application/json' } })) as any;
+    const result = await probePaymentChallenge('https://probe.invalid/api');
+    assert.equal(result.kind, 'live_402', 'a 402 whose body carries the challenge object classifies live');
+    assert.equal(result.challenge.accepts[0].network, 'eip155:8453');
+  });
+
+  it('an oversized body on a header-less 402 is refused as an error outcome (bounded read, never read on)', async () => {
+    globalThis.fetch = (async () => new Response('a'.repeat(65537), { status: 402 })) as any;
+    const result = await probePaymentChallenge('https://probe.invalid/api');
+    assert.equal(result.kind, 'error');
+    assert.equal(result.error, 'Payment response exceeds size limit');
+    assert.equal(result.challenge, undefined);
+  });
 });

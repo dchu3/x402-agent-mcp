@@ -7,7 +7,7 @@ import { SOLANA_MAINNET_CAIP2, SOLANA_DEVNET_CAIP2, SOLANA_TESTNET_CAIP2 } from 
 // any request and redirects are refused (REDIRECT_REFUSED), never followed.
 // x402_crawl_directory and x402_probe_allowlist probe through these helpers,
 // so the guard covers them without a second fetch path.
-import { guardedFetch, isTransportRefusal } from "../transport/guard.js";
+import { guardedFetch, isTransportRefusal, type GuardCode } from "../transport/guard.js";
 
 /** Fetch a URL and return its parsed JSON body, or null on any failure
  * (network error, non-2xx, or body that is not valid JSON — e.g. an HTML
@@ -108,15 +108,63 @@ export interface LivenessProbeResult {
   latency_ms: number;
   /** Diagnostic message — present only on error (timeout, DNS, refused, …). */
   error?: string;
+  /** The stable transport refusal code (issue #58: PRIVATE_HOST_REFUSED,
+   * REDIRECT_REFUSED, HTTP_NOT_ALLOWED, URL_INVALID) when this error outcome
+   * IS a transport-guard refusal — absent for timeouts, network failures and
+   * the oversized-payment-data outcomes (those surface through `error` with
+   * the paid flow's own cap wording). */
+  error_code?: GuardCode;
+}
+
+/** The paid flow's own payment-data caps, applied here too (issue #67 req 1:
+ * the probe must refuse what the paid probe refuses): `fetch.ts` refuses a
+ * payment-required header longer than 64 KiB ("Payment header exceeds size
+ * limit") and the paid bounded read (`casper-fetch.boundedText`) refuses a
+ * body past 64 KiB ("Payment response exceeds size limit"). */
+const PAYMENT_REQUIRED_HEADER_CAP = 65_536;
+const PAYMENT_REQUIRED_BODY_CAP = 65_536;
+
+/** Bounded body read for the header-less-402 fallback (adapted from
+ * casper-fetch's boundedText, which throws on oversize). Kept local so this
+ * shared probe surface stays free of the payment SDK casper-fetch imports.
+ * Reads at most PAYMENT_REQUIRED_BODY_CAP bytes and throws when the body
+ * exceeds it — an oversized body is an attack signal, never read on. */
+async function boundedProbeBody(response: Response, limit: number = PAYMENT_REQUIRED_BODY_CAP): Promise<string> {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > limit) {
+        await reader.cancel();
+        throw new Error("Payment response exceeds size limit");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks).toString("utf8");
 }
 
 /** Probe a URL for a 402 PAYMENT-REQUIRED challenge and classify the outcome
- * (issue #34, L6):
+ * (issue #34, L6; issue #67 req 1 — the guard/cap outcomes x402_inspect
+ * reports):
  *   - status 402 with a decodable payment-required header ⇒ live_402 (with the
- *     parsed challenge object)
+ *     parsed challenge object); a payment-required header longer than 64 KiB
+ *     is an error outcome (never parsed, the paid probe's own cap);
+ *   - a 402 with NO payment-required header falls back to the bounded BODY
+ *     read the paid probe uses header-less (a JSON object body ⇒ live_402;
+ *     a body past 64 KiB is an error outcome, anything else ⇒ no_402);
  *   - any other answered response, or a 402 whose header does not decode ⇒
  *     no_402
- *   - a thrown/aborted request (timeout, network failure) ⇒ error (never live)
+ *   - a thrown/aborted request (timeout, network failure, transport refusal)
+ *     ⇒ error (never live); a transport refusal carries its stable code in
+ *     `error_code` (PRIVATE_HOST_REFUSED / REDIRECT_REFUSED / …).
  * Redirects are never followed (redirect: "manual" — a 3xx is refused
  * REDIRECT_REFUSED by the transport guard, issue #58), only the response
  * header is read, and nothing is ever paid or authenticated — one shared HTTP
@@ -135,17 +183,43 @@ export async function probePaymentChallenge(url: string, timeoutMs: number = 100
     if (resp.status !== 402) {
       return { kind: "no_402", latency_ms: Date.now() - started };
     }
-    const challenge = decodePaymentRequiredHeader(resp.headers.get("payment-required"));
-    if (!challenge) {
-      return { kind: "no_402", latency_ms: Date.now() - started };
+    const encoded = resp.headers.get("payment-required");
+    // Issue #67 req 1: the SAME oversize caps the paid probe refuses with —
+    // an oversized payment payload is an attack signal, never parsed.
+    if (encoded !== null && encoded.length > PAYMENT_REQUIRED_HEADER_CAP) {
+      return { kind: "error", latency_ms: Date.now() - started, error: "Payment header exceeds size limit" };
     }
-    return { kind: "live_402", challenge, latency_ms: Date.now() - started };
+    const challenge = decodePaymentRequiredHeader(encoded);
+    if (challenge) {
+      return { kind: "live_402", challenge, latency_ms: Date.now() - started };
+    }
+    if (encoded === null) {
+      // Header absent: exactly the fallback the paid probe parses on a 402
+      // (header else bounded body). An oversized body is refused as an error
+      // outcome — bounded read, never read on; a body that is not a JSON
+      // object is just "answered, nothing decodable" (no_402).
+      let body: string;
+      try {
+        body = await boundedProbeBody(resp);
+      } catch (err: any) {
+        return { kind: "error", latency_ms: Date.now() - started, error: String(err?.message ?? err).slice(0, 200) };
+      }
+      try {
+        const parsed = JSON.parse(body) as unknown;
+        if (parsed !== null && typeof parsed === "object") {
+          return { kind: "live_402", challenge: parsed, latency_ms: Date.now() - started };
+        }
+      } catch {
+        // not a JSON object body — no_402 below
+      }
+    }
+    return { kind: "no_402", latency_ms: Date.now() - started };
   } catch (err: any) {
     // Issue #58: a transport guard refusal reports as a stable error outcome
     // ("PRIVATE_HOST_REFUSED: …" / "REDIRECT_REFUSED: …") — never live, never
     // followed. The refusal detail already carries the stable code.
     if (isTransportRefusal(err)) {
-      return { kind: "error", latency_ms: Date.now() - started, error: err.message };
+      return { kind: "error", latency_ms: Date.now() - started, error: err.message, error_code: err.code };
     }
     return { kind: "error", latency_ms: Date.now() - started, error: String(err?.message ?? err).slice(0, 200) };
   }

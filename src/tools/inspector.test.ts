@@ -1,5 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { after, afterEach, it } from 'node:test';
+import http from 'node:http';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -201,4 +202,181 @@ it('malformed offer input is a reported refusal, never a throw into the framewor
   assert.equal(parsed.offers.length, 0);
   assert.equal(parsed.selection.code, 'NO_PAYABLE_OFFER');
   assert.ok(parsed.error ?? true, 'a shape-aware error field is fine');
+});
+
+// ---------------------------------------------------------------------------
+// Issue #67 req 1 (fix round 2) — `url` WITHOUT `offer`: the tool performs
+// the SAME guarded probe the paid flow makes (probePaymentChallenge over
+// guardedFetch: private-host guard, redirect refusal, timeout, size caps) and
+// feeds the fetched challenge into the SAME offer-evaluation wiring. Hermetic
+// per the acceptance tests: a real loopback mock seller on 127.0.0.1 with
+// X402_ALLOW_PRIVATE_HOSTS set env-only for that port (the
+// fetch-selection.test.ts pattern). The mock seller records every request so
+// tests can assert NO payment header was ever sent and the ledger stays
+// byte-identical.
+// ---------------------------------------------------------------------------
+
+interface RecordedRequest {
+  method: string;
+  url: string;
+  headers: Record<string, string | string[] | undefined>;
+}
+
+const liveSellers: Array<{ server: http.Server }> = [];
+
+/** Start one loopback mock seller; the seller-brain writes the 402 (or not).
+ * X402_ALLOW_PRIVATE_HOSTS is set env-only for this suite's own port — a tool
+ * caller can never add to it (issue #58 req 6). */
+async function seller(
+  onVisit: (req: http.IncomingMessage, res: http.ServerResponse) => void,
+): Promise<{ url: string; recorded: RecordedRequest[] }> {
+  const recorded: RecordedRequest[] = [];
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      recorded.push({ method: req.method ?? '', url: req.url ?? '', headers: { ...req.headers } });
+      onVisit(req, res);
+    });
+  });
+  liveSellers.push({ server });
+  const port = await new Promise<number>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const addr = server.address();
+      resolve(typeof addr === 'object' && addr !== null ? addr.port : 0);
+    });
+  });
+  process.env.X402_ALLOW_PRIVATE_HOSTS = `127.0.0.1:${port}`;
+  return { url: `http://127.0.0.1:${port}/v1/paid`, recorded };
+}
+
+after(async () => {
+  for (const { server } of liveSellers) {
+    await new Promise<void>((ok) => server.close(() => ok()));
+  }
+});
+
+const b64url = (s: string) =>
+  Buffer.from(s).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+function ledgerBytes(): string | null {
+  return existsSync(process.env.PAYMENT_LOG_PATH!) ? readFileSync(process.env.PAYMENT_LOG_PATH!, 'utf-8') : null;
+}
+
+it('url + no offer: the tool performs the guarded probe itself — a live 402 yields the full per-offer report', async () => {
+  const { url, recorded } = await seller((_req, res) => {
+    res.writeHead(402, {
+      'payment-required': b64url(JSON.stringify({ x402Version: 2, accepts: [DISALLOWED, BASE_USDC] })),
+    });
+    res.end('Payment Required');
+  });
+  const before = ledgerBytes();
+  const parsed = parse(await handler()({ url }));
+  assert.equal(parsed.probe.kind, 'live_402', 'the probe outcome is reported');
+  assert.ok(Number.isFinite(parsed.probe.latency_ms));
+  assert.equal(parsed.offers.length, 2, 'every listed offer is reported');
+  assert.equal(parsed.offers[0].reject, 'network_not_allowed', 'polygon is refused by the same wiring');
+  assert.equal(parsed.offers[1].amount_atomic, '500000');
+  assert.equal(parsed.offers[1].amount_unit, '0.500000', 'exact 6-decimal rendering of the wired-offer');
+  assert.equal(parsed.selection.chosen_index, 1, 'the payable base offer is marked');
+  assert.equal(parsed.selection.budget.verdict, 'within', 'the chosen leg gets the SAME budget verdict');
+});
+
+it('the url probe makes exactly one credential-less request, no payment header, ledger byte-identical', async () => {
+  const { url, recorded } = await seller((_req, res) => {
+    res.writeHead(402, {
+      'payment-required': b64url(JSON.stringify({ x402Version: 2, accepts: [BASE_USDC] })),
+    });
+    res.end('Payment Required');
+  });
+  const before = ledgerBytes();
+  const parsed = parse(await handler()({ url }));
+  assert.equal(parsed.selection.chosen_index, 0);
+  assert.equal(recorded.length, 1, 'exactly ONE request — the probe; no paid leg follows');
+  assert.equal(recorded[0].headers['x-payment'], undefined, 'the mock records NO payment header');
+  assert.equal(recorded[0].headers['payment-signature'], undefined, 'no signature was ever sent');
+  assert.equal(ledgerBytes(), before, 'the ledger stays byte-identical');
+  assert.match(String(parsed.note), /nothing was signed|never pays/i);
+});
+
+it('a private-host url is refused with PRIVATE_HOST_REFUSED and zero requests (no payment attempt)', async () => {
+  let requests = 0;
+  const prev = globalThis.fetch;
+  globalThis.fetch = (async () => { requests++; return new Response('x'); }) as any;
+  try {
+    const before = ledgerBytes();
+    const parsed = parse(await handler()({ url: 'http://192.168.1.10/v1/paid' }));
+    assert.equal(parsed.error, 'PRIVATE_HOST_REFUSED', 'the stable transport code is the reported refusal');
+    assert.match(parsed.detail, /192\.168\.1\.10/);
+    assert.equal(parsed.probe.kind, 'error');
+    assert.equal(parsed.probe.error_code, 'PRIVATE_HOST_REFUSED', 'the probe outcome carries the stable code');
+    assert.equal(parsed.offers.length, 0);
+    assert.equal(parsed.selection.code, 'NO_PAYABLE_OFFER');
+    assert.equal(requests, 0, 'nothing reached any host — refused before any request, never a payment attempt');
+    assert.equal(ledgerBytes(), before, 'the ledger stays byte-identical');
+  } finally {
+    globalThis.fetch = prev;
+  }
+});
+
+it('offer precedence: when both `url` and `offer` are supplied the OFFER wins and zero requests are made', async () => {
+  let requests = 0;
+  const prev = globalThis.fetch;
+  globalThis.fetch = (async () => { requests++; return new Response('Probe ran — it must not.'); }) as any;
+  try {
+    const parsed = parse(await handler()({ url: 'https://203.0.113.10/should-not-be-probed', offer: [BASE_USDC] }));
+    assert.equal(parsed.selection.chosen_index, 0, 'the offer payload drives the report, unchanged');
+    assert.equal(parsed.offers.length, 1);
+    assert.equal(parsed.probe, undefined, 'no probe block — no request was made');
+    assert.equal(requests, 0, 'the offer path keeps ZERO network calls even with a url present');
+  } finally {
+    globalThis.fetch = prev;
+  }
+});
+
+it("a redirecting url is refused REDIRECT_REFUSED and the redirect target is never fetched", async () => {
+  const seen: string[] = [];
+  const prev = globalThis.fetch;
+  globalThis.fetch = (async (input: unknown) => {
+    seen.push(String(input instanceof Request ? (input as Request).url : input));
+    return new Response(null, { status: 302, headers: { location: 'http://10.1.2.3/steal' } });
+  }) as any;
+  try {
+    const parsed = parse(await handler()({ url: 'https://203.0.113.10/redirect' }));
+    assert.equal(parsed.error, 'REDIRECT_REFUSED', 'the stable transport code is the reported refusal');
+    assert.match(parsed.detail, /302/);
+    assert.equal(parsed.probe.kind, 'error');
+    assert.equal(parsed.offers.length, 0);
+    assert.equal(parsed.selection.code, 'NO_PAYABLE_OFFER');
+    assert.deepEqual(seen, ['https://203.0.113.10/redirect'], 'only the probe ran — the redirect target was never fetched');
+  } finally {
+    globalThis.fetch = prev;
+  }
+});
+
+it('an oversized response body on the probe is a reported refusal, never a throw into the framework', async () => {
+  const prev = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('a'.repeat(65537), { status: 402 })) as any;
+  try {
+    const parsed = parse(await handler()({ url: 'https://203.0.113.10/oversized' }));
+    assert.equal(parsed.error, 'Payment response exceeds size limit', 'the paid path\'s own bounded-read wording surfaces as the outcome');
+    assert.equal(parsed.probe.kind, 'error');
+    assert.equal(parsed.offers.length, 0);
+    assert.equal(parsed.selection.code, 'NO_PAYABLE_OFFER');
+  } finally {
+    globalThis.fetch = prev;
+  }
+});
+
+it('a url that answers without a 402 is a no_402 report — nothing to inspect, nothing paid', async () => {
+  const { url, recorded } = await seller((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end('<html>free landing page</html>');
+  });
+  const parsed = parse(await handler()({ url }));
+  assert.equal(parsed.probe.kind, 'no_402');
+  assert.equal(parsed.offers.length, 0);
+  assert.equal(parsed.selection.code, 'NO_PAYABLE_OFFER');
+  assert.equal(recorded.length, 1);
+  assert.equal(recorded[0].headers['x-payment'], undefined);
 });
