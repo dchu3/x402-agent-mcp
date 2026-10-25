@@ -36,7 +36,7 @@ import { guardedFetch, isTransportRefusal } from "../transport/guard.js";
 // Issue #61 (C7): the probe-replay transport — the SDK's first (unpaid) request
 // to the same method+url is answered from the probe's own bytes instead of a
 // second network hit, closing the offer-swap window at its root.
-import { replayFirstProbe, recordForReplay, paidTimeoutMs, paidLegDeadline, type PaidLegDeadline, type ProbedResponseRecord } from "../transport/replay.js";
+import { replayFirstProbe, recordForReplay, paidTimeoutMs, probeTimeoutMs, paidLegDeadline, type PaidLegDeadline, type ProbedResponseRecord } from "../transport/replay.js";
 // Issue #64: deny-by-default caller headers — validated (allowlist, hard deny
 // list, token/CR-LF-NUL/length/count checks) BEFORE any request; values are
 // never logged (names only below).
@@ -396,7 +396,10 @@ export function registerFetchTool(server: McpServer): void {
           // indistinct TypeError.
           const probeResp = await guardedFetch(url, {
             method,
-            signal: AbortSignal.timeout(30000),
+            // Issue #80 (R1c): the probe timeout is configurable now
+            // (X402_PROBE_TIMEOUT_MS, default 30000 ms, fail-closed parse) —
+            // the same bound the paid leg carries, no longer a literal.
+            signal: AbortSignal.timeout(probeTimeoutMs(process.env)),
             headers: requestHeaders(),
             body: args.body || undefined,
           });
@@ -715,6 +718,22 @@ export function registerFetchTool(server: McpServer): void {
           // actual charge below still aborts at the signing boundary (the
           // blocking hook), exactly as amendment 1 specifies.
           if (!forcedChain) {
+            // Issue #80 (R1c): a probe that ran out of time is a NAMED
+            // pre-payment refusal — timeout_before_payment — not the generic
+            // probe failure, so an agent can tell a slow seller from seller
+            // garbage. Fixed shape, no seller data (issue #63). Either
+            // DOMException name can arrive here (AbortSignal.timeout names it
+            // TimeoutError; an implementation may surface AbortError); on
+            // this seam every abort is the flow's own probe bound.
+            const probeAbortName = (err as { name?: unknown } | undefined)?.name;
+            if (probeAbortName === "TimeoutError" || probeAbortName === "AbortError") {
+              return {
+                content: [{
+                  type: "text" as const,
+                  text: JSON.stringify({ error: "timeout_before_payment", url }),
+                }],
+              };
+            }
             // Issue #63 (req 4): fixed error code only — the raw detail (which
             // may contain seller text) goes to the local debug log.
             console.error(`[x402_fetch] probe failed for ${url}: ${stripUntrusted(String(err?.message ?? err), 1000)}`);
