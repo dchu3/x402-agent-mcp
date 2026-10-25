@@ -97,6 +97,31 @@ export function reserveSpend(input: ReservationInput): ReservationResult {
         `(spent $${spent.toFixed(4)} + reserved $${reservedGlobal.toFixed(4)} today)`,
     };
   }
+  // Issue #65 (req 4/5): the OPTIONAL cross-chain ceiling, evaluated in the
+  // SAME synchronous check+insert as the daily cap so two parallel calls
+  // cannot both squeeze under it. Settled rails' spend (railSpendTotalUsd —
+  // the whole budget registry, each rail priced by its explicitly configured
+  // USD rate) plus every outstanding hold (reservedUsd(TOTAL_USD_SCOPE)) plus
+  // this amount must fit under the ceiling. Unset → the block is skipped
+  // entirely (zero behaviour change). While active, every hold also carries
+  // the 'total-usd' scope so the next call sees the held amount.
+  const ceiling = dailyTotalCeilingUsd();
+  if (ceiling !== undefined) {
+    const ceilingHeld = reservedUsd(TOTAL_USD_SCOPE);
+    const ceilingSpent = railSpendTotalUsd();
+    if (ceilingSpent + ceilingHeld + amountUsd > ceiling + FLOAT_EPSILON_USD) {
+      return {
+        ok: false,
+        reason:
+          `reserve $${amountUsd} would exceed the cross-chain daily ceiling MAX_DAILY_SPEND_TOTAL_USD $${ceiling} ` +
+          `(total spent $${ceilingSpent.toFixed(4)} + held $${ceilingHeld.toFixed(4)} across rails)`,
+      };
+    }
+    if (!seen.has(TOTAL_USD_SCOPE)) {
+      seen.add(TOTAL_USD_SCOPE);
+      scopes.push(TOTAL_USD_SCOPE);
+    }
+  }
   counter += 1;
   const id = `resv-${Date.now().toString(36)}-${counter.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   active.set(id, { id, amountUsd, scopes });

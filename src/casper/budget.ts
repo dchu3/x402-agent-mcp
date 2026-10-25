@@ -10,6 +10,10 @@ import { loadPolicyConfig } from '../policy/config.js';
 // over this module's own counter (no duplicated accounting), and its USD
 // rate resolves through the registry's ONE rate function (no built-in rate).
 import { registerBudget, resolveRailUsdRate } from '../budget-registry.js';
+// The OPTIONAL cross-chain ceiling (issue #65 req 4): the rail's check reads
+// whether an operator set MAX_DAILY_SPEND_TOTAL_USD (no cycle — reservations
+// reads its accounting through the registry, never through this module).
+import { dailyTotalCeilingUsd } from '../reservations.js';
 
 // Separate from the USD tracker. Debit before signing, not after an untrusted
 // HTTP response. Ambiguous failures retain the debit to prevent retry overspend.
@@ -23,6 +27,14 @@ export class CasperBudget {
     return this.spent;
   }
   check(amount: bigint): void {
+    // Issue #65 (req 4): while the OPTIONAL cross-chain ceiling is active,
+    // an unpriced Casper rail cannot be verified against it — refused
+    // outright with the stable refusal code, ONE stderr line (never a
+    // flood), before any budget or amount check (refusal is refusal).
+    if (dailyTotalCeilingUsd() !== undefined && casperRailUsdRate() === null) {
+      console.error('[x402] Casper rail refused while MAX_DAILY_SPEND_TOTAL_USD is set: no configured rate (RAIL_DISABLED_NO_RATE)');
+      throw new Error('Paid Casper requests disabled while MAX_DAILY_SPEND_TOTAL_USD is set: no rate configured for CSPR (code RAIL_DISABLED_NO_RATE; configure X402_RATE_WCSPR_USD)');
+    }
     const perCall = process.env.CASPER_MAX_PAYMENT_PER_CALL;
     const daily = process.env.CASPER_MAX_DAILY_SPEND;
     if (!perCall?.trim() || !daily?.trim()) throw new Error('Paid Casper requests disabled: configure both Casper budgets');
@@ -81,6 +93,12 @@ function casperTableRate(): number | undefined {
   }
 }
 
+/** The Casper rail's ONE USD rate (env var first, then the asset table): used
+ * by both the budget check's ceiling refusal and the registry adapter. */
+function casperRailUsdRate(): number | null {
+  return resolveRailUsdRate('wCSPR', casperTableRate());
+}
+
 registerBudget({
   id: 'casper',
   unit: 'wCSPR',
@@ -92,7 +110,7 @@ registerBudget({
   // spend, so there are no separate outstanding holds to report.
   reservedToday: () => null,
   persistence: 'memory',
-  usdRate: () => resolveRailUsdRate('wCSPR', casperTableRate()),
+  usdRate: () => casperRailUsdRate(),
 });
 
 /** Test hook: clear the singleton's in-memory spend and its day (fresh state

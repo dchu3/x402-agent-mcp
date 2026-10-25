@@ -284,6 +284,13 @@ export function getDailySpent(chain?: string): number {
     ? dailySpentByChain.get(chain) ?? 0
     : [...dailySpentByChain.entries()].filter(([bucket]) => bucket !== SOLANA_DEVNET_CAIP2).reduce((sum, [, val]) => sum + val, 0);
 }
+
+/** Test hook: zero the in-memory daily spend map (fresh-process simulation
+ * between scenarios — getDailySpent would otherwise rehydrate the same
+ * ledger). Not part of the runtime surface. */
+export function _resetForTests(): void {
+  for (const bucket of [...dailySpentByChain.keys()]) dailySpentByChain.delete(bucket);
+}
 // ---------------------------------------------------------------------------
 // Issue #65: the USD rail registers itself in the budget registry as an
 // ADAPTER over exactly this module's accounting — the same counters rehydrate
