@@ -57,7 +57,10 @@ it('returns ALLOW for a prospective in-policy payment and NEVER touches the paym
   const parsed = JSON.parse(result.content[0].text);
   assert.equal(parsed.decision, 'ALLOW');
   assert.equal(parsed.service, 'analyzer.example');
-  assert.equal(parsed.amount, '0.05');
+  // Issues #65/#67 (C1): amounts print through the exact atomic formatter —
+  // a USD amount renders at its exact 6-decimal width, never a toFixed(2)
+  // rounding that would show a small value as zero.
+  assert.equal(parsed.amount, '0.050000');
   assert.equal(parsed.currency, 'USDC');
   assert.equal(parsed.chain, 'base');
   assert.deepEqual(parsed.reasons, []);
@@ -97,7 +100,17 @@ it('defaults the chain from the directory entry and the amount from the matching
   const analyzer = await handler()({ url: 'https://analyzer.example/score' });
   const parsed = JSON.parse(analyzer.content[0].text);
   assert.equal(parsed.chain, 'base');
-  assert.equal(parsed.amount, '0.05');
+  assert.equal(parsed.amount, '0.050000');
+});
+
+it('prints sub-cent amounts exactly — a small value is never rounded to zero (issues #65/#67, C1)', async () => {
+  payingFetchMock();
+  // The live defect (#67 req 4): a $0.001 check printed "amount": "0.00" via
+  // toFixed(2). Both pins from plan C1: $0.001 non-zero, $0.000001 at 6 dp.
+  const milli = await handler()({ url: 'https://analyzer.example/score', amount: 0.001, chain: 'base', token: 'USDC' });
+  assert.equal(JSON.parse(milli.content[0].text).amount, '0.001000');
+  const micro = await handler()({ url: 'https://analyzer.example/score', amount: 0.000001, chain: 'base', token: 'USDC' });
+  assert.equal(JSON.parse(micro.content[0].text).amount, '0.000001');
 });
 
 it('reflects the operator trust levels: BLOCKED env host is refused, unknown host follows the compat default', async () => {
@@ -322,7 +335,7 @@ it('price anomaly: a Casper inspection stays inert on rule 4.6 (amount 0 by desi
   const parsed = JSON.parse(result.content[0].text);
   assert.equal(parsed.decision, 'ALLOW', 'the mote-denominated leg must not hit the price gate');
   assert.ok(!parsed.reasons.some((r: any) => r.code === 'PRICE_ANOMALY'));
-  assert.equal(parsed.amount, '0.00');
+  assert.equal(parsed.amount, '0.000000');
   assert.equal(payment.calls, 0);
   assert.deepEqual(ledgerLines(), BASELINE_ENTRIES.map((e) => JSON.stringify(e)), 'inspection must not write to the ledger');
 });
@@ -426,4 +439,89 @@ it('endpoint_liveness: require_fresh_402: false leaves inspection ALLOW for an u
   } finally {
     restoreDirectory34();
   }
+});
+
+// ---------------------------------------------------------------------------
+// Issue #67 (plan C6): clearer check output — the verdict beside its reading
+// aid, and the budget headroom (the shared free-tools snapshot) beside it.
+// ---------------------------------------------------------------------------
+
+it('the ALLOW verdict names what passed, and the budget headroom sits beside it (#67, C6)', async () => {
+  const result = await handler()({ url: 'https://analyzer.example/score', amount: 0.05, chain: 'base', token: 'USDC' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.ok(parsed.verdict_summary.startsWith('ALLOW:'), JSON.stringify(parsed.verdict_summary));
+  assert.ok(parsed.verdict_summary.includes('passes the policy rules (0 reasons)'));
+  assert.ok(parsed.verdict_summary.includes('0.050000'));
+  const usd = parsed.budget.rails.find((r: any) => r.rail === 'usd');
+  assert.ok(usd, 'the USD rail’s headroom is part of the verdict context');
+  assert.equal(usd.per_call_cap, '0.500000');
+  assert.equal(usd.daily_cap, '10.000000');
+  assert.equal(usd.spent_today, '0.000000');
+  assert.equal(usd.remaining_today, '10.000000');
+  assert.equal(parsed.budget.ceiling.active, false, 'unset ceiling → inactive, no assumed limits');
+});
+
+it('remaining today is exact after a settled spend — never rounded to zero (#67, C6)', async () => {
+  const { logPayment } = await import('../payment-utils.js') as typeof import('../payment-utils.js');
+  logPayment({ timestamp: new Date().toISOString(), url: 'https://analyzer.example/score', method: 'GET', chain: 'base', amount_usdc: 8, status: 'success' });
+  const result = await handler()({ url: 'https://analyzer.example/score', amount: 0.05, chain: 'base', token: 'USDC' });
+  const parsed = JSON.parse(result.content[0].text);
+  const usd = parsed.budget.rails.find((r: any) => r.rail === 'usd');
+  assert.equal(usd.spent_today, '8.000000');
+  assert.equal(usd.remaining_today, '2.000000');
+});
+
+it('the DENY verdict lists its reason codes in the reading aid (#67, C6)', async () => {
+  const result = await handler()({ url: 'https://analyzer.example/score', amount: 5, chain: 'base', token: 'USDC' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.decision, 'DENY');
+  assert.ok(parsed.verdict_summary.startsWith('DENY:'), JSON.stringify(parsed.verdict_summary));
+  assert.ok(parsed.verdict_summary.includes('REQUEST_LIMIT_EXCEEDED'));
+});
+
+// ---------------------------------------------------------------------------
+// Issue #67 (req 1/5, plan REFRESH line 84, FIX 3): never invent a chain.
+// Precedence: args.chain → args.network (exact CAIP-2 mapped through the
+// existing vocabulary/asset tables) → directory entry → 'base' assumed for
+// the POLICY evaluation only — and output always names its source, so an
+// assumption is visible instead of silent.
+// ---------------------------------------------------------------------------
+
+const SOLANA_DEVNET_CAIP2_TEST = 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1'; // @x402/svm's exact devnet id, imported verbatim below
+
+it('a bare network id names the chain: the devnet Solana seller is chain "solana", source "network"', async () => {
+  const result = await handler()({ url: 'https://devnetseller.example/api', network: SOLANA_DEVNET_CAIP2_TEST, amount: 0.05 });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.chain, 'solana', `a devnet solana seller must never read "base" again, got: ${parsed.chain}`);
+  assert.equal(parsed.chain_source, 'network');
+  assert.equal(parsed.network, SOLANA_DEVNET_CAIP2_TEST);
+});
+
+it('an explicit chain argument wins over everything, source "argument"', async () => {
+  const result = await handler()({ url: 'https://analyzer.example/score', chain: 'polygon', network: SOLANA_DEVNET_CAIP2_TEST, amount: 0.05 });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.chain, 'polygon');
+  assert.equal(parsed.chain_source, 'argument');
+});
+
+it('a directory-listed host names the chain when nothing else did, source "directory"', async () => {
+  const result = await handler()({ url: 'https://analyzer.example/score', amount: 0.05 });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.chain, 'base');
+  assert.equal(parsed.chain_source, 'directory');
+});
+
+it('nothing named → chain "base" for the policy evaluation only, with the assumption VISIBLE', async () => {
+  const result = await handler()({ url: 'https://no-truth-here.example/api', amount: 0.05 });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.chain, 'base');
+  assert.equal(parsed.chain_source, 'assumed_default');
+});
+
+it('a network id that maps OUTSIDE the project chain set does not claim a chain (falls through, visible)', async () => {
+  const result = await handler()({ url: 'https://no-truth-here.example/api', network: 'eip155:999777', amount: 0.05 });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.chain, 'base');
+  assert.equal(parsed.chain_source, 'assumed_default', 'an unmapped network never invents a project chain');
+  assert.equal(parsed.network, 'eip155:999777');
 });

@@ -23,7 +23,10 @@
 // Caps come from MAX_DAILY_SPEND / MAX_PAYMENT_PER_CALL read LIVE per call
 // (never cached at module load), exactly like checkSpendingLimit.
 
-import { getDailySpent, getDevnetDailySpent, getMaxDailySpend, getMaxPerCall } from "./payment-utils.js";
+import { getDailySpent, getDevnetDailySpent, getMaxDailySpend, getMaxPerCall, readCapUsd } from "./payment-utils.js";
+// Issue #65 (req 1): the ceiling reads every registered rail's spend through
+// the budget registry — ONE accounting read for the whole cross-chain total.
+import { getBudgets, railSpendUsd, RAIL_DISABLED_NO_RATE, type BudgetRail } from "./budget-registry.js";
 
 export interface ReservationInput {
   amountUsd: number;
@@ -94,6 +97,31 @@ export function reserveSpend(input: ReservationInput): ReservationResult {
         `(spent $${spent.toFixed(4)} + reserved $${reservedGlobal.toFixed(4)} today)`,
     };
   }
+  // Issue #65 (req 4/5): the OPTIONAL cross-chain ceiling, evaluated in the
+  // SAME synchronous check+insert as the daily cap so two parallel calls
+  // cannot both squeeze under it. Settled rails' spend (railSpendTotalUsd —
+  // the whole budget registry, each rail priced by its explicitly configured
+  // USD rate) plus every outstanding hold (reservedUsd(TOTAL_USD_SCOPE)) plus
+  // this amount must fit under the ceiling. Unset → the block is skipped
+  // entirely (zero behaviour change). While active, every hold also carries
+  // the 'total-usd' scope so the next call sees the held amount.
+  const ceiling = dailyTotalCeilingUsd();
+  if (ceiling !== undefined) {
+    const ceilingHeld = reservedUsd(TOTAL_USD_SCOPE);
+    const ceilingSpent = railSpendTotalUsd();
+    if (ceilingSpent + ceilingHeld + amountUsd > ceiling + FLOAT_EPSILON_USD) {
+      return {
+        ok: false,
+        reason:
+          `reserve $${amountUsd} would exceed the cross-chain daily ceiling MAX_DAILY_SPEND_TOTAL_USD $${ceiling} ` +
+          `(total spent $${ceilingSpent.toFixed(4)} + held $${ceilingHeld.toFixed(4)} across rails)`,
+      };
+    }
+    if (!seen.has(TOTAL_USD_SCOPE)) {
+      seen.add(TOTAL_USD_SCOPE);
+      scopes.push(TOTAL_USD_SCOPE);
+    }
+  }
   counter += 1;
   const id = `resv-${Date.now().toString(36)}-${counter.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   active.set(id, { id, amountUsd, scopes });
@@ -121,6 +149,91 @@ export function reservedUsd(scope: string): number {
     if (r.scopes.includes(scope)) total += r.amountUsd;
   }
   return total;
+}
+
+// ---------------------------------------------------------------------------
+// Issue #65 (req 4) — the OPTIONAL cross-chain ceiling.
+//
+// MAX_DAILY_SPEND_TOTAL_USD is an operator-configured daily total across
+// every registered rail, converted through each rail's explicitly configured
+// USD rate (there is NO built-in rate and NO default ceiling: unset = today's
+// behaviour, byte-identical). The state/verdict helpers below are the ONE
+// accounting path for the ceiling — the reservation registry evaluates it in
+// the same synchronous check+insert as the daily scope (issue #65 req 5), and
+// any rail without a configured rate is DISABLED while a ceiling is set
+// (RAIL_DISABLED_NO_RATE). The state helpers are read-only; the registry's
+// rails expose their own spend.
+// ---------------------------------------------------------------------------
+
+/** The environment variable of the cross-chain ceiling (no default). */
+export const CEILING_VAR = "MAX_DAILY_SPEND_TOTAL_USD";
+
+/** The reservation scope EVERY hold carries while a ceiling is active so
+ * concurrent calls cannot overshoot the total (one extra scope, same
+ * check+insert as the daily scope — issue #65 req 5). */
+export const TOTAL_USD_SCOPE = "total-usd";
+
+/** The configured ceiling in USD as a number, or undefined when unset (the
+ * opt-in boundary: unset behaviour is byte-identical to pre-#65). A present
+ * value parses with readCapUsd's fail-closed discipline: a garbage value
+ * reads 0 — every reservation is then refused until the operator fixes the
+ * env, never widened. */
+export function dailyTotalCeilingUsd(): number | undefined {
+  if (process.env[CEILING_VAR] === undefined) return undefined;
+  return readCapUsd(CEILING_VAR, 0);
+}
+
+/** Today's cross-rail spend in USD: every registered rail's spend converted
+ * by its configured rate (railSpendUsd — native USD for the USD rail, exact
+ * atomic × rate for priced rails; an unpriced rail contributes nothing and
+ * is disabled while a ceiling is active, so nothing can accrue there). */
+export function railSpendTotalUsd(): number {
+  let total = 0;
+  for (const rail of getBudgets()) {
+    const value = railSpendUsd(rail);
+    if (value !== null) total += value;
+  }
+  return total;
+}
+
+/** The ceiling's snapshot for the free visibility tools (x402_status and
+ * x402_check_payment): the stable code set, the totals and which rails the
+ * ceiling disables. Read-only — no reserves, no writes.
+ *
+ * A rail is DISABLED while a ceiling is active whenever the ceiling cannot
+ * price it with certainty: no configured rate, or a configured rate whose
+ * spend conversion is outside the USD conversion domain (e.g. a >18-decimal
+ * unit) — an unpriceable spend could hide under the total, so such a rail is
+ * refused outright (RAIL_DISABLED_NO_RATE is the one stable refusal code). */
+export interface CeilingState {
+  active: boolean;
+  max_usd?: number;
+  spent_total_usd?: number;
+  reserved_total_usd?: number;
+  disabled_rails?: Array<{ rail: string; unit: string; code: typeof RAIL_DISABLED_NO_RATE }>;
+}
+
+/** True when the ceiling cannot price this rail's spend (so the rail must be
+ * refused while a ceiling is active). Priced rails with a native USD spend or
+ * a convertible atomic spend price fine; a configured rate with an
+ * unconvertible spend does not count as pricing. */
+function ceilingCannotPrice(rail: BudgetRail): boolean {
+  if (rail.usdRate() === null) return true;
+  return railSpendUsd(rail) === null;
+}
+
+export function ceilingState(): CeilingState {
+  const maxUsd = dailyTotalCeilingUsd();
+  if (maxUsd === undefined) return { active: false };
+  return {
+    active: true,
+    max_usd: maxUsd,
+    spent_total_usd: railSpendTotalUsd(),
+    reserved_total_usd: reservedUsd(TOTAL_USD_SCOPE),
+    disabled_rails: getBudgets()
+      .filter(ceilingCannotPrice)
+      .map((rail) => ({ rail: rail.id, unit: rail.unit, code: RAIL_DISABLED_NO_RATE })),
+  };
 }
 
 /** Test hook: clear every hold (fresh state between scenarios). Not part of

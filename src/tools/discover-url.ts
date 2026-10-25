@@ -190,7 +190,7 @@ function serviceInfoFromOpenApi(spec: any): any | null {
 export function registerDiscoverUrlTool(server: McpServer): void {
   server.tool(
     "x402_discover_url",
-    "Discover any x402 service by URL. Fetches /.well-known/x402 (payment details), /.well-known/ai-catalog.json (capabilities), and /llms.txt (agent summary). Returns a unified discovery object with chains, wallet, endpoints, and prices.",
+    "Discover any x402 service by URL. Fetches /.well-known/x402 (payment details), /.well-known/ai-catalog.json (capabilities), and /llms.txt (agent summary). Returns a unified discovery object with chains, wallet, endpoints, and prices. Discovery only records what a service advertises; discovering a host never makes it payable — the allowlist and the payment policy still decide every paid leg, and this tool never pays.",
     {
       url: z.string().describe("Base URL of the service to discover (e.g. https://svm402.com)"),
     },

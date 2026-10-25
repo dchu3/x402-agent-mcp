@@ -23,9 +23,20 @@ import { normalizeRecipient } from "../policy/recipient.js";
 import { getDailySpent } from "../payment-utils.js";
 import { getPerServiceSpent } from "../policy/budget-store.js";
 import { getAnomalyInputs } from "../policy/anomaly-store.js";
+// FIX 3 — issue #67 (req 1/5): the EXISTING CAIP-2 → chain-name vocabulary
+// (no second table) — the check maps an exact network id to the chain name.
+import { parseChainFromNetwork } from "./probe-utils.js";
 // Issue #59/#62 (C9 visibility): the run's explicit mode + the asset table.
 import { modeAllowsNetwork, resolveNetworkMode } from "../networks.js";
 import { assetTableSummary } from "../assets.js";
+// Issue #65/#67 (plan C1): amounts print through the exact atomic formatter —
+// a small value is never rounded to zero (a $0.001 check printed "0.00"
+// through toFixed(2)). Issue #67 (plan C6): the check output additionally
+// carries the budget headroom (the shared free-tools snapshot) and a plain
+// verdict_summary so an agent can parse the outcome without re-reading the
+// reasons array.
+import { exactUsdString } from "./accounting.js";
+import { budgetSnapshotOutput } from "./status.js";
 
 /** Directory entry for a hostname, or null. Case-insensitive hostname match —
  * the same rule resolveTrustLevel uses for DISCOVERED classification. */
@@ -42,6 +53,23 @@ function findDirectoryEntry(host: string) {
   } catch {
     return undefined; // directory unavailable — the trust derivation already treats this as UNKNOWN
   }
+}
+
+/** #67 (plan C6): a plain-language one-liner beside the machine verdict —
+ * the reason codes stay the contract, this is only the reading aid. */
+function verdictSummary(decision: string, amountUsd: number, token: string, service: string, chain: string, reasons: Array<{ code: string }>): string {
+  const amount = exactUsdString(amountUsd, 6);
+  const codes = reasons.map((r) => r.code);
+  if (decision === "ALLOW" && codes.length === 0) {
+    return `ALLOW: a ${amount} ${token} payment for ${service} on ${chain} passes the policy rules (0 reasons).`;
+  }
+  if (decision === "ALLOW") {
+    return `ALLOW (with warnings): a ${amount} ${token} payment for ${service} on ${chain} would proceed, with ${codes.length} warning(s): ${codes.join(', ')}.`;
+  }
+  if (decision === "APPROVAL_REQUIRED") {
+    return `APPROVAL_REQUIRED: a ${amount} ${token} payment for ${service} on ${chain} needs approval first — ${codes.length} reason(s): ${codes.join(', ')}.`;
+  }
+  return `DENY: a ${amount} ${token} payment for ${service} on ${chain} was refused by ${codes.length} reason(s): ${codes.join(', ')}.`;
 }
 
 export function registerCheckPaymentTool(server: McpServer): void {
@@ -65,7 +93,35 @@ export function registerCheckPaymentTool(server: McpServer): void {
       }
 
       const entry = findDirectoryEntry(host);
-      const chain = (args.chain || (entry && entry.chain && entry.chain !== "unknown" ? entry.chain : "") || "base").toLowerCase();
+      // Issue #67 (req 1/5, FIX 3): NEVER invent a chain. Precedence:
+      //   args.chain → args.network (the exact CAIP-2 mapped to the project
+      //   chain name through the EXISTING vocabulary — parseChainFromNetwork,
+      //   the same mapper every probe surface shares; no second table) →
+      //   directory entry → 'base' as the last resort for the POLICY
+      //   evaluation only. The output names its source, so an assumption is
+      //   visible instead of silent: a devnet Solana seller is never again
+      //   reported as "base" when the caller passed the exact network id.
+      // A CAIP-2 that maps OUTSIDE the project's chain set (an unmapped id)
+      // never claims a chain — it falls through, and the network itself stays
+      // echoed verbatim with its mode-match result.
+      const PROJECT_CHAINS = new Set(["base", "polygon", "arbitrum", "solana", "casper"]);
+      const directoryChain = entry && entry.chain && entry.chain !== "unknown" && PROJECT_CHAINS.has(entry.chain.toLowerCase()) ? entry.chain.toLowerCase() : "";
+      const networkChain = args.network !== undefined ? parseChainFromNetwork(args.network) : "";
+      let chain: string;
+      let chainSource: "argument" | "network" | "directory" | "assumed_default";
+      if (args.chain !== undefined) {
+        chain = args.chain.toLowerCase();
+        chainSource = "argument";
+      } else if (PROJECT_CHAINS.has(networkChain)) {
+        chain = networkChain;
+        chainSource = "network";
+      } else if (directoryChain !== "") {
+        chain = directoryChain;
+        chainSource = "directory";
+      } else {
+        chain = "base";
+        chainSource = "assumed_default";
+      }
       // Token passes through verbatim: the engine's allowlist match is exact
       // and the default list contains mixed-case entries ("wCSPR"). Case
       // normalization here would turn a valid wCSPR check into a false
@@ -109,9 +165,13 @@ export function registerCheckPaymentTool(server: McpServer): void {
       const output = {
         decision: result.decision,
         service: ctx.service,
-        amount: amountUsd.toFixed(2),
+        amount: exactUsdString(amountUsd, 6),
         currency: token,
         chain,
+        // Issue #67 (req 1/5, FIX 3): the chain's PROVENANCE — an agent can
+        // see whether the chain was named (argument/network), derived from
+        // the directory, or assumed ('base' for the policy evaluation only).
+        chain_source: chainSource,
         // Issue #59 (C9 visibility): the run's EXPLICIT network mode — when it
         // is unset over a loaded key the paid tool refuses, so this tool
         // surfaces the same condition with the stable code's message.
@@ -140,6 +200,13 @@ export function registerCheckPaymentTool(server: McpServer): void {
         // Reasons carry their optional detail payload (issue #30) verbatim.
         reasons: result.reasons.map((r) => ({ code: r.code, message: r.message, ...(r.detail !== undefined ? { detail: r.detail } : {}) })),
         limits: result.limits,
+        // Issue #67 (plan C6): a plain-language reading aid next to the
+        // machine verdict (reasons stay the contract — codes verbatim).
+        verdict_summary: verdictSummary(result.decision, amountUsd, token, ctx.service, chain, result.reasons),
+        // Issue #65/#67 (plan C6): the budget headroom beside the verdict —
+        // the shared free-tools snapshot (caps, spent, remaining, the
+        // optional cross-chain ceiling). Read-only, exact strings.
+        budget: budgetSnapshotOutput(),
         note: "Inspection only — no payment was attempted. Resolve DENY reasons before calling x402_fetch.",
       };
 

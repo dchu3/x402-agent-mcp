@@ -5,6 +5,14 @@ import { SOLANA_DEVNET_CAIP2 } from "@x402/svm";
 // Issue #54 (req 3): the ledger path resolver shared by every ledger
 // reader/writer (see the capture comment below).
 import { prepareLedgerDir, resolveLedger } from "./ledger-path.js";
+// Issue #65: the USD rail registers as an ADAPTER over THIS module's own
+// accounting (no duplicated counters) — the registry itself owns nothing.
+// The adapter's reservedUsd import is cycle-safe: reservations.ts depends on
+// payment-utils, and both modules export hoisted function declarations only,
+// so the closures run long after both module bodies have evaluated.
+import { atomicStringFromUsdString, exactUsdString } from "./tools/accounting.js";
+import { registerBudget, resolveRailUsdRate } from "./budget-registry.js";
+import { reservedUsd } from "./reservations.js";
 
 export interface PaymentLogEntry {
   timestamp: string;
@@ -140,8 +148,9 @@ function resetDailyIfNewDay(): void {
  * logs one stderr line and reads as 0, denying all payments until the env is
  * fixed. Absent vars keep the documented fallbacks (zero behavior change for
  * ordinary operators). The policy layer's own defaults (policy/config.ts
- * legacyNumber) already fail closed on their side. */
-function readCapUsd(name: string, fallback: number): number {
+ * legacyNumber) already fail closed on their side. The budget registry's #65
+ * ceiling reader reuses this exact discipline, so it is exported. */
+export function readCapUsd(name: string, fallback: number): number {
   const raw = process.env[name];
   if (raw === undefined) return fallback;
   if (!/^\d+(\.\d+)?$/.test(raw)) {
@@ -186,6 +195,13 @@ function capUsdExactString(name: string, fallback: string): string {
  * operator wrote a plain decimal — never a float round trip). */
 export function getMaxPerCallExactUsdString(): string {
   return capUsdExactString("MAX_PAYMENT_PER_CALL", "0.50");
+}
+
+/** The daily cap as its exact configured decimal string ("10.00" unless the
+ * operator wrote a plain decimal) — the budget registry #65 adapter reads it
+ * for the USD rail's daily-cap listing. */
+export function getMaxDailySpendExactUsdString(): string {
+  return capUsdExactString("MAX_DAILY_SPEND", "10.00");
 }
 
 /** The per-call cap as an exact integer atomic value for an asset's decimals:
@@ -268,3 +284,59 @@ export function getDailySpent(chain?: string): number {
     ? dailySpentByChain.get(chain) ?? 0
     : [...dailySpentByChain.entries()].filter(([bucket]) => bucket !== SOLANA_DEVNET_CAIP2).reduce((sum, [, val]) => sum + val, 0);
 }
+
+/** Test hook: zero the in-memory daily spend map (fresh-process simulation
+ * between scenarios — getDailySpent would otherwise rehydrate the same
+ * ledger). Not part of the runtime surface. */
+export function _resetForTests(): void {
+  for (const bucket of [...dailySpentByChain.keys()]) dailySpentByChain.delete(bucket);
+}
+// ---------------------------------------------------------------------------
+// Issue #65: the USD rail registers itself in the budget registry as an
+// ADAPTER over exactly this module's accounting — the same counters rehydrate
+// from the ledger, the same caps fail closed; the registry duplicates nothing.
+// The adapter reads every value LIVE per call (no env caching), and its USD
+// rate is the pegged asset's 1 unless the operator configures
+// X402_RATE_USDC_USD — there is no built-in override beyond the peg.
+// ---------------------------------------------------------------------------
+
+/** The USD rail's whole-map spend today: every settle bucket the ledger
+ * tracks (mainnet chains AND the devnet bucket — the cross-chain ceiling is
+ * an operator-set total across rails, so it must see every bucket; the
+ * per-chain daily caps keep their own bucket rules unchanged). */
+function usdRailSpentToday(): number {
+  return getDailySpent() + getDevnetDailySpent();
+}
+
+/** Exact integer atomic digit string from a USD float at 6 decimals — ONE
+ * toFixed rounding at the display boundary (never a float multiply), then
+ * integer string math (atomicStringFromUsdString). Display/registry use
+ * only: the caps and the ceiling compare the float the accounting module
+ * always compared. */
+function atomicFromUsdNumber(usd: number, decimals: number): string {
+  return atomicStringFromUsdString(exactUsdString(usd, decimals), decimals);
+}
+
+registerBudget({
+  id: "usd",
+  unit: "USDC",
+  decimals: 6,
+  perCallCap: () => ({ atomic: atomicStringFromUsdString(getMaxPerCallExactUsdString(), 6), decimals: 6 }),
+  dailyCap: () => ({ atomic: atomicStringFromUsdString(getMaxDailySpendExactUsdString(), 6), decimals: 6 }),
+  spentToday: () => ({ atomic: atomicFromUsdNumber(usdRailSpentToday(), 6), decimals: 6 }),
+  spentUsdToday: () => usdRailSpentToday(),
+  reservedToday: () => {
+    // The USD rail's outstanding holds: the mainnet global scope plus the
+    // devnet bucket's own scope (each hold is listed in one of them).
+    const mainnet = reservedUsd("global");
+    const devnet = reservedUsd(`net:${SOLANA_DEVNET_CAIP2}`);
+    const total = mainnet + devnet;
+    if (total <= 0) return null;
+    return { atomic: atomicFromUsdNumber(total, 6), decimals: 6 };
+  },
+  persistence: "ledger-rehydrated",
+  // The effective ledger location (issue #65 req 2): the same resolution the
+  // counters rehydrate from, captured once at module load.
+  ledgerPath: LOG_PATH,
+  usdRate: () => resolveRailUsdRate("USDC", 1), // pegged: the table's price IS the peg
+});

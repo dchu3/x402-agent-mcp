@@ -14,7 +14,7 @@ interface BatchResult {
 export function registerBatchDiscoverTool(server: McpServer): void {
   server.tool(
     "x402_discover_urls",
-    "Batch discover multiple x402 services in parallel. Provide a list of URLs, each is probed for /.well-known/x402 and ai-catalog.json. Returns a summary array.",
+    "Batch discover multiple x402 services in parallel. Provide a list of URLs, each is probed for /.well-known/x402 and ai-catalog.json. Returns a summary array. Discovery only records what a service advertises; discovering a host never makes it payable — the allowlist and the payment policy still decide every paid leg, and this tool never pays.",
     {
       urls: z.array(z.string()).describe("Array of base URLs to discover (e.g. [\"https://svm402.com\", \"https://2s.io\"])"),
     },

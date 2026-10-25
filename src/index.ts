@@ -10,6 +10,12 @@ import { registerBatchDiscoverTool } from "./tools/batch-discover.js";
 import { registerCrawlX402ScanTool } from "./tools/crawl-directory.js";
 import { registerCheckPaymentTool } from "./tools/check-payment.js";
 import { registerProbeAllowlistTool } from "./tools/probe-allowlist.js";
+// Issue #65 (req 2): the free budget listing — every registered rail's caps,
+// spend and persistence, plus the optional cross-chain ceiling state.
+import { registerStatusTool } from "./tools/status.js";
+// Issue #67 (#67's free inspector): run the paid flow's exact selection
+// wiring over a supplied offer and report every verdict — never pays.
+import { registerInspectTool } from "./tools/inspector.js";
 // Issue #59 (req 8 — C9 visibility): the run's EXPLICIT network mode + the
 // mode's Solana RPC host render at startup (the RPC HOST only — never a full
 // URL, one can carry credentials; a non-URL value must never crash startup).
@@ -32,6 +38,8 @@ registerBatchDiscoverTool(server);
 registerCrawlX402ScanTool(server);
 registerCheckPaymentTool(server);
 registerProbeAllowlistTool(server);
+registerStatusTool(server);
+registerInspectTool(server);
 registerFetchTool(server);
 
 // Start server

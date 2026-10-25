@@ -15,7 +15,7 @@ Agent: "I need news data"
 
 The agent never sees wallets, private keys, or x402 protocol details. Just search, discover, fetch.
 
-## Tools (10)
+## Tools (12)
 
 | Tool | Cost | Description |
 |------|------|-------------|
@@ -27,7 +27,9 @@ The agent never sees wallets, private keys, or x402 protocol details. Just searc
 | `x402_health` | Free | Check if a service is live and responding with 402 |
 | `x402_discover_urls` | Free | Batch discover multiple x402 services in parallel |
 | `x402_crawl_directory` | Free | Crawl x402scan.com to discover new x402 services and auto-add to directory |
-| `x402_check_payment` | Free | Evaluate a prospective payment against policy — ALLOW / DENY / APPROVAL_REQUIRED with reason codes; shows the run's network mode, the mode match for an exact network id (issue #59) and the asset-table summary (issue #62). **Never pays.** |
+| `x402_inspect` | Free | Inspect a 402 challenge (or a single offer) WITHOUT paying — the same deterministic selection the paid flow uses (asset table, policy gate, network mode): every offer's exact amounts and rejection tokens, the chosen leg's budget verdict, the Casper mote-rail verdict. **Never pays, never fetches.** (issue #67) |
+| `x402_status` | Free | List every registered budget rail — unit, per-call cap, daily cap, spent/remaining today (exact decimal strings, never rounded), outstanding holds, persistence, effective ledger path, configured USD rate — plus the optional cross-chain ceiling. **Never signs, writes or fetches.** (issue #65) |
+| `x402_check_payment` | Free | Evaluate a prospective payment against policy — ALLOW / DENY / APPROVAL_REQUIRED with reason codes and a plain-language `verdict_summary`; shows the run's network mode, the mode match for an exact network id (issue #59), the asset-table summary (issue #62) and the budget headroom (issue #65/#67). **Never pays.** |
 | `x402_fetch` | Endpoint price | Fetch any x402 endpoint — handles 402 payment on Base, Polygon, Arbitrum, Solana or Casper |
 
 ## Multi-Chain Support
@@ -110,7 +112,7 @@ Casper endpoints advertise CAIP-2 networks `casper:casper` (mainnet) and `casper
 | `CASPER_MAX_PAYMENT_PER_CALL` | disabled | Maximum per authorization in decimal wCSPR (e.g. `1.5`) |
 | `CASPER_MAX_DAILY_SPEND` | disabled | Daily authorization budget in decimal wCSPR (e.g. `10`) |
 
-Both budgets must be explicitly set and positive. No USD conversion is performed. Only the network-specific wCSPR package hashes from [Casper Wallet Core](https://github.com/make-software/casper-wallet-core/blob/master/src/domain/constants/casperNetwork.ts) are accepted. `scheme: "exact"` and x402 v2 are required. Forced-chain calls still probe payment requirements, and the SDK checks the actual requirements again before signing. Settlement is performed by the endpoint's facilitator; this client does not configure a separate facilitator.
+Both budgets must be explicitly set and positive. **Issue #65:** the mote budgets remain the ONLY spend binding for the Casper leg. The leg can now carry an EXPLICITLY CONFIGURED USD rate — `X402_RATE_WCSPR_USD`, or a priced wCSPR entry via `assets.extensions` — used ONLY for visibility (`x402_status` / `x402_inspect` listings) and for the optional cross-chain ceiling `MAX_DAILY_SPEND_TOTAL_USD`; it never converts the mote caps or replaces them, and an unpriced Casper rail is refused outright while a ceiling is active (`RAIL_DISABLED_NO_RATE`). Only the network-specific wCSPR package hashes from [Casper Wallet Core](https://github.com/make-software/casper-wallet-core/blob/master/src/domain/constants/casperNetwork.ts) are accepted. `scheme: "exact"` and x402 v2 are required. Forced-chain calls still probe payment requirements, and the SDK checks the actual requirements again before signing. Settlement is performed by the endpoint's facilitator; this client does not configure a separate facilitator.
 
 ```
 x402_fetch({ url: "https://some-casper-endpoint.example/api", chain: "casper" })
@@ -152,6 +154,9 @@ Check the payment ledger for an entry with `currency: "wCSPR"` and an exact `amo
 |---------|---------|-------------|
 | `MAX_PAYMENT_PER_CALL` | 0.50 | Reject any single call above this amount (USDC). Fail-closed: a value that does not parse as a plain non-negative decimal reads as 0 and disables payments |
 | `MAX_DAILY_SPEND` | 10.00 | Reject after cumulative daily spend exceeded (USDC). Fail-closed on malformed values like the per-call cap |
+| `MAX_DAILY_SPEND_TOTAL_USD` | unset | Issue #65: OPTIONAL cross-chain ceiling — a daily total across EVERY budget rail (the USD rail's ledger buckets, a Casper rail priced by its explicitly configured rate). Unset = today's behaviour exactly; there is no default. Fail-closed like the other caps (garbage reads 0 and refuses everything). While active, a rail with no usable USD rate is refused outright (`RAIL_DISABLED_NO_RATE`) instead of being assumed to fit |
+| `X402_RATE_USDC_USD` | unset | Issue #65: the USD rail's USD rate for the cross-chain total — usually unset (the USD rail prices natively; the peg is 1). Setting it OVERRIDES the peg (positive finite number; garbage fails the rate closed with one stderr line) |
+| `X402_RATE_WCSPR_USD` | unset | Issue #65: the Casper rail's USD rate (per whole CSPR) — REQUIRED for Casper spend to count toward `MAX_DAILY_SPEND_TOTAL_USD`; unset means the rail is unpriced and, while a ceiling is active, disabled. Operator-priced table entries (`assets.extensions` on wCSPR) also price the rail — the env var wins if both exist |
 | `PAYMENT_LOG_PATH` | `<state dir>/x402-payments.jsonl` | Explicit ledger path — wins outright; when unset the state-dir ledger is used and a legacy working-directory ledger is counted read-only |
 | `X402_STATE_DIR` | `~/.x402-agent-mcp` | Per-user state directory holding the spend ledger (`x402-payments.jsonl`) when `PAYMENT_LOG_PATH` is unset |
 | `X402_DIRECTORY_PATH` | ./endpoints.json | Path to the endpoint directory file (gitignored); set to isolate tests/sandboxes from the live directory |

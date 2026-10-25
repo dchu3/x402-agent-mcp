@@ -140,7 +140,7 @@ export interface ProbeAllowlistSummaryRow {
 export function registerProbeAllowlistTool(server: McpServer): void {
   server.tool(
     "x402_probe_allowlist",
-    "Refresh the liveness probes for the pinned endpoint set (issue #34): the directory's seed rows when liveness.allowlist is omitted, else the allowlisted origins. Never pays, never follows redirects, never sends credentials; each result is recorded atomically on its directory entry and drives x402_search ranking and the ENDPOINT_NOT_LIVE payment gate. Run it on your own schedule (cron) — x402_search itself never probes.",
+    "Refresh the liveness probes for the pinned endpoint set (issue #34): the directory's seed rows when liveness.allowlist is omitted, else the allowlisted origins. Never pays, never follows redirects, never sends credentials; each result is recorded atomically on its directory entry and drives x402_search ranking and the ENDPOINT_NOT_LIVE payment gate. Run it on your own schedule (cron) — x402_search itself never probes. Probing only records what a service advertises; probing a host never makes it payable — the allowlist and the payment policy still decide every paid leg, and this tool never pays.",
     {},
     async () => {
       const { config, configErrors } = loadPolicyConfig();

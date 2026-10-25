@@ -46,6 +46,9 @@ import { checkExtraHeaders } from "../transport/headers.js";
 import { untrustedText, stripUntrusted, PROBE_UNTRUSTED_MAX, CHALLENGE_UNTRUSTED_MAX } from "../transport/untrusted.js";
 import { usdFromAtomic, sellerReportedCostUsd, parseBoundedBody } from "./accounting.js";
 import { createFromOffer, intentManager } from "../payment-intent/manager.js";
+// Issue #67: the offer-evaluation wiring — one wiring shared with the free
+// x402_inspect tool (src/tools/inspector.ts) so selection never drifts.
+import { seamUsdOf, seamPolicyFor } from "./offer-evaluation.js";
 import { executeGuarded } from "../payment-intent/executor.js";
 // Issue #62: the per-network asset table — the offer's asset id resolves to a
 // real symbol + decimals + USD price (exact integer conversion via
@@ -485,36 +488,13 @@ export function registerFetchTool(server: McpServer): void {
                 // Issue #62: the table decides, not the SDK's implicitly
                 // allowed default-asset universe (spend controls at Step 3
                 // enforce an OUTER bound now; the table is the source of
-                // truth).
-                usdOf: (assetId, networkCaip2, atomicAmount) => {
-                  const priced = priceAtomicAsUsd(networkCaip2, assetId, atomicAmount, assetExtensions);
-                  if (priced.ok === true) return priced;
-                  return priced.code === "ASSET_NOT_LISTED"
-                    ? { ok: false, code: "asset_not_listed" }
-                    : { ok: false, code: "asset_no_usd_rate" };
-                },
-                policyFor: (c) => {
-                  // Issue #62: the policy gate reads the TABLE's real symbol
-                  // (tokens.allowed means what the table says), priced USD.
-                  // Issue #59 (D7): each CANDIDATE is evaluated against its
-                  // OWN spend bucket — a devnet candidate reads the devnet
-                  // daily total and its devnet-prefixed reservations, every
-                  // other candidate the mainnet totals — the same bucket rule
-                  // Step 3.5 enforces for the chosen offer below, so the
-                  // selection verdict and the Step 3.5 verdict agree for the
-                  // same offer (getDailySpent(undefined) reads the mainnet
-                  // whole-map total, which excludes the devnet bucket).
-                  const candidateBucket = spendBucketForNetwork(c.network);
-                  const candidateServiceScope = candidateBucket
-                    ? `net:${candidateBucket}:service:${serviceHost}`
-                    : `service:${serviceHost}`;
-                  const evaluation = getPolicyEngine().evaluate(
-                    buildPolicyContext(url, c.chain, c.symbol, c.usd, { recipient: c.payTo }),
-                    { dailySpentUsd: getDailySpent(spendBucketForNetwork(c.network)), perServiceSpentUsd: getPerServiceSpent(serviceHost) + reservedUsd(candidateServiceScope) },
-                    getAnomalyInputs(url),
-                  );
-                  return evaluation.decision === "ALLOW" ? "ALLOW" : "REFUSE";
-                },
+                // truth). Issue #67: these two factories are the SHARED
+                // wiring — src/tools/offer-evaluation.ts — so the free
+                // inspector evaluates offers through the exact same table
+                // pricer and the exact same per-candidate policy gate; the
+                // flow below just binds its own url/service-host.
+                usdOf: seamUsdOf(policyState.config.assets.extensions),
+                policyFor: seamPolicyFor(url, serviceHost),
                 chainOrder: DEFAULT_CHAIN_ORDER,
               });
               offerRefusals = selection.rejected;
@@ -860,8 +840,19 @@ export function registerFetchTool(server: McpServer): void {
         let registeredNetwork = "";
 
         if (useChain === "solana") {
-          const secretKeyBytes = bs58.decode(solanaKey!);
-          const keypairSigner = await createKeyPairSignerFromBytes(secretKeyBytes);
+          // Issue #67 (req 6): fixed key-format refusals. The decode and the
+          // keypair construction are wrapped: a refusal carries EXACTLY ONE
+          // fixed message — no fragment of the key value (the raw decoder or
+          // construction error could carry the malformed value itself, and
+          // it would reach the same catch's console.error and failed ledger
+          // row). One stderr line renders the fixed text only.
+          let keypairSigner: Awaited<ReturnType<typeof createKeyPairSignerFromBytes>>;
+          try {
+            keypairSigner = await createKeyPairSignerFromBytes(bs58.decode(solanaKey!));
+          } catch (keyErr) {
+            console.error(`[x402_fetch] CONFIG_INVALID: SOLANA key must be a base58 string (not a JSON array) — the key value is never echoed anywhere`);
+            throw new Error("SOLANA key must be a base58 string (not a JSON array)");
+          }
           const svmSigner = toClientSvmSigner(keypairSigner);
           const scheme = new ExactSvmScheme(svmSigner, { rpcUrl: solanaRpc });
           payerAddress = keypairSigner.address;
@@ -873,7 +864,14 @@ export function registerFetchTool(server: McpServer): void {
           client.register(registeredNetwork as `${string}:${string}`, scheme);
 
         } else {
-          const account = privateKeyToAccount(evmKey! as `0x${string}`);
+          // Issue #67 (req 6): the same fixed-refusal wrap for the EVM key.
+          let account: ReturnType<typeof privateKeyToAccount>;
+          try {
+            account = privateKeyToAccount(evmKey! as `0x${string}`);
+          } catch (keyErr) {
+            console.error(`[x402_fetch] CONFIG_INVALID: EVM key must be 0x-prefixed hex — the key value is never echoed anywhere`);
+            throw new Error("EVM key must be 0x-prefixed hex");
+          }
           const evmSigner = toClientEvmSigner(account as any);
           // Issue #32 (R5): per-chain RPC options — BASE_RPC_URL is scoped to
           // chain 8453 ONLY (the EvmSchemeOptions by-chain-id form). Polygon /
