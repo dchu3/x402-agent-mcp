@@ -91,7 +91,26 @@ export async function fetchCasper(
     error = 'Casper payment failed validation, signing or transport; authorization budget remains reserved if signing was attempted';
     return { content: [{ type: 'text' as const, text: JSON.stringify({ error, url, chain: 'casper' }) }] };
   } finally {
-    logPayment({ timestamp: new Date().toISOString(), url, method, chain: 'casper',
-      currency: 'wCSPR', amount_motes: authorized().toString(), tx_hash: txHash, status, error });
+    // Issue #54 (req 6): the Casper row keeps the TRUE outcome too — a
+    // verified success receipt settles; a nonzero authorization with no
+    // verified receipt is a signed-and-debited attempt (ambiguous failures
+    // retain the debit in the budget), so the ledger must count it exactly
+    // the same across a restart: authorized_unserved, its validity the
+    // intent's own expiry (none bound ⇒ no expiry field ⇒ the row counts —
+    // the fail-closed over-count direction). Nothing authorized ⇒ failed/0,
+    // exactly as before.
+    const unservedAuthorization = status !== 'success' && authorized() > 0n;
+    logPayment({
+      timestamp: new Date().toISOString(),
+      url,
+      method,
+      chain: 'casper',
+      currency: 'wCSPR',
+      amount_motes: authorized().toString(),
+      ...(unservedAuthorization && intent != null ? { expires_at: intent.expiresAt } : {}),
+      tx_hash: txHash,
+      status: unservedAuthorization ? 'authorized_unserved' : status,
+      error,
+    });
   }
 }
