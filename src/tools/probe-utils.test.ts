@@ -340,6 +340,14 @@ describe('probePaymentChallenge — the discriminated liveness probe (issue #34)
   it('an aborted probe (timeout) is error, never live_402', async () => {
     globalThis.fetch = (async (_url: unknown, init: any) => {
       const signal: AbortSignal = init.signal;
+      // Issue #80 drive-by (test harness realism — the flake this PR's extra
+      // suite load exposed): guardedFetch's guardUrl does a REAL dns lookup
+      // before the mock is invoked (slow.invalid is not allowlisted); under
+      // parallel-suite load that lookup can outlast the 20 ms probe timeout,
+      // so the signal may already be aborted here. Real fetch rejects
+      // immediately on an already-aborted signal — the mock must too, or the
+      // listener (registered after the event) never fires and the test hangs.
+      if (signal.aborted) throw new DOMException('The operation was aborted.', 'AbortError');
       return await new Promise<Response>((_resolve, reject) => {
         signal.addEventListener('abort', () => reject(new DOMException('The operation was aborted.', 'AbortError')));
       });
