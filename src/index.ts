@@ -22,6 +22,25 @@ import { registerInspectTool } from "./tools/inspector.js";
 import { resolveNetworkMode, solanaRpcHostForMode } from "./networks.js";
 import { assetTableSummary } from "./assets.js";
 import { VERSION } from "./version.js";
+// Issue #80 (R1d): startup fail-fast on an invalid timeout configuration —
+// the parsers fail closed (RangeError) at CALL time; validating them here, on
+// startup, instead of mid-flow (pre-#80 they only surfaced per-call inside
+// the paid leg's generic payment failure).
+import { paidTimeoutMs, probeTimeoutMs } from "./transport/replay.js";
+
+for (const validateTimeoutConfig of [paidTimeoutMs, probeTimeoutMs]) {
+  try {
+    validateTimeoutConfig(process.env);
+  } catch (err) {
+    if (err instanceof RangeError) {
+      // Fixed message naming the variable (the RangeError text already does);
+      // refusal BEFORE any server construction, key handling or network.
+      console.error(`x402-agent-mcp: refusing to start — invalid timeout configuration: ${err.message}`);
+      process.exit(1);
+    }
+    throw err;
+  }
+}
 
 const server = new McpServer({
   name: "x402-agent-mcp",
