@@ -367,6 +367,11 @@ export function registerFetchTool(server: McpServer): void {
       let probedOffer: { scheme?: string; network?: string; asset?: string; amount?: string; payTo?: string } | undefined;
       let casperIntent: PaymentIntent | null = null;
       let casperBlockedCode: IntentRejectCode | undefined;
+      // Issue #80 (R2, Casper leg): the SELECTED Casper accept's payTo,
+      // retained for the per-call expected_pay_to narrowing check at the
+      // Casper branch below — the accept is resolved inside the probe block,
+      // the narrowing gate runs just before fetchCasper (before any signing).
+      let casperSelectedPayTo: string | undefined;
       // Issue #61: the deterministically chosen payable offer (when one
       // exists), the fixed-vocabulary rejection records for the losing
       // offers, and the challenge pieces the scope boundary (issue #55)
@@ -649,6 +654,7 @@ export function registerFetchTool(server: McpServer): void {
               }
               if (casperAccept) {
                 casperNetwork = toCasperCaip2(casperAccept.network);
+                casperSelectedPayTo = casperAccept.payTo;
                 // Issue #59 (req 8): the casper leg's observed network.
                 observeNetwork(casperNetwork);
                 // Issue #59 (req 3 + D6): the offer's own network must equal
@@ -787,6 +793,67 @@ export function registerFetchTool(server: McpServer): void {
       }
 
       if (useChain === CASPER_CHAIN) {
+        // Issue #80 (R2, Casper leg): the caller's PER-CALL NARROWING limits
+        // bind the mote rail too. The pre-fix flow returned fetchCasper here
+        // BEFORE the USD-leg narrowing block, so a Casper call (forced or
+        // auto-detected) silently ignored max_price_usd / expected_pay_to /
+        // allowed_chains and still signed. Enforcement sits at THIS branch —
+        // after the offer/accept resolution above, before fetchCasper runs —
+        // so a refusal signs nothing and writes no ledger row (fail closed,
+        // the same discipline as the USD leg):
+        // - allowed_chains must LIST 'casper', else CHAIN_NOT_ALLOWED;
+        // - expected_pay_to must equal the SELECTED Casper accept's payTo,
+        //   else PAY_TO_MISMATCH;
+        // - max_price_usd has no mote-rail meaning (the rail is mote-priced,
+        //   never USD-priced) — it is refused explicitly with
+        //   PER_CALL_LIMIT_UNSUPPORTED, never silently ignored (the pre-fix
+        //   failure mode). Malformed values are PER_CALL_LIMIT_INVALID.
+        {
+          const casperNarrowingReasons: Array<{ code: string; message: string }> = [];
+          const maxPriceArg: unknown = args.max_price_usd;
+          const expectedPayToArg: unknown = args.expected_pay_to;
+          const allowedChainsArg: unknown = args.allowed_chains;
+
+          if (maxPriceArg !== undefined) {
+            if (typeof maxPriceArg !== "number" || !Number.isFinite(maxPriceArg) || maxPriceArg <= 0) {
+              casperNarrowingReasons.push({ code: "PER_CALL_LIMIT_INVALID", message: "max_price_usd must be a positive finite number of USD when provided" });
+            } else {
+              casperNarrowingReasons.push({ code: "PER_CALL_LIMIT_UNSUPPORTED", message: "max_price_usd is not supported on the Casper (mote-priced) rail and the call was not signed — bound this leg with CASPER_MAX_PAYMENT_PER_CALL / CASPER_MAX_DAILY_SPEND or narrow it with allowed_chains / expected_pay_to" });
+            }
+          }
+
+          if (expectedPayToArg !== undefined) {
+            if (typeof expectedPayToArg !== "string" || expectedPayToArg === "") {
+              casperNarrowingReasons.push({ code: "PER_CALL_LIMIT_INVALID", message: "expected_pay_to must be a non-empty string when provided" });
+            } else if ((casperSelectedPayTo ?? "") !== expectedPayToArg) {
+              casperNarrowingReasons.push({ code: "PAY_TO_MISMATCH", message: "the Casper offer's payTo does not match the caller's expected_pay_to — narrowing-only, refused before signing" });
+            }
+          }
+
+          if (allowedChainsArg !== undefined) {
+            const PER_CALL_CHAINS = ["base", "polygon", "arbitrum", "solana", "casper"];
+            if (!Array.isArray(allowedChainsArg) || allowedChainsArg.length === 0 || allowedChainsArg.some((c) => typeof c !== "string" || !PER_CALL_CHAINS.includes(c as string))) {
+              casperNarrowingReasons.push({ code: "PER_CALL_LIMIT_INVALID", message: "allowed_chains must be a non-empty array of base, polygon, arbitrum, solana and/or casper when provided" });
+            } else if (!(allowedChainsArg as string[]).includes(CASPER_CHAIN)) {
+              casperNarrowingReasons.push({ code: "CHAIN_NOT_ALLOWED", message: "the offer pays on casper, which is not in the caller's allowed_chains — narrowing-only, refused before signing" });
+            }
+          }
+
+          if (casperNarrowingReasons.length > 0) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: JSON.stringify({
+                  error: `Payment refused by the caller's per-call limits (${casperNarrowingReasons.map((r) => r.code).join(", ")})`,
+                  url,
+                  chain: CASPER_CHAIN,
+                  network: stripUntrusted(casperNetwork, 64),
+                  reasons: casperNarrowingReasons,
+                }),
+              }],
+            };
+          }
+        }
         return fetchCasper(url, method, args.body, casperKey!, casperNetwork, casperIntent, casperBlockedCode);
       }
 
