@@ -1215,26 +1215,45 @@ it('multi-EVM: a forced chain contradicting the offered network aborts BEFORE an
   assert.ok(!entries.some((e: any) => e.url === url && e.status === 'success'), 'no ledger success for the contradicted offer');
 });
 
-it('multi-EVM drift: the probe binds base but the paid leg serves a polygon-only challenge — aborted before any signature', async () => {
+it('multi-EVM drift: the probe binds base but the paid leg serves a polygon-only challenge — the drift is never signed, the send counts as unknown', async () => {
   process.env.MAX_PAYMENT_PER_CALL = '50';
   process.env.MAX_DAILY_SPEND = '50';
   process.env.EVM_PRIVATE_KEY = `0x${'11'.repeat(32)}`;
   const url = 'https://multi-evm-drift-test.invalid/api';
-  let calls = 0;
+  let calls = 0, signedCalls = 0;
   globalThis.fetch = (async (input: unknown, init: unknown) => {
     calls++;
-    assert.equal(noSignatureHeader(input, init), false, 'a signature must never exist for the drifted offer');
-    if (calls === 1) return chargeableEvmChallenge(url, BASE_CAIP2, BASE_USDC_ADDRESS); // probe binds eip155:8453
-    return chargeableEvmChallenge(url, POLYGON_CAIP2, POLYGON_USDC_ADDRESS); // paid leg: eip155:137 only — no registered scheme matches
+    if (noSignatureHeader(input, init)) {
+      signedCalls++;
+      // Issue #61: the SDK's first request rides the probe replay, so the
+      // AUTHORISED base offer is legitimately signed and this signed request
+      // is sent. The drift appears only on the SIGNED leg's re-challenge —
+      // and must never bind: a signature for the polygon offer never exists.
+      assert.equal(signatureHeaderNetwork(input, init), BASE_CAIP2, 'the signed payload stays the probe-observed base offer — never a swap to the drifted polygon one');
+      return chargeableEvmChallenge(url, POLYGON_CAIP2, POLYGON_USDC_ADDRESS); // the drifted re-challenge
+    }
+    return chargeableEvmChallenge(url, BASE_CAIP2, BASE_USDC_ADDRESS); // probe binds eip155:8453
   }) as any;
   const before = ledgerLines();
   const result = await handler()({ url });
   const parsed = JSON.parse(result.content[0].text);
-  assert.equal(calls, 2, 'probe + one paid attempt — the abort precedes any signed retry');
-  assert.match(parsed.error, /x402 payment failed/, 'the SDK refuses to select an unregistered network');
+  assert.equal(calls, 2, 'probe + one paid attempt — the abort precedes any retry against the drifted offer');
+  assert.equal(signedCalls, 1, 'exactly one signed request — the drifted polygon challenge was never paid');
+  assert.equal(parsed.status, 402, 'the drifted re-challenge surfaces as the paid leg’s answer');
+  // Issue #54 (acceptance test 6 rejection control): the seller answered the
+  // signed base payment with a fresh 402 challenge BEFORE settlement — a
+  // clear pre-settlement refusal: nothing counts, and paid stays false.
+  assert.equal(parsed.paid, false);
+  assert.equal(parsed.authorization_sent, true, 'a payload WAS sent — the refusal is at the seller');
+  assert.equal(parsed.served, false);
+  assert.equal(parsed.cost_usdc, 0);
   const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
   assert.ok(!entries.some((e: any) => e.url === url && e.status === 'success'), 'no ledger success for the drifted offer');
-  assert.equal(entries.find((e: any) => e.url === url)?.status, 'failed', 'the aborted attempt is audited like any other failure');
+  const row = entries.find((e: any) => e.url === url);
+  assert.equal(row?.status, 'failed', 'a 402 re-challenge is a refusal, not a send — failed/0');
+  assert.equal(row?.amount_usdc, 0);
+  assert.equal(row?.http_status, 402);
+  assert.equal(row?.attempted_amount_usdc, 0.01);
 });
 
 // ---------------------------------------------------------------------------

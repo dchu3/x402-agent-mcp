@@ -1,4 +1,5 @@
 import type { x402Client } from '@x402/fetch';
+import { existsSync, readFileSync } from 'fs';
 import { CASPER_MAINNET_CAIP2, CSPR_DECIMALS, csprToMotes, toCasperCaip2 } from './networks.js';
 import { assertPayableCasperAccept, casperAmountMotes, WCSPR_ASSETS } from './accepts.js';
 // Issue #62/#65: the Casper rail's optional rate resolves through the SAME
@@ -14,16 +15,41 @@ import { registerBudget, resolveRailUsdRate } from '../budget-registry.js';
 // whether an operator set MAX_DAILY_SPEND_TOTAL_USD (no cycle — reservations
 // reads its accounting through the registry, never through this module).
 import { dailyTotalCeilingUsd } from '../reservations.js';
+// Issue #54 (req 3 + req 6): the SAME ledger resolution and the SAME
+// counted-spend predicate every other accounting consumer reads — the
+// Casper rail rehydrates from these exact rows (see the singleton below).
+import { resolveLedger } from '../ledger-path.js';
+import { isCountedSpend } from '../payment-utils.js';
+
+// The ledger location resolves through src/ledger-path.ts — one resolution
+// shared by every reader/writer. Captured once at module load, mirroring the
+// payment-utils capture-at-load semantics.
+const LEDGER = resolveLedger();
+const LOG_PATH = LEDGER.primary;
 
 // Separate from the USD tracker. Debit before signing, not after an untrusted
 // HTTP response. Ambiguous failures retain the debit to prevent retry overspend.
 export class CasperBudget {
   private date = '';
   private spent = 0n;
-  constructor(private readonly now = () => new Date().toISOString().slice(0, 10)) {}
+  private rehydrated = false;
+  constructor(
+    private readonly now = () => new Date().toISOString().slice(0, 10),
+    // Issue #54 (req 6): only the rail's SINGLETON rehydrates from the ledger
+    // (constructed with `true` below); a caller-constructed budget stays
+    // process-local exactly as before.
+    private readonly rehydrateFromLedger = false,
+  ) {}
   getDailySpent(): bigint {
     const date = this.now();
     if (date !== this.date) { this.date = date; this.spent = 0n; }
+    // One-shot lazy rehydration, BEFORE the first read or debit — the same
+    // merge order the USD side uses (a restart must not reset the daily
+    // Casper budget through the in-memory map starting at 0).
+    if (this.rehydrateFromLedger && !this.rehydrated) {
+      this.rehydrated = true; // set before any I/O — never double-read
+      this.spent += rehydratedCasperMotesToday(date, Date.now());
+    }
     return this.spent;
   }
   check(amount: bigint): void {
@@ -52,18 +78,63 @@ export class CasperBudget {
 }
 
 
-export const casperBudget = new CasperBudget();
+export const casperBudget = new CasperBudget(undefined, true);
+
+/** Split a ledger file into lines, best-effort: a missing/unreadable file is
+ * an empty ledger (the per-file error names the path). */
+function readLedgerLines(path: string | undefined): string[] {
+  if (!path || !existsSync(path)) return [];
+  try {
+    return readFileSync(path, 'utf-8').split('\n');
+  } catch (err) {
+    console.error(`[x402] Failed to read ledger ${path}: ${err}`);
+    return [];
+  }
+}
+
+/** Issue #54 (req 6): TODAY's Casper spend rebuilt from the SAME ledger rows
+ * every other accounting counter reads (the USD counters deliberately
+ * exclude casper rows — this is where they are summed). The ONE
+ * counted-spend predicate (isCountedSpend) decides: a verified success
+ * counts; a signed-but-unverified authorization counts until the sent
+ * payload's own expires_at, then releases; failed never counts. Amounts sum
+ * the row's own amount_motes audit field as exact integers — NEVER a USD
+ * conversion, NEVER an invented price (an unpriced rail's refusal path stays
+ * RAIL_DISABLED_NO_RATE at the budget check). Legacy-first, read-once, the
+ * same best-effort reads as the other consumers. */
+function rehydratedCasperMotesToday(date: string, nowMs: number): bigint {
+  let total = 0n;
+  for (const line of readLedgerLines(LEDGER.legacyReadOnly).concat(readLedgerLines(LOG_PATH))) {
+    try {
+      const e = JSON.parse(line) as { status?: string; chain?: string; amount_motes?: string; timestamp?: string; expires_at?: string };
+      if (
+        e.chain === 'casper' &&
+        typeof e.timestamp === 'string' &&
+        e.timestamp.slice(0, 10) === date &&
+        isCountedSpend(e, nowMs) &&
+        typeof e.amount_motes === 'string' &&
+        /^\d+$/.test(e.amount_motes)
+      ) {
+        total += BigInt(e.amount_motes);
+      }
+    } catch {
+      // Corrupted ledger lines are skipped — logging is best-effort, so is reading it back
+    }
+  }
+  return total;
+}
 
 // ---------------------------------------------------------------------------
 // Issue #65: the Casper rail registers in the budget registry as an ADAPTER
-// over this module's own memory counter — the registry duplicates nothing.
-// persistence is honestly "memory": the counter is process-local, and the
-// ledger is not its source of truth. Caps read the env LIVE per call through
-// the existing csprToMotes math (an unset or unusable budget is "no cap" —
-// the rail's own checks refuse all paid calls then). The USD rate comes ONLY
-// from X402_RATE_WCSPR_USD (or a rate an operator prices onto the table's
-// wCSPR entry via assets.extensions): NO built-in rate ever ships — an
-// unpriced Casper rail is disabled for paid calls while the optional
+// over this module's own counter — the registry duplicates nothing.
+// Issue #54 (req 6): persistence is 'ledger-rehydrated' — the counter
+// rebuilds today's mote spend from today's ledger rows (the same ledger the
+// USD rail lists), so a restart is not a reset. Caps read the env LIVE per
+// call through the existing csprToMotes math (an unset or unusable budget is
+// "no cap" — the rail's own checks refuse all paid calls then). The USD rate
+// comes ONLY from X402_RATE_WCSPR_USD (or a rate an operator prices onto the
+// table's wCSPR entry via assets.extensions): NO built-in rate ever ships —
+// an unpriced Casper rail is disabled for paid calls while the optional
 // cross-chain MAX_DAILY_SPEND_TOTAL_USD ceiling is set (RAIL_DISABLED_NO_RATE).
 // ---------------------------------------------------------------------------
 
@@ -109,16 +180,21 @@ registerBudget({
   // The Casper rail debits synchronously on reserve — its holds ARE its
   // spend, so there are no separate outstanding holds to report.
   reservedToday: () => null,
-  persistence: 'memory',
+  persistence: 'ledger-rehydrated',
+  // The effective ledger location (issue #54 req 6): the same resolution the
+  // rehydrated counter reads, captured once at module load.
+  ledgerPath: LOG_PATH,
   usdRate: () => casperRailUsdRate(),
 });
 
-/** Test hook: clear the singleton's in-memory spend and its day (fresh state
- * between scenarios). Not part of the runtime surface. */
+/** Test hook: clear the singleton's in-memory spend, its day and its
+ * rehydration mark (fresh state between scenarios — the next read rehydrates
+ * exactly as a restart would). Not part of the runtime surface. */
 export function _resetCasperBudgetForTests(): void {
-  const budget = casperBudget as unknown as { date: string; spent: bigint };
+  const budget = casperBudget as unknown as { date: string; spent: bigint; rehydrated: boolean };
   budget.date = '';
   budget.spent = 0n;
+  budget.rehydrated = false;
 }
 
 /** Guard the requirements actually selected by x402, not just the earlier probe. */

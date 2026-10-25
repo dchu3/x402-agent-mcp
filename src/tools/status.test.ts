@@ -97,7 +97,7 @@ it('lists every registered rail with exact atomic amounts, persistence and the l
   assert.equal(casper.per_call_cap, '1.000000000', '1 CSPR = 10^9 motes, exact');
   assert.equal(casper.daily_cap, '2.000000000');
   assert.equal(casper.spent_today, '0.000000000');
-  assert.equal(casper.persistence, 'memory', 'the honest persistence value (#65 req 2)');
+  assert.equal(casper.persistence, 'ledger-rehydrated', 'issue #54 req 6: the Casper rail rehydrates from the same ledger — the honest value to print');
   assert.equal(casper.usd_rate, null, 'no configured rate — never an assumed one');
 });
 

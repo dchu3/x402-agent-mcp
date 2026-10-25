@@ -22,9 +22,9 @@
 import { usdFromAtomic } from "./tools/accounting.js";
 
 /** How a rail's spend persists across a restart: "ledger-rehydrated" counters
- * rebuild from today's ledger rows; "memory" counters are process-local (the
- * honest value x402_status prints for the Casper rail — not a bug to fix
- * silently here). */
+ * rebuild from today's ledger rows; "memory" counters are process-local.
+ * Issue #54 (req 6): BOTH shipped rails rehydrate from the same ledger — a
+ * restart is not a reset on either rail. */
 export type PersistenceMode = "ledger-rehydrated" | "memory";
 
 /** An exact integer atomic amount: the decimal digit string plus the unit's

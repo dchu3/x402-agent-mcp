@@ -66,12 +66,12 @@ it('the USD rail reports today’s USD spend (the number its own caps compare) a
   assert.equal(usd.reservedToday?.(), null, 'nothing is outstanding in a fresh process');
 });
 
-it('the Casper rail adapter prices nothing by default (NO built-in rate, ever) and stays memory-backed', () => {
+it('the Casper rail adapter prices nothing by default (NO built-in rate, ever) and rehydrates like the USD rail', () => {
   const casper = rail('casper');
   assert.equal(casper.unit, 'wCSPR');
   assert.equal(casper.decimals, 9);
-  assert.equal(casper.persistence, 'memory', 'the Casper counter is memory-only — the honest value to print (#65 req 2)');
-  assert.equal(casper.ledgerPath, undefined, 'no ledger is the source of truth for the Casper counter');
+  assert.equal(casper.persistence, 'ledger-rehydrated', 'issue #54 req 6: the Casper counter rehydrates from the SAME ledger — a restart is not a reset');
+  assert.equal(casper.ledgerPath, process.env.PAYMENT_LOG_PATH, 'the Casper counter’s source of truth is the same ledger location');
   assert.equal(casper.usdRate(), null, 'no X402_RATE_WCSPR_USD configured → no rate, no ship-by-default');
 });
 

@@ -4,10 +4,13 @@
 //
 // - PAYMENT_LOG_PATH captured at module load (tests use fresh query-busted
 //   imports with the env preset — see payment-utils.rehydrate.test.ts).
-// - Lazy one-shot rehydration: today's SUCCESSFUL payments are grouped by the
-//   ledger URL's hostname; rehydrated flag set before any I/O so a throw can
-//   never cause a double-read. Corrupted lines and unparseable URLs are
-//   skipped — logging is best-effort, so is reading it back.
+// - Lazy one-shot rehydration: today's COUNTED payments are grouped by the
+//   ledger URL's hostname (the #54 isCountedSpend predicate — success and
+//   settled_unserved count, a sent-but-unproven authorization counts until
+//   the row's expires_at, failed never); rehydrated flag set before any I/O
+//   so a throw can never cause a double-read. Corrupted lines and
+//   unparseable URLs are skipped — logging is best-effort, so is reading it
+//   back.
 // - resetDailyIfNewDay() rolls the in-memory map at the UTC day boundary.
 //
 // Scope rule (symmetric with the global ledger): Casper entries are excluded
@@ -20,6 +23,12 @@ import { existsSync, readFileSync } from "fs";
 // Issue #54 (req 3): the ledger path resolver shared by every ledger reader
 // (see the capture comment below).
 import { resolveLedger } from "../ledger-path.js";
+// Issue #54 (Option A): the ONE counted-spend predicate — per-service
+// rehydration reads the SAME rule payment-utils.logPayment counts by, so a
+// settled_unserved or sent-but-unproven (authorized_unserved, until its own
+// expiry) row counts per-service exactly as it counts globally, and a failed
+// row never does. No consumer keeps a private copy of the status test.
+import { isCountedSpend } from "../payment-utils.js";
 
 // Issue #54: the ledger location resolves through src/ledger-path.ts — one
 // resolution shared by every reader/writer: an explicit PAYMENT_LOG_PATH wins
@@ -45,9 +54,9 @@ function rehydrateFromLedger(): void {
   // per-service cap).
   for (const line of readLedgerLines(LEDGER.legacyReadOnly).concat(readLedgerLines(LOG_PATH))) {
     try {
-      const e = JSON.parse(line) as { status?: string; chain?: string; url?: string; amount_usdc?: number; timestamp?: string };
+      const e = JSON.parse(line) as { status?: string; chain?: string; url?: string; amount_usdc?: number; timestamp?: string; expires_at?: string };
       if (
-        e.status === "success" &&
+        isCountedSpend(e, Date.now()) &&
         e.chain !== "casper" &&
         typeof e.url === "string" &&
         typeof e.timestamp === "string" &&
@@ -103,10 +112,10 @@ export function getPerServiceSpent(host: string): number {
   return perServiceSpent.get((host || "").toLowerCase()) ?? 0;
 }
 
-/** Record a successful USD-settled payment against its service host, in
- * memory. Call this right next to payment-utils.logPayment for non-Casper
- * successes so the in-memory map and the ledger stay consistent (rehydration
- * rebuilds the same values after a restart). */
+/** Record a COUNTED USD payment against its service host, in memory. Call
+ * this right next to payment-utils.logPayment for non-Casper counted rows so
+ * the in-memory map and the ledger stay consistent (rehydration rebuilds the
+ * same values after a restart — both sides read the #54 isCountedSpend rule). */
 export function recordServicePayment(url: string, amountUsdc: number): void {
   resetDailyIfNewDay();
   if (!Number.isFinite(amountUsdc) || amountUsdc <= 0) return;
