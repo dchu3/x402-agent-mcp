@@ -162,7 +162,7 @@ async function fetchListingHtml(pageUrl: string): Promise<string> {
 export function registerCrawlX402ScanTool(server: McpServer): void {
   server.tool(
     "x402_crawl_directory",
-    "Crawl the x402scan.com all-services page to discover new x402 endpoints. Extracts service URLs, probes each for x402 support, and auto-adds confirmed services to the local directory. Returns summary of newly discovered services.",
+    "Crawl the x402scan.com all-services page to discover new x402 endpoints. Extracts service URLs, probes each for x402 support, and auto-adds confirmed services to the local directory. Returns summary of newly discovered services. Discovery only records what a service advertises; discovering a host never makes it payable — the allowlist and the payment policy still decide every paid leg, and this tool never pays.",
     {
       max_results: z.number().optional().describe("Maximum number of new services to add (default: 20)"),
     },
