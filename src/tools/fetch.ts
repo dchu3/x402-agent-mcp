@@ -818,6 +818,19 @@ export function registerFetchTool(server: McpServer): void {
       const serviceScope = spendBucket ? `net:${spendBucket}:service:${serviceHost}` : `service:${serviceHost}`;
       const dailySpentOfBucket = spendBucket ? getDailySpent(spendBucket) : getDailySpent();
 
+      // Issue #54 (Option A — the post-send throw path): the catch block
+      // below must know whether a payload was SIGNED (a send happened) and
+      // at what signed amount — the tri-state paid, the counted
+      // authorized_unserved row and its expires_at all read these after the
+      // paid leg throws. The bindings are hoisted out of the try: declared
+      // here, assigned inside (semantics unchanged).
+      let intent: PaymentIntent | null = null;
+      let blockedCode: IntentRejectCode | undefined;
+      let signedAmountUsdc: number | undefined;
+      // Issue #53/#54: flips inside the enforcement hook right after the
+      // intent is consumed — the only point where a signature may exist.
+      let payloadSigned = false;
+
       // Step 3: Create x402 client with the right scheme
       try {
         // Issue #61 (C7): force the SDK's own selection to the agent-chosen
@@ -1028,8 +1041,6 @@ export function registerFetchTool(server: McpServer): void {
         // continues with a blocking hook (INTENT_UNAUTHORISED) so endpoints
         // that do not actually charge pass through unchanged, while any
         // payment-payload creation aborts before signing (amendment 1).
-        let intent: PaymentIntent | null = null;
-        let blockedCode: IntentRejectCode | undefined;
         if (probedOffer) {
           const intentResult = createFromOffer({
             decision: policyResult,
@@ -1102,7 +1113,7 @@ export function registerFetchTool(server: McpServer): void {
         // recorded amount then reads 0 with the raw atomic fields on the row
         // for audit — never a made-up value); for an intent created by
         // createFromOffer (validated digits + decimals) this is unreachable.
-        const signedAmountUsdc = intent !== null ? usdFromAtomic(intent.amountAtomic, intent.decimals) : undefined;
+        signedAmountUsdc = intent !== null ? usdFromAtomic(intent.amountAtomic, intent.decimals) : undefined;
         if (intent !== null && signedAmountUsdc === undefined) {
           return intentRefusal(url, useChain, amountUsdc, [
             { code: "INTENT_UNAUTHORISED", message: "the signed amount could not be converted to USD for spend accounting — refusing before signing (fail closed)" },
@@ -1110,9 +1121,7 @@ export function registerFetchTool(server: McpServer): void {
           ]);
         }
 
-        // Issue #53/#54: flips inside the enforcement hook right after the
-        // intent is consumed — the only point where a signature may exist.
-        let payloadSigned = false;
+        // (payloadSigned is declared above the try — the catch reads it.)
 
         // Issue #54 (req 1): reserve the signed candidate amount BEFORE the
         // payment layer runs. The reserve’s check+insert is synchronous
@@ -1423,7 +1432,13 @@ export function registerFetchTool(server: McpServer): void {
           else releaseReservation(reservation.id);
         }
       } catch (err: any) {
-        // Log failed payment attempt
+        // Issue #54 (Option A, req 2): a throw AFTER the payload was signed
+        // and sent is NOT a clean failure — settlement is unknown: the row
+        // counts (authorized_unserved; no tx hash can exist) until the sent
+        // payload's own validity (the intent's expiresAt) ends, and the
+        // per-service store moves identically (one predicate, both sides).
+        // Only a path that never signed keeps the zero-spend failed row
+        // exactly as before.
         logPayment({
           timestamp: new Date().toISOString(),
           url,
@@ -1433,10 +1448,21 @@ export function registerFetchTool(server: McpServer): void {
           // carry it too — the audit trail is complete; only SUCCESS devnet
           // rows feed the devnet bucket).
           ...(probedOffer?.network ? { network: probedOffer.network } : {}),
-          amount_usdc: 0,
-          status: "failed",
+          ...(payloadSigned && intent !== null
+            ? {
+                amount_usdc: signedAmountUsdc ?? 0,
+                amount_atomic: intent.amountAtomic,
+                decimals: intent.decimals,
+                ...(intent.asset !== "" ? { asset: intent.asset } : {}),
+                expires_at: intent.expiresAt,
+                status: "authorized_unserved" as const,
+              }
+            : { amount_usdc: 0, status: "failed" as const }),
           error: err.message,
         });
+        if (payloadSigned && intent !== null) {
+          recordServicePayment(url, signedAmountUsdc ?? 0);
+        }
 
         // Issue #58: a transport guard refusal (private host / redirect /
         // scheme) is a stable structured refusal — never folded into the
@@ -1459,12 +1485,16 @@ export function registerFetchTool(server: McpServer): void {
           return intentRefusal(url, useChain, amountUsdc, abortReasons);
         }
 
-        // Issue #56: the paid request ran out of its own timeout bound. A
-        // fixed PAID_TIMEOUT refusal — never the raw AbortError text — while
-        // the failed row above keeps the zero-spend audit trail. Either
-        // DOMException name can arrive here (AbortSignal.timeout names it
-        // TimeoutError; an implementation may surface AbortError); on this
-        // seam every abort is the flow's own paid-leg bound.
+        // Issue #56+#54: the paid request ran out of its own timeout bound. A
+        // fixed PAID_TIMEOUT refusal — never the raw AbortError text. A
+        // timeout AFTER the send is exactly the unknown case: the counted
+        // authorized_unserved row was already written above, the agent is
+        // told paid is unknown (never false after a send), and the message
+        // says do not retry blindly — a second blind call could pay twice.
+        // A timeout before any signing keeps the pre-#54 zero-spend shape.
+        // Either DOMException name can arrive here (AbortSignal.timeout
+        // names it TimeoutError; an implementation may surface AbortError);
+        // on this seam every abort is the flow's own paid-leg bound.
         const abortName = (err as { name?: unknown } | undefined)?.name;
         if (abortName === "TimeoutError" || abortName === "AbortError") {
           return {
@@ -1474,8 +1504,21 @@ export function registerFetchTool(server: McpServer): void {
                 error: "PAID_TIMEOUT",
                 url,
                 chain: useChain,
+                ...(payloadSigned
+                  ? {
+                      paid: "unknown",
+                      authorization_sent: true,
+                      served: false,
+                      cost_usdc: signedAmountUsdc ?? 0,
+                    }
+                  : {}),
                 estimated_cost_usdc: amountUsdc,
-                reasons: [{ code: "PAID_TIMEOUT", message: "the seller did not answer the paid request within the timeout bound" }],
+                reasons: [{
+                  code: "PAID_TIMEOUT",
+                  message: payloadSigned
+                    ? "the signed payment was sent but the seller did not answer the paid request within the timeout bound — settlement is unknown; do not retry blindly (this client never auto-retries a paid call); the amount counts against today's budget until the sent payload's validity expires"
+                    : "the seller did not answer the paid request within the timeout bound",
+                }],
               }),
             }],
           };
@@ -1492,6 +1535,18 @@ export function registerFetchTool(server: McpServer): void {
               error: "x402 payment failed",
               chain: useChain,
               url,
+              // Issue #54 (Option A): after a send, a throw is UNKNOWN
+              // spend, not a bare `paid: false` — the counted
+              // authorized_unserved row was already written above.
+              ...(payloadSigned
+                ? {
+                    paid: "unknown",
+                    authorization_sent: true,
+                    served: false,
+                    cost_usdc: signedAmountUsdc ?? 0,
+                    note: "the signed payment was sent but the call failed without settlement evidence — do not retry blindly (this client never auto-retries a paid call); the amount counts against today's budget until the sent payload's validity expires",
+                  }
+                : {}),
             }),
           }],
         };

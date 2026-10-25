@@ -227,3 +227,62 @@ it('402 with a rejection and no receipt → failed, paid false (acceptance test 
   assert.equal(getDailySpent(), dailyBefore, 'a refused payment must not move the daily spend');
   assert.equal(store.getPerServiceSpent(host), serviceBefore, 'a refused payment must not move per-service spend');
 });
+
+// ---------------------------------------------------------------------------
+// C4: a dropped socket AFTER the send — the generic catch path's variant of
+// "unknown": the connection died mid-answer, settlement cannot be ruled out,
+// so the send is counted (authorized_unserved, no tx hash), never reported as
+// a bare failure, and NEVER retried. Loopback mock seller (the loopback-only
+// convention of fetch-paid-limits.test.ts); the socket is destroyed after
+// the signed header arrives, exactly as a dead peer would behave.
+// ---------------------------------------------------------------------------
+
+it('a dropped socket after the signed send → paid "unknown", counted row, no second paid request', { timeout: 20_000 }, async () => {
+  process.env.MAX_PAYMENT_PER_CALL = '50';
+  process.env.MAX_DAILY_SPEND = '50';
+  const { createServer } = await import('node:http');
+  const recorded: Array<{ signed: boolean }> = [];
+  const server = createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      const isSigned = req.headers['payment-signature'] !== undefined || req.headers['x-payment'] !== undefined;
+      recorded.push({ signed: isSigned });
+      if (isSigned) {
+        // The seller dies mid-flight after the signed request arrived.
+        req.socket.destroy();
+        return;
+      }
+      const challenge = chargeableBaseChallenge(`http://${req.headers.host ?? ''}${req.url}`);
+      res.writeHead(challenge.status, Object.fromEntries((challenge.headers as Headers).entries()));
+      res.end('Payment Required');
+    });
+  });
+  const port = await new Promise<number>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const addr = server.address();
+      resolve(typeof addr === 'object' && addr !== null ? addr!.port : 0);
+    });
+  });
+  process.env.X402_ALLOW_PRIVATE_HOSTS = `127.0.0.1:${port}`;
+  const url = `http://127.0.0.1:${port}/api`;
+  try {
+    const before = ledgerLines();
+    const result = await handler()({ url, chain: 'base' });
+    const parsed = JSON.parse(result.content[0].text);
+    assert.equal(parsed.error, 'x402 payment failed', `the fixed failure text, got: ${JSON.stringify(parsed)}`);
+    assert.equal(parsed.paid, 'unknown', 'a send that then failed is unknown spend, not a bare failure');
+    assert.equal(parsed.authorization_sent, true);
+    assert.equal(parsed.served, false);
+    assert.equal(parsed.cost_usdc, 0.01, 'paid "unknown" reports the counted amount, never 0');
+    assert.match(String(parsed.note ?? ''), /do not retry blindly/i, 'the unknown text carries the no-retry guidance');
+    assert.equal(recorded.filter((r) => r.signed).length, 1, 'exactly ONE paid request — no second paid request after the drop');
+    const row = ledgerLines().slice(before.length).find((e: any) => e.url === url);
+    assert.equal(row?.status, 'authorized_unserved', 'the counted row keeps the true outcome');
+    assert.equal(row?.amount_usdc, 0.01);
+    assert.equal(row?.tx_hash, undefined, 'no settlement evidence exists — no tx hash');
+    assert.equal(typeof row?.expires_at, 'string', 'the counted row carries the sent payload’s validity');
+  } finally {
+    server.close();
+  }
+});

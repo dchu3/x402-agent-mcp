@@ -120,16 +120,26 @@ async function chargingSeller(paidBody: string | Buffer): Promise<{ url: string;
 
 const FIVE_MIB = 'x'.repeat(5 * 1024 * 1024);
 
-it('issue #56 (C8): a 5 MiB paid response body is read bounded — the cap surfaces as an honest failed row with the read bound named, never an unbounded read', { timeout: 40_000 }, async () => {
+it('issue #56 (C8) + #54: a 5 MiB paid response body is read bounded — the cap surfaces as a counted authorized_unserved row with the read bound named, never an unbounded read', { timeout: 40_000 }, async () => {
   const s = await chargingSeller(FIVE_MIB);
   const before = ledgerLines().length;
   const parsed = JSON.parse((await handler()({ url: s.url })).content[0].text);
   const row = ledgerLines().slice(before).find((r: any) => r.url === s.url);
   assert.ok(row, 'every paid attempt leaves a ledger row');
-  assert.equal(row.status, 'failed', 'the seller\u2019s 5 MiB body never settles a success row in this flow');
-  assert.equal(row.amount_usdc, 0);
+  // Issue #54: the payment WAS signed and sent (the 5 MiB body belongs to
+  // the paid leg's own response) — the throw after the send is the UNKNOWN
+  // case, never a bare failure: the row counts until the sent payload's own
+  // validity ends, and the agent is told paid is unknown, not false.
+  assert.equal(row.status, 'authorized_unserved', 'a throw after the send is counted, not failed/0');
+  assert.equal(row.amount_usdc, 0.01, 'the signed amount counts');
+  assert.equal(row.tx_hash, undefined, 'no settlement evidence — no tx hash');
+  assert.equal(typeof row.expires_at, 'string', 'the counted row carries the sent payload’s validity');
   assert.equal(row.error, 'Payment response exceeds size limit', 'the bounded read names its own cap');
   assert.equal(parsed.error, 'x402 payment failed');
+  assert.equal(parsed.paid, 'unknown');
+  assert.equal(parsed.authorization_sent, true);
+  assert.equal(parsed.served, false);
+  assert.equal(parsed.cost_usdc, 0.01, 'paid "unknown" reports the counted amount, never 0');
   // Exactly two network legs (issue #61): the probe and the signed leg. No
   // third (SDK-unpaid) leg, no retry loop after the cap: the attempt is
   // finished, audited, and never retried against a seller that just showed
@@ -138,7 +148,7 @@ it('issue #56 (C8): a 5 MiB paid response body is read bounded — the cap surfa
   assert.equal(s.recorded.filter((r) => r.signed).length, 1);
 });
 
-it('issue #56 (C8): a paid request that never answers refuses with the fixed PAID_TIMEOUT code quickly, with an honest zero-spend row', { timeout: 20_000 }, async () => {
+it('issue #56 (C8) + #54: a paid request that never answers refuses with the fixed PAID_TIMEOUT code quickly, with an honest counted (unknown) row', { timeout: 20_000 }, async () => {
   process.env.X402_PAID_TIMEOUT_MS = '300';
   const s = await seller((req, res, _i, signed) => {
     // The probe answers (the challenge); the signed leg never does.
@@ -156,10 +166,20 @@ it('issue #56 (C8): a paid request that never answers refuses with the fixed PAI
   const elapsed = Date.now() - started;
   assert.equal(parsed.error, 'PAID_TIMEOUT', `the fixed refusal code, got: ${JSON.stringify(parsed)}`);
   assert.ok(elapsed < 10_000, `the timeout bound is honoured quickly (took ${elapsed}ms; the pre-#56 flow waits on undici's minutes-long defaults)`);
+  // Issue #54: a timeout AFTER the send is exactly the unknown case — the
+  // agent is never told paid: false; the send is counted until the sent
+  // payload's own validity ends; and the message says do not retry blindly.
+  assert.equal(parsed.paid, 'unknown');
+  assert.equal(parsed.authorization_sent, true);
+  assert.equal(parsed.served, false);
+  assert.match(parsed.reasons?.[0]?.message ?? '', /do not retry blindly/i);
   const row = ledgerLines().slice(before).find((r: any) => r.url === s.url);
-  assert.ok(row, 'the timed-out attempt is audited like any other failure');
-  assert.equal(row.status, 'failed');
-  assert.equal(row.amount_usdc, 0);
+  assert.ok(row, 'the timed-out attempt is audited like any other paid attempt');
+  assert.equal(row.status, 'authorized_unserved', 'the send counts, it is not failed/0');
+  assert.equal(row.amount_usdc, 0.01);
+  assert.equal(row.tx_hash, undefined, 'no settlement evidence — no tx hash');
+  assert.equal(typeof row.expires_at, 'string');
+  assert.equal(s.recorded.filter((r) => r.signed).length, 1, 'exactly one paid request — never retried');
 });
 
 it('issue #56 (C8): a paid body just under the cap still settles honestly — the cap is not entangled with settlement', { timeout: 40_000 }, async () => {
