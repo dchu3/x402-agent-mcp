@@ -194,6 +194,38 @@ direct `node --test "dist-test/**/*.test.js"` (glob) form only expands from
 Node ≥ 21, so on Node 20 it matches no files — the explicit list runs
 identically on Node 20 and newer.
 
+The suite is **hermetic by default**: tests talk only to loopback mock
+sellers (exactly the hosts `X402_ALLOW_PRIVATE_HOSTS` lets through), write
+every state file into a `mkdtemp` temp path (`X402_DIRECTORY_PATH`,
+`PAYMENT_LOG_PATH`), touch no network beyond that loopback, and generate
+any wallet key they sign with at runtime — thrown away with the temp
+directory when the suite ends. Nothing in `npm test` reaches a public chain.
+
+**Optional devnet smoke (never part of `npm test`).** The one way to watch
+the payment flow settle for real without touching mainnet is devnet mode
+against the x402 lab devnet ([networks.md](networks.md)) with a key that
+holds no real value:
+
+```bash
+X402_NETWORK_MODE=devnet
+SOLANA_PRIVATE_KEY=<THROWAWAY_DEVNET_KEY>       # generated, never a mainnet key
+# SOLANA_DEVNET_RPC_URL=<DEVNET_RPC_URL>        # optional; the public SDK devnet RPC is the fallback
+```
+
+Add the devnet network to the policy's `networks.allowed`, then make one
+small paid call, e.g. `x402_fetch({ url: "https://<DEVNET_ENDPOINT_URL>" })`
+against the lab seller, and check the ledger: the row must carry the devnet
+network id in `network`, spend must land in the devnet bucket, and the
+fund-from-faucet wallet (`<DEVNET_TEST_WALLET>` if you name it anywhere)
+must be the throwaway — never a key that holds value.
+
+**No real addresses or keys in tests, fixtures, docs or examples.** Every
+address-shaped value that is not already-documented public infra (the
+devnet ids in networks.md) must be an angle-bracket placeholder, written
+so a copy-paste can never carry value. The enforcement net is the
+[pre-push security scan](#pre-push-security-scan) below — write tests and
+docs as if that scan runs on every push, because it does.
+
 ### CI
 
 `.github/workflows/ci.yml` builds and tests on Node 20 and 22, installs with
