@@ -3,6 +3,13 @@ import { after, afterEach, it } from 'node:test';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+// The throwaway EVM key is GENERATED in test code (same pattern as the other
+// fetch tests) — never a literal key-shaped string in the repository.
+import { generatePrivateKey } from 'viem/accounts';
+// The wCSPR asset id is the SHIPPED public package hash from casper/accepts
+// — imported, never re-typed (a re-typed 64-hex literal is indistinguishable
+// from a key in a security scan).
+import { WCSPR_ASSETS } from '../casper/accepts.js';
 
 // ---------------------------------------------------------------------------
 // Issue #67 (plan C5) — x402_inspect: a FREE inspection of an offer (or a
@@ -21,7 +28,8 @@ process.env.X402_STATE_DIR = join(dir, 'state');
 process.env.X402_DIRECTORY_PATH = join(dir, 'endpoints.json');
 writeFileSync(process.env.X402_DIRECTORY_PATH, JSON.stringify({ endpoints: [], categories: [], last_updated: '2026-10-24' }), 'utf8');
 // Signers for the base leg: keys loaded (the same envs the fetch seam reads).
-process.env.EVM_PRIVATE_KEY = '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d';
+const EVM_KEY = generatePrivateKey();
+process.env.EVM_PRIVATE_KEY = EVM_KEY;
 
 const paymentUtils = (await import('../payment-utils.js')) as typeof import('../payment-utils.js');
 const { registerInspectTool } = (await import('./inspector.js')) as typeof import('./inspector.js');
@@ -41,7 +49,7 @@ afterEach(() => {
     PAYMENT_LOG_PATH: join(dir, 'payments', 'ledger.jsonl'),
     X402_STATE_DIR: join(dir, 'state'),
     X402_DIRECTORY_PATH: join(dir, 'endpoints.json'),
-    EVM_PRIVATE_KEY: '0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d',
+    EVM_PRIVATE_KEY: EVM_KEY,
   };
   delete process.env.MAX_DAILY_SPEND_TOTAL_USD;
   delete process.env.X402_RATE_WCSPR_USD;
@@ -54,7 +62,7 @@ const DISALLOWED = { scheme: 'exact', network: 'eip155:137', asset: '0x3c499c542
 const CASPER_OFFER = {
   scheme: 'exact',
   network: 'casper:casper',
-  asset: '8df5d26790e18cf0404502c62ce5dc9025800ad6975c97466e20506c39c505b6',
+  asset: WCSPR_ASSETS['casper:casper'],
   amount: '1500000000',
   payTo: '00' + 'a'.repeat(64),
 };
