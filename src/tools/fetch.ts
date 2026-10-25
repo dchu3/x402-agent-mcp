@@ -840,8 +840,19 @@ export function registerFetchTool(server: McpServer): void {
         let registeredNetwork = "";
 
         if (useChain === "solana") {
-          const secretKeyBytes = bs58.decode(solanaKey!);
-          const keypairSigner = await createKeyPairSignerFromBytes(secretKeyBytes);
+          // Issue #67 (req 6): fixed key-format refusals. The decode and the
+          // keypair construction are wrapped: a refusal carries EXACTLY ONE
+          // fixed message — no fragment of the key value (the raw decoder or
+          // construction error could carry the malformed value itself, and
+          // it would reach the same catch's console.error and failed ledger
+          // row). One stderr line renders the fixed text only.
+          let keypairSigner: Awaited<ReturnType<typeof createKeyPairSignerFromBytes>>;
+          try {
+            keypairSigner = await createKeyPairSignerFromBytes(bs58.decode(solanaKey!));
+          } catch (keyErr) {
+            console.error(`[x402_fetch] CONFIG_INVALID: SOLANA key must be a base58 string (not a JSON array) — the key value is never echoed anywhere`);
+            throw new Error("SOLANA key must be a base58 string (not a JSON array)");
+          }
           const svmSigner = toClientSvmSigner(keypairSigner);
           const scheme = new ExactSvmScheme(svmSigner, { rpcUrl: solanaRpc });
           payerAddress = keypairSigner.address;
@@ -853,7 +864,14 @@ export function registerFetchTool(server: McpServer): void {
           client.register(registeredNetwork as `${string}:${string}`, scheme);
 
         } else {
-          const account = privateKeyToAccount(evmKey! as `0x${string}`);
+          // Issue #67 (req 6): the same fixed-refusal wrap for the EVM key.
+          let account: ReturnType<typeof privateKeyToAccount>;
+          try {
+            account = privateKeyToAccount(evmKey! as `0x${string}`);
+          } catch (keyErr) {
+            console.error(`[x402_fetch] CONFIG_INVALID: EVM key must be 0x-prefixed hex — the key value is never echoed anywhere`);
+            throw new Error("EVM key must be 0x-prefixed hex");
+          }
           const evmSigner = toClientEvmSigner(account as any);
           // Issue #32 (R5): per-chain RPC options — BASE_RPC_URL is scoped to
           // chain 8453 ONLY (the EvmSchemeOptions by-chain-id form). Polygon /
