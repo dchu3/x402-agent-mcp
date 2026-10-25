@@ -34,6 +34,24 @@ process.env.EVM_PRIVATE_KEY = EVM_KEY;
 
 const paymentUtils = (await import('../payment-utils.js')) as typeof import('../payment-utils.js');
 const { registerInspectTool } = (await import('./inspector.js')) as typeof import('./inspector.js');
+// issue #77 — the REAL MCP surface: the SDK pieces + every tool the binary
+// registers (imported the same lazy, env-already-pinned way — some of these
+// modules read env at import time, so they load AFTER the env block above).
+const { McpServer } = (await import('@modelcontextprotocol/sdk/server/mcp.js')) as typeof import('@modelcontextprotocol/sdk/server/mcp.js');
+const { Client } = (await import('@modelcontextprotocol/sdk/client/index.js')) as typeof import('@modelcontextprotocol/sdk/client/index.js');
+const { InMemoryTransport } = (await import('@modelcontextprotocol/sdk/inMemory.js')) as typeof import('@modelcontextprotocol/sdk/inMemory.js');
+const { VERSION } = (await import('../version.js')) as typeof import('../version.js');
+const { registerSearchTool } = (await import('./search.js')) as typeof import('./search.js');
+const { registerListCategoriesTool } = (await import('./categories.js')) as typeof import('./categories.js');
+const { registerDescribeTool } = (await import('./describe.js')) as typeof import('./describe.js');
+const { registerDiscoverUrlTool } = (await import('./discover-url.js')) as typeof import('./discover-url.js');
+const { registerHealthCheckTool } = (await import('./health.js')) as typeof import('./health.js');
+const { registerBatchDiscoverTool } = (await import('./batch-discover.js')) as typeof import('./batch-discover.js');
+const { registerCrawlX402ScanTool } = (await import('./crawl-directory.js')) as typeof import('./crawl-directory.js');
+const { registerCheckPaymentTool } = (await import('./check-payment.js')) as typeof import('./check-payment.js');
+const { registerProbeAllowlistTool } = (await import('./probe-allowlist.js')) as typeof import('./probe-allowlist.js');
+const { registerStatusTool } = (await import('./status.js')) as typeof import('./status.js');
+const { registerFetchTool } = (await import('./fetch.js')) as typeof import('./fetch.js');
 
 const originalFetch = globalThis.fetch;
 let fetchCalls = 0;
@@ -379,4 +397,158 @@ it('a url that answers without a 402 is a no_402 report — nothing to inspect, 
   assert.equal(parsed.selection.code, 'NO_PAYABLE_OFFER');
   assert.equal(recorded.length, 1);
   assert.equal(recorded[0].headers['x-payment'], undefined);
+});
+
+// ---------------------------------------------------------------------------
+// Issue #77 — the REGRESSION: the input schema declared `offer` non-optional,
+// so a real MCP client passing only `{url}` never reached the handler at all
+// (`MCP error -32602: Input validation error: … expected nonoptional, received
+// undefined at offer`), and every handler-level test passed because it always
+// supplied `offer`. These tests drive the tool the way a REAL client does:
+// the same McpServer the binary builds (src/index.ts's exact registration
+// sequence) connected to an SDK `Client` over InMemoryTransport.createLinkedPair(),
+// so the call crosses the REAL input schema — not the bare handler. All three
+// mock seller whose request log is asserted in both directions.
+// ---------------------------------------------------------------------------
+
+/** One McpServer registered EXACTLY like the binary's (src/index.ts) — the
+ * same constructor ({name: 'x402-agent-mcp', version: VERSION}) and the same
+ * register sequence, so the tool's REAL zod input schema is what validates. */
+async function binaryLikeServer(): Promise<InstanceType<typeof McpServer>> {
+  const server = new McpServer({ name: 'x402-agent-mcp', version: VERSION });
+  registerSearchTool(server);
+  registerListCategoriesTool(server);
+  registerDescribeTool(server);
+  registerDiscoverUrlTool(server);
+  registerHealthCheckTool(server);
+  registerBatchDiscoverTool(server);
+  registerCrawlX402ScanTool(server);
+  registerCheckPaymentTool(server);
+  registerProbeAllowlistTool(server);
+  registerStatusTool(server);
+  registerInspectTool(server);
+  registerFetchTool(server);
+  return server;
+}
+
+/** A real SDK Client linked to one binary-like server over an in-memory
+ * pair; `disconnect` tears the pair down so no handle outlives the test. */
+async function connectClient(): Promise<{
+  client: InstanceType<typeof Client>;
+  disconnect: () => Promise<void>;
+}> {
+  const server = await binaryLikeServer();
+  const client = new Client({ name: 'issue-77-schema-client', version: '0.0.0' });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport as any);
+  await client.connect(clientTransport);
+  return { client, disconnect: async () => { await client.close(); await server.close(); } };
+}
+
+/** callTool with the failure mode EXPLICITLY named: before the fix this call
+ * rejected with `MCP error -32602: Input validation error` before the handler
+ * ever ran — the exact unreachable-path regression. */
+async function callInspect(client: InstanceType<typeof Client>, args: Record<string, unknown>): Promise<any> {
+  try {
+    return (await client.callTool({ name: 'x402_inspect', arguments: args })) as any;
+  } catch (err) {
+    assert.fail(`the call must cross the REAL input schema and reach the handler (issue #77 regression would reject with -32602): ${String((err as Error)?.message ?? err)}`);
+  }
+}
+
+it('REAL MCP schema, {url} only: passes validation, the guarded probe runs, the report comes back — never -32602', async () => {
+  const { url, recorded } = await seller((_req, res) => {
+    res.writeHead(402, {
+      'payment-required': b64url(JSON.stringify({ x402Version: 2, accepts: [BASE_USDC] })),
+    });
+    res.end('Payment Required');
+  });
+  const before = ledgerBytes();
+  const { client, disconnect } = await connectClient();
+  try {
+    const parsed = parse(await callInspect(client, { url }));
+    assert.equal(parsed.probe.kind, 'live_402', 'the url-only guarded probe ran and its outcome is reported');
+    assert.ok(Number.isFinite(parsed.probe.latency_ms));
+    assert.equal(parsed.offers.length, 1, 'the fetched challenge feeds the SAME offer evaluation');
+    assert.equal(parsed.offers[0].amount_atomic, '500000');
+    assert.equal(parsed.offers[0].amount_unit, '0.500000');
+    assert.equal(parsed.selection.chosen_index, 0);
+    assert.equal(parsed.selection.budget.verdict, 'within');
+    assert.equal(parsed.offers[0].rail_budget, undefined, 'a USD rail leg — no mote-rail verdict');
+    assert.match(String(parsed.note), /nothing was signed, reserved or paid/);
+    assert.equal(recorded.length, 1, 'exactly ONE request — the guarded probe');
+    assert.equal(recorded[0].headers['x-payment'], undefined, 'no payment header was ever sent');
+    assert.equal(recorded[0].headers['payment-signature'], undefined, 'no payment signature was ever sent');
+    assert.equal(ledgerBytes(), before, 'the ledger stays byte-identical');
+  } finally {
+    await disconnect();
+  }
+});
+
+it('REAL MCP schema, {} only: reaches the handler and returns the one clear missing-argument error, ZERO seller requests', async () => {
+  const { url, recorded } = await seller((_req, res) => {
+    res.writeHead(402, {
+      'payment-required': b64url(JSON.stringify({ x402Version: 2, accepts: [BASE_USDC] })),
+    });
+    res.end('Payment Required');
+  });
+  const before = ledgerBytes();
+  const { client, disconnect } = await connectClient();
+  try {
+    const parsed = parse(await callInspect(client, {}));
+    assert.match(String(parsed.error), /^url or offer is required/, 'one clear error naming BOTH inputs');
+    assert.equal(parsed.offers.length, 0);
+    assert.equal(parsed.selection.code, 'NO_PAYABLE_OFFER');
+    assert.match(String(parsed.note), /nothing was signed, reserved, paid or fetched/);
+    assert.equal(parsed.probe, undefined, 'no probe block — nothing was fetched either');
+    assert.equal(recorded.length, 0, 'the mock seller saw ZERO requests');
+    assert.equal(ledgerBytes(), before, 'the ledger stays byte-identical');
+  } finally {
+    await disconnect();
+  }
+});
+
+it('REAL MCP schema, {url, offer}: the offer wins and stays OFFLINE — unchanged result, ZERO seller requests', async () => {
+  const { url, recorded } = await seller((_req, res) => {
+    res.writeHead(402, {
+      'payment-required': b64url(JSON.stringify({ x402Version: 2, accepts: [BASE_USDC] })),
+    });
+    res.end('Payment Required');
+  });
+  const before = ledgerBytes();
+  const { client, disconnect } = await connectClient();
+  try {
+    const parsed = parse(await callInspect(client, { url, offer: [BASE_USDC] }));
+    assert.equal(parsed.probe, undefined, 'no probe block — the offer path makes no request');
+    assert.equal(parsed.offers.length, 1);
+    assert.equal(parsed.offers[0].amount_atomic, '500000');
+    assert.equal(parsed.offers[0].amount_unit, '0.500000');
+    assert.equal(parsed.selection.chosen_index, 0);
+    assert.equal(parsed.selection.budget.verdict, 'within', 'the offline result is today\'s, unchanged');
+    assert.match(String(parsed.note), /nothing was signed, reserved, paid or fetched/);
+    assert.equal(recorded.length, 0, 'the mock seller saw ZERO requests');
+    assert.equal(ledgerBytes(), before, 'the ledger stays byte-identical');
+  } finally {
+    await disconnect();
+  }
+});
+
+it('REAL MCP schema, malformed offer present: identical offline error text and ZERO seller requests (precedence, not validation)', async () => {
+  const { url, recorded } = await seller((_req, res) => {
+    res.writeHead(402, {
+      'payment-required': b64url(JSON.stringify({ x402Version: 2, accepts: [BASE_USDC] })),
+    });
+    res.end('Payment Required');
+  });
+  const { client, disconnect } = await connectClient();
+  try {
+    const parsed = parse(await callInspect(client, { url, offer: 'not json at all {{' }));
+    assert.equal(parsed.error, 'offer is not parseable x402 payment data (a JSON string, whole payload, accepts array or single offer object)', 'the malformed-OFFER error text is today\'s, untouched');
+    assert.equal(parsed.offers.length, 0);
+    assert.equal(parsed.selection.code, 'NO_PAYABLE_OFFER');
+    assert.equal(parsed.probe, undefined);
+    assert.equal(recorded.length, 0, 'a malformed offer still makes ZERO network calls');
+  } finally {
+    await disconnect();
+  }
 });
