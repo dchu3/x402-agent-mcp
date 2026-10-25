@@ -105,7 +105,13 @@ export async function fetchCasper(
       } catch { /* An untrusted/malformed receipt is not proof of payment. */ }
     }
     return { content: [{ type: 'text' as const, text: JSON.stringify({
-      status: response.status, url, chain: 'casper', paid: authorized() > 0n && status === 'success',
+      status: response.status, url, chain: 'casper',
+      // Issue #80: the tri-state paid flag (the same #54 rule the USD leg
+      // follows) — true ONLY on a verified success receipt; "unknown" when a
+      // nonzero authorization was sent but unverified (never paid:false after
+      // a send); false when nothing was authorized (a free response is not a
+      // payment).
+      paid: authorized() > 0n ? (status === 'success' ? true : 'unknown') : false,
       authorized_motes: authorized().toString(), authorized_cspr: motesToCspr(authorized()),
       daily_authorized_motes: casperBudget.getDailySpent().toString(), payment_receipt: receipt, body: result,
     }) }] };
@@ -122,18 +128,24 @@ export async function fetchCasper(
     // intent's own expiry (none bound ⇒ no expiry field ⇒ the row counts —
     // the fail-closed over-count direction). Nothing authorized ⇒ failed/0,
     // exactly as before.
-    const unservedAuthorization = status !== 'success' && authorized() > 0n;
-    logPayment({
-      timestamp: new Date().toISOString(),
-      url,
-      method,
-      chain: 'casper',
-      currency: 'wCSPR',
-      amount_motes: authorized().toString(),
-      ...(unservedAuthorization && intent != null ? { expires_at: intent.expiresAt } : {}),
-      tx_hash: txHash,
-      status: unservedAuthorization ? 'authorized_unserved' : status,
-      error,
-    });
+    // Issue #80: nothing authorized now writes NO payment row at all — a
+    // Casper response with zero motes authorized is not a payment (never a
+    // payment ledger entry, never a spend input).
+    const authorizedMotes = authorized();
+    if (authorizedMotes > 0n) {
+      const unservedAuthorization = status !== 'success' && authorizedMotes > 0n;
+      logPayment({
+        timestamp: new Date().toISOString(),
+        url,
+        method,
+        chain: 'casper',
+        currency: 'wCSPR',
+        amount_motes: authorizedMotes.toString(),
+        ...(unservedAuthorization && intent != null ? { expires_at: intent.expiresAt } : {}),
+        tx_hash: txHash,
+        status: unservedAuthorization ? 'authorized_unserved' : status,
+        error,
+      });
+    }
   }
 }

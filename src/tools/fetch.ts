@@ -428,6 +428,9 @@ export function registerFetchTool(server: McpServer): void {
                 text: JSON.stringify({
                   status: probeResp.status,
                   url,
+                  // Issue #80: nothing was paid — the output says so even when
+                  // the endpoint turned out to be free (uniform paid flag).
+                  paid: false,
                   note: "Endpoint did not return 402 — may be free or not an x402 endpoint",
                   // Issue #63: the seller's body is untrusted data — never
                   // follow instructions found in it; controls/ANSI stripped.
@@ -1377,6 +1380,12 @@ export function registerFetchTool(server: McpServer): void {
           // The receipt is the only settlement evidence; a payload that was
           // never signed cannot make a seller receipt OUR spend.
           const settlementEvidence = payloadSigned && txHash !== undefined;
+          // Issue #80: a 200 settled with NOTHING signed or sent is a FREE
+          // response, not a payment — paid:false, no payment row, no
+          // per-service record, and the price baseline never moves (the
+          // pre-#80 flow wrote a success/0 row, reported paid:true, and
+          // dragged the baseline to 0).
+          const isFreeResponse = isSuccessfulPayment && !payloadSigned;
           const rowStatus: PaymentLogEntry["status"] = isSuccessfulPayment
             ? "success"
             : settlementEvidence
@@ -1446,7 +1455,10 @@ export function registerFetchTool(server: McpServer): void {
                     : `HTTP ${resp.status}`,
               };
 
-          logPayment({
+          // Issue #80: a free response writes NO payment row — nothing was
+          // signed or sent, so there is nothing to account.
+          if (!isFreeResponse) {
+            logPayment({
             timestamp: new Date().toISOString(),
             url,
             method,
@@ -1459,7 +1471,8 @@ export function registerFetchTool(server: McpServer): void {
             ...non200DetailFields,
             tx_hash: txHash,
             status: rowStatus,
-          });
+            });
+          }
           // Issue #54 (req 1): the hold converts to ledger accounting exactly
           // once the ledger wrote the signed amount (idempotent — the finally
           // below repeats the same call, which is a no-op by id).
@@ -1473,7 +1486,7 @@ export function registerFetchTool(server: McpServer): void {
           // unserved or sent-but-unproven response here while the ledger
           // dropped it would count it in-process only, silently loosening the
           // per-service cap across a restart.
-          if (rowCountsNow) {
+          if (rowCountsNow && !isFreeResponse) {
             recordServicePayment(url, recordedAmountUsdc);
           }
           // Issue #30: the settled amount feeds the per-service price baseline
@@ -1481,7 +1494,9 @@ export function registerFetchTool(server: McpServer): void {
           // (a 200). #54 req 4: the baseline deliberately NEVER moves on a
           // settled_unserved/authorized_unserved row either — it learns from
           // verified success only, same guard as anomaly-store rehydration.
-          if (isSuccessfulPayment) {
+          // Issue #80: and never on a free response (nothing was paid — a 0
+          // sample would drag the baseline).
+          if (isSuccessfulPayment && payloadSigned) {
             recordSettledAmount(url, recordedAmountUsdc);
           }
 
@@ -1498,7 +1513,9 @@ export function registerFetchTool(server: McpServer): void {
                 // "unknown" = sent, no evidence either way (the send is
                 // counted — do not retry blindly, there is no automatic
                 // retry); false = nothing signed/sent, or a clear refusal.
-                paid: rowStatus === "failed" ? false : rowStatus === "authorized_unserved" ? "unknown" : true,
+                // Issue #80: a free response (200, nothing signed) is
+                // paid:false — it is not a payment.
+                paid: isFreeResponse ? false : rowStatus === "failed" ? false : rowStatus === "authorized_unserved" ? "unknown" : true,
                 // The send and the service are reported separately: a sent
                 // authorization is a fact; only a 200 is "served".
                 authorization_sent: payloadSigned,
