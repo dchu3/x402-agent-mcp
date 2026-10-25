@@ -37,10 +37,22 @@
 // diff never contains a contiguous secret-shaped assignment — the pre-push
 // security scan (scripts/pre-push-security-scan.sh, check 2) greps the pushed
 // diff and would otherwise block the guard's own commit.
+//
+// Docs-split guards D + E (added for the #73 docs restructure):
+//
+//   D. Each reference docs file (policy.md, payments.md, networks.md,
+//      operations.md) exists — the README front page links to them.
+//
+//   E. Every local (non-http) markdown link in README.md and docs/*.md
+//      resolves to a real file, so the short README's docs links and the
+//      docs' cross-links never dangle (same-page anchors and external URLs
+//      are out of scope; guards A-C above keep scanning README.md and
+//      .env.example unchanged).
 import { strict as assert } from 'node:assert';
 import { it } from 'node:test';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 
 const README = readFileSync(fileURLToPath(new URL('../README.md', import.meta.url)), 'utf8');
 const ENV_EXAMPLE = readFileSync(fileURLToPath(new URL('../.env.example', import.meta.url)), 'utf8');
@@ -182,4 +194,61 @@ it('positive + negative control (#60): the scanners demonstrably fail on retired
   assert.deepEqual(findRetiredRoutes(CLEAN_FIXTURE), [], 'the clean fixture must pass guard A');
   assert.deepEqual(findLiteralSecretAssignments(CLEAN_FIXTURE), [], 'the clean fixture must pass guard B');
   assert.deepEqual(findLiteralRpcUrls(CLEAN_FIXTURE), [], 'the clean fixture must pass guard C');
+});
+
+// ---- Docs split (#73): docs/ reference files + resolved links -----------
+
+const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url));
+const DOCS_DIR = join(REPO_ROOT, 'docs');
+const REFERENCE_DOCS = ['policy.md', 'payments.md', 'networks.md', 'operations.md'];
+
+// Matches `[text](target)` markdown links whose target has no spaces or
+// parentheses and stays on one line (the shape every link in this repo has).
+function localMarkdownLinkTargets(text: string): string[] {
+  const targets: string[] = [];
+  for (const match of text.matchAll(/\[[^\]\n]*\]\(([^()\s]+)\)/g)) {
+    const target = match[1];
+    if (/^(https?:)?\/\//i.test(target) || /^(mailto|data):/i.test(target)) continue; // external
+    if (target.startsWith('#')) continue; // same-page anchor
+    targets.push(target.split('#', 1)[0]);
+  }
+  return targets;
+}
+
+it('docs split (#73): every reference docs/ file exists with a title', () => {
+  for (const name of REFERENCE_DOCS) {
+    const path = join(DOCS_DIR, name);
+    assert.ok(existsSync(path), `docs/${name} must exist (docs referenced from the README)`);
+    const text = readFileSync(path, 'utf8');
+    assert.ok(text.startsWith('# '), `docs/${name} must open with an H1 title`);
+    assert.ok(text.trim().length > 0, `docs/${name} must not be empty`);
+  }
+});
+
+it('docs split (#73): every local markdown link in README.md and docs/*.md resolves to a real file', () => {
+  const pages: Array<[string, string, string]> = [
+    ['README.md', README, '.'],
+    ...REFERENCE_DOCS.map(
+      (name) => [`docs/${name}`, readFileSync(join(DOCS_DIR, name), 'utf8'), 'docs'] as [string, string, string],
+    ),
+  ];
+  for (const [where, text, baseDir] of pages) {
+    for (const target of localMarkdownLinkTargets(text)) {
+      const resolved = join(REPO_ROOT, baseDir, target);
+      assert.ok(
+        existsSync(resolved) && statSync(resolved).isFile(),
+        `${where} links to "${target}" which does not resolve to a real file (looked at ${resolved})`,
+      );
+    }
+  }
+});
+
+it('positive + negative control (#73): the local-link scanner filters external URLs and same-page anchors and still checks files', () => {
+  const fixture = [
+    'external [sdk](https://example.com/x) is skipped',
+    'anchor [limits](#limits) is skipped',
+    'local [env](.env.example) is checked',
+  ].join('\n');
+  assert.deepEqual(localMarkdownLinkTargets(fixture), ['.env.example']);
+  assert.equal(existsSync(join(REPO_ROOT, 'does-not-exist.md')), false);
 });
