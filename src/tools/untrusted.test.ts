@@ -132,7 +132,12 @@ it('a failing seller: error body and error header text reach the caller ONLY via
   }) as any;
   const parsed = JSON.parse((await runFetch({ url: 'https://failing-seller.invalid/api' })).content[0].text);
   assert.equal(parsed.status, 500);
-  assert.equal(parsed.paid, false);
+  // Issue #54: the signed leg WAS sent and the 500 carries no settlement
+  // evidence — the outcome is "unknown" (counted), never a bare paid: false.
+  // The #63 point of this test is below: the marker stays under untrusted.
+  assert.equal(parsed.paid, 'unknown');
+  assert.equal(parsed.authorization_sent, true);
+  assert.equal(parsed.served, false);
   // the tool's own fields carry only fixed text — the marker never appears there
   if (parsed.error) assert.ok(!parsed.error.includes(MARKER), 'error stays fixed text');
   if (parsed.message) assert.ok(!parsed.message.includes(MARKER), 'message stays fixed text');
