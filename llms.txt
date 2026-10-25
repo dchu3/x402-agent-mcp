@@ -1,0 +1,12 @@
+# x402-agent-mcp
+
+> Universal x402 agent MCP — discover and pay for any x402 endpoint on Base, Polygon, Arbitrum, Solana or Casper
+
+An MCP server that gives AI agents tools to discover x402 services, inspect a prospective payment before paying, and pay per call with an operator wallet. The short front page with install and configuration lives in [README.md](README.md).
+
+## Docs
+
+- [Payment policy engine](docs/policy.md): the gate every payment passes — decisions, stable reason codes, the fixed rule order, trust levels, and the recipients, price-anomaly and endpoint-liveness gates
+- [Payments, budgets and the ledger](docs/payments.md): spend accounting, the budget rails and the optional cross-chain ceiling, the payment ledger and its reservations, the payment-intent boundary, and trust in settlement receipts
+- [Networks, chains and network mode](docs/networks.md): the chain and CAIP-2 asset matrices, the explicit no-default `X402_NETWORK_MODE` rule, devnet, Casper, and USD pricing
+- [Operations — usage, directory refresh, CI and security](docs/operations.md): usage examples, the endpoint directory and its refresh recipes, agent-client configuration, development and CI, the pre-push security scan, roadmap, tech stack

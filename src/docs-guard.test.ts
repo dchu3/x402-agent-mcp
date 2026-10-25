@@ -50,7 +50,7 @@
 //      .env.example unchanged).
 import { strict as assert } from 'node:assert';
 import { it } from 'node:test';
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 
@@ -297,5 +297,21 @@ it('metadata (#73): LICENSE matches the standard MIT template', () => {
   assert.ok(license.startsWith(MIT_TEMPLATE_HEAD), 'LICENSE must start with the standard MIT template head');
   for (const phrase of MIT_TEMPLATE_BODY_PHRASES) {
     assert.ok(license.includes(phrase), `LICENSE must carry the standard MIT template phrase: ${phrase}`);
+  }
+});
+
+// ---- Agent discovery (#73): llms.txt references the whole docs/ tree ----
+
+it('discovery (#73): README and llms.txt reference every docs/ file', () => {
+  const readme = readFileSync(join(REPO_ROOT, 'README.md'), 'utf8');
+  const llms = readFileSync(join(REPO_ROOT, 'llms.txt'), 'utf8');
+  assert.ok(readme.startsWith('# x402-agent-mcp'), 'README must still be the project front page');
+  assert.ok(llms.startsWith('# x402-agent-mcp'), 'llms.txt must open with the H1 title');
+  const docFiles = readdirSync(DOCS_DIR).filter((name) => name.endsWith('.md')).sort();
+  assert.ok(docFiles.length >= 4, 'docs/ must contain the reference files');
+  for (const name of docFiles) {
+    const rel = `docs/${name}`;
+    assert.ok(readme.includes(rel), `README must reference ${rel}`);
+    assert.ok(llms.includes(rel), `llms.txt must reference ${rel}`);
   }
 });
