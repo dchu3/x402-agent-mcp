@@ -317,4 +317,10 @@ export interface PolicyEngineState {
    * parse error (the engine fails closed regardless). Optional only because
    * hand-built fixtures construct states without one. */
   profile?: PolicyProfile;
+  /** Post-merge review (#86): set ONLY when the X402_POLICY_PROFILE resolution
+   * itself failed — the verbatim resolver message, also present in configErrors.
+   * Reporting surfaces must render profile "invalid" (never the fail-closed
+   * fallback "strict", which an operator cannot tell apart from a deliberate
+   * choice); the fail-closed engine behaviour is unchanged. */
+  profileError?: string;
 }

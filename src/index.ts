@@ -22,10 +22,15 @@ import { registerInspectTool } from "./tools/inspector.js";
 import { resolveNetworkMode, solanaRpcHostForMode } from "./networks.js";
 import { assetTableSummary } from "./assets.js";
 // Issue #66 (stage A, req 1/4): the startup log names the active policy
-// profile, and with the permissive default a second line warns that unknown
-// services are payable up to the global caps and names the tightening
-// switch. DEFAULT_POLICY_PROFILE is what the warning keys on.
-import { DEFAULT_POLICY_PROFILE, resolvePolicyProfile } from "./policy/profile.js";
+// profile. Post-merge review (#86): the lines derive from the EFFECTIVE policy
+// state (the same loadPolicyConfig output the engine consumes) instead of
+// resolvePolicyProfile alone — an invalid X402_POLICY_PROFILE reports itself
+// as invalid (with the resolver message), and a POLICY_CONFIG_PATH file that
+// tightened services.unknown is announced instead of the blanket permissive
+// warning. The lines themselves are pure and unit-tested in
+// src/policy/startup.ts / startup.test.ts.
+import { loadPolicyConfig } from "./policy/config.js";
+import { profileStartupLines } from "./policy/startup.js";
 import { VERSION } from "./version.js";
 // Issue #80 (R1d): startup fail-fast on an invalid timeout configuration —
 // the parsers fail closed (RangeError) at CALL time; validating them here, on
@@ -77,26 +82,21 @@ const solanaRpcHost = networkModeState.mode
   ? solanaRpcHostForMode(networkModeState.mode)
   : "";
 const assetTable = assetTableSummary();
-// Issue #66 (stage A): the same env-time resolution loadPolicyConfig uses —
-// the log line never disagrees with the engine state built from it.
-const activeProfile = resolvePolicyProfile();
+// Post-merge review (#86): ONE load — the profile report below sees exactly
+// the state the engine would build from this same env/file (loadPolicyConfig
+// deliberately re-reads env/config on every call, never memoised).
+const policyState = loadPolicyConfig();
 console.error(
   `x402-agent-mcp v${VERSION} | network_mode=${networkModeForLog}` +
   (networkModeState.error ? ` — NETWORK_NOT_CONFIGURED: paid tools refuse until X402_NETWORK_MODE is set` : "") +
   ` | solana_rpc_host=${solanaRpcHost || "(inactive)"}` +
-  ` | assets=${assetTable.table_entries} entries on [${assetTable.networks.join(", ")}]` +
-  ` | policy_profile=${activeProfile.profile}`,
+  ` | assets=${assetTable.table_entries} entries on [${assetTable.networks.join(", ")}]`,
 );
-// Issue #66 (stage A, req 4): the permissive default is TODAY's behavior, so
-// it must be announced, not silent — unknown services are payable up to the
-// global caps, and X402_POLICY_PROFILE=strict|standard is the shipped
-// tightening switch. One extra stderr line, visible exactly once at startup.
-// (Stage B/C — flipping the DEFAULT — is a later release; this warning is
-// the "A now" half of the recorded A+B blend.)
-if (activeProfile.profile === DEFAULT_POLICY_PROFILE) {
-  console.error(
-    `policy_profile=permissive: unknown services are payable up to the global caps — tighten with X402_POLICY_PROFILE=strict or X402_POLICY_PROFILE=standard (a POLICY_CONFIG_PATH file overrides the profile)`,
-  );
+// The profile lines, one stderr line each (the first line IS the log line
+// every operator greps for; the permissive warning / invalid-profile error
+// follow when the effective state calls for them):
+for (const line of profileStartupLines(policyState)) {
+  console.error(line);
 }
 
 const transport = new StdioServerTransport();

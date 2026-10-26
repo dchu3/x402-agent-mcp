@@ -204,8 +204,14 @@ export function registerCheckPaymentTool(server: McpServer): void {
         // Issue #66 (stage A, req 1): the active policy profile beside
         // trust_level — reported from the loaded state (no second env read
         // at this call site). With X402_POLICY_PROFILE unset this is the
-        // stage-A default "permissive".
-        policy_profile: policyState.profile ?? DEFAULT_POLICY_PROFILE,
+        // stage-A default "permissive"; post-merge review (#86): a value that
+        // failed resolution is reported as "invalid" (+ policy_profile_error,
+        // the resolver message) — never as the fail-closed fallback "strict",
+        // which an operator cannot tell apart from a deliberate choice.
+        policy_profile: policyState.profileError !== undefined
+          ? "invalid"
+          : (policyState.profile ?? DEFAULT_POLICY_PROFILE),
+        ...(policyState.profileError !== undefined ? { policy_profile_error: policyState.profileError } : {}),
         // Issue #34: echo the endpoint liveness verdict the gate saw (rule
         // 4.7) — computed in buildPolicyContext from the directory row +
         // liveness config — so an agent can inspect pin/probe state BEFORE
