@@ -40,7 +40,7 @@
 import { readFileSync } from "fs";
 import { PolicyEngine } from "./engine.js";
 import { DEFAULT_ANOMALY_CONFIG } from "./anomaly.js";
-import { applyProfileDefaults, resolvePolicyProfile } from "./profile.js";
+import { applyProfileDefaults, capTrustForProfile, resolvePolicyProfile } from "./profile.js";
 import { DEFAULT_FACILITATOR_NETWORKS } from "../evm/networks.js";
 import { findEntryForUrl, loadDirectory } from "../directory.js";
 import { livenessVerdict } from "./liveness.js";
@@ -922,6 +922,14 @@ export function buildPolicyContext(
   } catch {
     service = "";
   }
+  // Issue #66 (stage A, requirement 6): the active profile caps the derived
+  // level — in strict/standard a directory row never raises trust above
+  // UNKNOWN (an explicit POLICY_TRUSTED_HOSTS entry keeps TRUSTED; BLOCKED
+  // is untouched). With the variable unset (permissive) the level passes
+  // through byte-identical. resolvePolicyProfile() is the same env-time
+  // resolution loadPolicyConfig performs, so the capped level always matches
+  // the engine state that evaluates the context.
+  const { profile } = resolvePolicyProfile();
   return {
     service,
     chain,
@@ -932,6 +940,11 @@ export function buildPolicyContext(
     ...(opts.purpose !== undefined ? { purpose: opts.purpose } : {}),
     ...(opts.agentContext !== undefined ? { agentContext: opts.agentContext } : {}),
     endpointLiveness: computeEndpointLiveness(url, opts.now),
-    trustLevel: resolveTrustLevel(service),
+    trustLevel: capTrustForProfile(
+      resolveTrustLevel(service),
+      service,
+      profile,
+      (host) => envHostList("POLICY_TRUSTED_HOSTS").has(host),
+    ),
   };
 }

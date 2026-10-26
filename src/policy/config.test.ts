@@ -3,7 +3,7 @@ import { afterEach, after, it } from 'node:test';
 import { mkdtempSync, writeFileSync, rmSync, chmodSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { loadPolicyConfig, getPolicyEngine, resolveTrustLevel, DEFAULT_POLICY_CONFIG, defaultPolicyConfig } from './config.js';
+import { loadPolicyConfig, getPolicyEngine, resolveTrustLevel, buildPolicyContext, DEFAULT_POLICY_CONFIG, defaultPolicyConfig } from './config.js';
 import type { PolicyConfig } from './types.js';
 import { clearDirectoryCache } from '../directory.js';
 
@@ -930,4 +930,53 @@ it("#66: X402_POLICY_* env still wins over the file AND the profile (profile < f
   assert.deepEqual(state.configErrors, []);
   assert.equal(state.config.payments.maxPerRequest, 1.5, 'env override beats both the file and the profile');
   assert.equal(state.config.payments.maxDaily, 20, 'file value stands where env is silent — above the profile line');
+});
+
+// ---------------------------------------------------------------------------
+// Issue #66 stage A — requirement 6: directory rows never raise trust above
+// unknown in strict/standard. Permissive (the default) stays byte-identical
+// to today's derivation.
+// ---------------------------------------------------------------------------
+
+function directoryWith(baseUrl: string): string {
+  const p = join(tempDir(), 'endpoints.json');
+  writeFileSync(p, JSON.stringify({
+    endpoints: [{
+      name: 'DirSvc', description: '', base_url: baseUrl, chain: 'base', category: 'api', tags: [],
+      endpoints: [{ path: '/x', method: 'POST', price_usdc: '0.01', description: '' }],
+      source: 'seed',
+    }],
+    categories: [], last_updated: '2026-01-01',
+  }), 'utf8');
+  return p;
+}
+
+it("#66: a directory host is DISCOVERED under the permissive default and demoted to UNKNOWN under strict/standard", () => {
+  process.env.X402_DIRECTORY_PATH = directoryWith('https://dirsvc.example');
+  clearDirectoryCache();
+  delete process.env.X402_POLICY_PROFILE;
+  assert.equal(buildPolicyContext('https://dirsvc.example/x', 'base', 'USDC', 0.01).trustLevel, 'DISCOVERED', 'permissive: today\'s derivation, byte-identical');
+  process.env.X402_POLICY_PROFILE = 'strict';
+  assert.equal(buildPolicyContext('https://dirsvc.example/x', 'base', 'USDC', 0.01).trustLevel, 'UNKNOWN', 'strict: directory membership raises no trust');
+  process.env.X402_POLICY_PROFILE = 'standard';
+  assert.equal(buildPolicyContext('https://dirsvc.example/x', 'base', 'USDC', 0.01).trustLevel, 'UNKNOWN', 'standard: directory membership raises no trust');
+});
+
+it("#66: a POLICY_TRUSTED_HOSTS host stays TRUSTED under strict — the explicit policy entry exception", () => {
+  process.env.X402_DIRECTORY_PATH = directoryWith('https://dirsvc.example');
+  clearDirectoryCache();
+  process.env.POLICY_TRUSTED_HOSTS = 'dirsvc.example';
+  process.env.X402_POLICY_PROFILE = 'strict';
+  assert.equal(buildPolicyContext('https://dirsvc.example/x', 'base', 'USDC', 0.01).trustLevel, 'TRUSTED');
+});
+
+it("#66: POLICY_BLOCKED_HOSTS stays BLOCKED in every profile", () => {
+  process.env.X402_DIRECTORY_PATH = directoryWith('https://dirsvc.example');
+  clearDirectoryCache();
+  process.env.POLICY_BLOCKED_HOSTS = 'dirsvc.example';
+  for (const profile of ['permissive', 'strict', 'standard', undefined]) {
+    if (profile === undefined) delete process.env.X402_POLICY_PROFILE;
+    else process.env.X402_POLICY_PROFILE = profile;
+    assert.equal(buildPolicyContext('https://dirsvc.example/x', 'base', 'USDC', 0.01).trustLevel, 'BLOCKED', `profile=${profile ?? 'unset'}`);
+  }
 });

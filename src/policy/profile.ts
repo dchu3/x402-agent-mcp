@@ -15,7 +15,7 @@
 // (loadPolicyConfig) fails closed with that error in configErrors, so the
 // value is irrelevant, and "strict" guarantees no code path can read
 // "permissive" off a bad value.
-import type { PolicyConfig } from "./types.js";
+import type { PolicyConfig, TrustLevel } from "./types.js";
 
 export type PolicyProfile = "strict" | "standard" | "permissive";
 
@@ -108,4 +108,26 @@ export function applyProfileDefaults(config: PolicyConfig, profile: PolicyProfil
   // The cap line: a profile never rides an operator's raised legacy env caps.
   config.payments.maxPerRequest = Math.min(config.payments.maxPerRequest, LEGACY_DEFAULT_MAX_PER_REQUEST);
   config.payments.maxDaily = Math.min(config.payments.maxDaily, LEGACY_DEFAULT_MAX_DAILY);
+}
+
+/** Issue #66 requirement 6, stage A — STRICT/STANDARD ONLY (the permissive
+ * default must stay byte-identical, which is exactly why this lives beside
+ * the profile and not inside resolveTrustLevel): a directory row may never
+ * RAISE trust above UNKNOWN. DISCOVERED → UNKNOWN unless the host is an
+ * explicit operator allowlist entry (POLICY_TRUSTED_HOSTS); every other
+ * level passes through untouched — BLOCKED stays BLOCKED in every profile,
+ * TRUSTED stays TRUSTED (resolveTrustLevel already answers those from the
+ * env lists; the `trustedHosts` callback keeps the exception explicit so
+ * the cap can never demote an operator-managed entry), and VERIFIED/UNKNOWN
+ * are unaffected (resolveTrustLevel never returns VERIFIED — no reputation
+ * system).
+ *
+ * Called from buildPolicyContext so BOTH paying callers (x402_fetch and
+ * x402_check_payment) see the same capped level; the engine consumes the
+ * capped level unchanged (services.unknown / services.discovered as the
+ * profile configured them). */
+export function capTrustForProfile(level: TrustLevel, serviceHost: string, profile: PolicyProfile, trustedHosts: (host: string) => boolean): TrustLevel {
+  if (profile === "permissive") return level;
+  if (level === "DISCOVERED" && !trustedHosts(serviceHost)) return "UNKNOWN";
+  return level;
 }
