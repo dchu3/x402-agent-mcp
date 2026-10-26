@@ -536,3 +536,76 @@ it('positive + negative control (#60): the guard G scanner fails on lookalike ad
   ].join('\n');
   assert.deepEqual(findUndocumentedAddressMaterial(CLEAN), [], 'allowlisted + placeholder shapes must pass');
 });
+// ---- Guard H (#87): no issue references or history notes in public docs --
+//
+// The public docs state CURRENT behaviour only. History-shaped prose (issue
+// cross-references, requirement numbers, stage labels, release-note wording,
+// "previously/formerly" notes) rots the moment the code changes and is what
+// #87 flagged across README.md, docs/*.md and .env.example: the rule must be
+// stated, the change-log flavor dropped. Scanned: README.md, every docs/*.md
+// and .env.example. Source comments are out of scope (they may keep issue
+// references — this guard pins the PUBLIC pages only). Guards A-G above are
+// untouched.
+const GUARD_H_TOKENS: ReadonlyArray<[string, RegExp]> = [
+  ['issue reference', /[Ii]ssues? #[0-9]+/],
+  ['issue reference', /\(#[0-9]+\)/],
+  ['requirement number', /\(?req(?:uirement)? [0-9]+\)?/],
+  ['stage label', /[Ss]tage [A-C]\b/],
+  ['release-note wording', /BREAKING CHANGE/],
+  ['history note', /[Pp]reviously/],
+  ['history note', /[Ff]ormerly/],
+  ['history note', /before chain-scoping/],
+  ['history note', /old payment_info/],
+  ['history note', /once dragged/],
+  ['history note', /hardcoded 30 s/],
+  ['history note', /Today's behavio/],
+];
+
+function findGuardHViolations(text: string): string[] {
+  const violations: string[] = [];
+  for (const [label, re] of GUARD_H_TOKENS) {
+    if (re.test(text)) violations.push(label);
+  }
+  return violations;
+}
+
+const GUARD_H_PAGES: ReadonlyArray<[string, string]> = [
+  ['README.md', README],
+  ['.env.example', ENV_EXAMPLE],
+  ...readdirSync(DOCS_DIR).filter((n) => n.endsWith('.md')).map(
+    (n) => [`docs/${n}`, readFileSync(join(DOCS_DIR, n), 'utf8')] as [string, string],
+  ),
+];
+
+it('guard H (#87): README.md, docs/*.md and .env.example state current behaviour only — no issue references or history notes', () => {
+  for (const [where, text] of GUARD_H_PAGES) {
+    assert.deepEqual(
+      findGuardHViolations(text),
+      [],
+      `${where}: issue cross-references, requirement/stage labels, release-note wording and history notes ("previously"/"formerly") must not appear in the public docs — state the current behaviour and keep the rule`,
+    );
+  }
+});
+
+it('positive + negative control (#87): the guard H scanner fails on every token class and passes current-behaviour phrasing', () => {
+  // Assembled so each token class is exercised; the fragments are ordinary
+  // prose tokens (nothing secret-shaped), so direct strings are fine here.
+  const BAD = [
+    'added in issue ' + '#86' + ' (see ' + '(' + '#87' + '))',
+    'req ' + '2' + ' of the rollout, requirement ' + '3' + ' for casper',
+    'Stage ' + 'A' + ' shipped it — BREAKING ' + 'CHANGE:',
+    'Previously the flow estimated; formerly it fell back',
+    'an old ' + 'payment_info' + ' echo once ' + 'dragged' + ' baselines to zero (a once-d' + 'ragged baseline…)',
+    'a hardcoded ' + '30 s' + ' literal; Today' + "'" + 's behavio' + 'ur row',
+    'before chain-' + 'scoping the vocabulary was one chain',
+  ].join('\n');
+  assert.equal(findGuardHViolations(BAD).length, GUARD_H_TOKENS.length, 'every token class must be flagged');
+
+  const CLEAN = [
+    'With the variable unset the profile is permissive.',
+    'A bare recipients entry is scoped to base and never authorises the same address on polygon.',
+    'Directory membership is not proof of liveness; refresh with the probe tool.',
+    'X402_POLICY_PROFILE=strict|standard|permissive',
+  ].join('\n');
+  assert.deepEqual(findGuardHViolations(CLEAN), [], 'current-behaviour phrasing must pass');
+});
