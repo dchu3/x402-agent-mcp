@@ -66,7 +66,7 @@ Precedence is fail-closed: `BLOCKED` > `TRUSTED` > directory > `UNKNOWN`. Per-le
 
 ### Configuration
 
-JSON via `POLICY_CONFIG_PATH` (no new dependencies), with `X402_POLICY_*` env overrides. A complete, commented, validated example lives in [`policy.example.json`](../policy.example.json) (usage notes: [`policy.example.README.md`](../policy.example.README.md)) — copy it, edit it, and point `POLICY_CONFIG_PATH` at it; `node scripts/validate-policy-example.mjs` proves it loads clean and behaves as documented. Precedence: `MAX_PAYMENT_PER_CALL` / `MAX_DAILY_SPEND` (the legacy defaults) < config file < env overrides.
+JSON via `POLICY_CONFIG_PATH` (no new dependencies), with `X402_POLICY_*` env overrides. A complete, commented, validated example lives in [`policy.example.json`](../policy.example.json) (usage notes: [`policy.example.README.md`](../policy.example.README.md)) — copy it, edit it, and point `POLICY_CONFIG_PATH` at it; `node scripts/validate-policy-example.mjs` proves it loads clean and behaves as documented. Precedence: `MAX_PAYMENT_PER_CALL` / `MAX_DAILY_SPEND` (the legacy defaults) < the `X402_POLICY_PROFILE` overlay (see Profiles below) < config file < env overrides.
 
 ```json
 {
@@ -102,6 +102,18 @@ The example above **is** the behavior-compat default: non-directory hosts are pa
   }
 }
 ```
+
+#### Profiles — `X402_POLICY_PROFILE` (issue #66, stage A)
+
+Three **operator opt-in** profiles ship on top of the defaults; `X402_POLICY_PROFILE` (`strict` | `standard` | `permissive`, exact lowercase match) selects one. The variable is unset by default and the default profile is **`permissive`** — exactly the behavior-compat default above; nothing changes until an operator opts in, and the startup log names the active profile (with the permissive default it warns that any endpoint is payable up to the global caps). An unrecognized value fails closed: the engine lands in the payments-disabled error state (`CONFIG_INVALID`, payments refused) — free tools are unaffected.
+
+| Profile | Effect |
+|---------|--------|
+| `permissive` (default) | Today's behavior, unchanged: every service payable at the global caps, all gates inactive by construction. |
+| `standard` | Non-directory hosts stay payable only at or below a **USD 0.05 per-request** line (written as `services.unknown.maxPerRequest`), directory membership raises no trust (directory rows are capped to that same unknown treatment), and the price-anomaly gate turns on. |
+| `strict` | Non-directory hosts are refused outright and directory membership raises no trust either — both land on `services.unknown: deny`, so without an explicit `POLICY_TRUSTED_HOSTS` entry nothing is payable; the recipient gate flips to **allowlist** mode (an empty list denies every recipient — list your payees via the config file), the price-anomaly gate turns on, and a USD 0.05 per-request cap is written on `services.discovered` as defense in depth. |
+
+Precedence is unchanged and **a policy file always wins over the profile**: profile < `POLICY_CONFIG_PATH` file < `X402_POLICY_*` env overrides. Every profile cap is `min()`-ed against the legacy caps — a profile never raises a cap. Flipping the DEFAULT to `standard` or `strict` (the issue's stage B/C rollout) is a future release; this stage explicitly keeps `permissive` as the unset default.
 
 **Recipients.** The `recipients` block gates *who* may be paid — rule 4.5 emits `RECIPIENT_NOT_ALLOWED`. Comparison happens on the **normalized (canonical)** recipient, chain-aware: EVM `0x…` addresses are compared case-insensitively against their EIP-55-valid spelling (a wrong-checksum spelling is not repaired — it is unusable) on **every** EVM chain in the vocabulary (`base`, `polygon`, `arbitrum`, `base-sepolia`, any `eip155:*` id), Solana wallets as the canonical 32-byte base58 re-encoding, Casper payTo as `00` + 64 hex with an optional `account-hash-` prefix stripped. Formatting can therefore never bypass or break the gate. Entries are **chain-scoped**: `"polygon:0x…"` matches only on polygon, `"*:0x…"` on any chain, and a **bare** entry (no qualifier) is the legacy unqualified form scoped to **base** — before chain-scoping, base was the only EVM chain in the vocabulary, so an existing bare Base approval keeps exactly its old meaning and can never silently authorise the same `0x…` address on Polygon. An entry with an unrecognised qualifier is unusable (fail closed). Two modes:
 
