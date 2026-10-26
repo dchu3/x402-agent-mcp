@@ -889,3 +889,45 @@ it("#66: an invalid profile value fails closed — configErrors non-empty, payme
   // Free tools never consult the policy config — the failure is confined to
   // the payment path by construction (this suite imports no paying code).
 });
+
+// ---------------------------------------------------------------------------
+// Issue #66 stage A — requirement 7: a policy file ALWAYS overrides the
+// profile. The full chain (config.ts decision 3, extended):
+//   legacy env (default source) < profile overlay < POLICY_CONFIG_PATH < X402_POLICY_*.
+// ---------------------------------------------------------------------------
+
+it("#66: a policy file overrides the profile — services re-take the file's content", () => {
+  process.env.X402_POLICY_PROFILE = 'strict';
+  process.env.POLICY_CONFIG_PATH = configFile('file-over-profile.json', validFileJson({
+    services: { unknown: { action: 'allow' }, discovered: { action: 'allow', maxPerRequest: 0.25 } },
+    recipients: { mode: 'change-detect' },
+  }));
+  const state = loadPolicyConfig();
+  assert.deepEqual(state.configErrors, []);
+  assert.equal(state.config.services.unknown.action, 'allow', 'the file re-allows unknown hosts over the strict profile deny');
+  assert.equal(state.config.services.discovered.maxPerRequest, 0.25, 'the file cap wins over the strict profile cap');
+  assert.equal(state.config.recipients.mode, 'change-detect', 'the file reverts the strict allowlist mode');
+});
+
+it("#66: a policy file's caps win over the profile caps", () => {
+  process.env.X402_POLICY_PROFILE = 'strict';
+  process.env.POLICY_CONFIG_PATH = configFile('file-caps.json', validFileJson({
+    payments: { enabled: true, maxPerRequest: 2, maxDaily: 20 },
+  }));
+  const state = loadPolicyConfig();
+  assert.deepEqual(state.configErrors, []);
+  assert.equal(state.config.payments.maxPerRequest, 2);
+  assert.equal(state.config.payments.maxDaily, 20);
+});
+
+it("#66: X402_POLICY_* env still wins over the file AND the profile (profile < file < env)", () => {
+  process.env.X402_POLICY_PROFILE = 'strict';
+  process.env.POLICY_CONFIG_PATH = configFile('env-over-file.json', validFileJson({
+    payments: { enabled: true, maxPerRequest: 2, maxDaily: 20 },
+  }));
+  process.env.X402_POLICY_MAX_PER_REQUEST = '1.5';
+  const state = loadPolicyConfig();
+  assert.deepEqual(state.configErrors, []);
+  assert.equal(state.config.payments.maxPerRequest, 1.5, 'env override beats both the file and the profile');
+  assert.equal(state.config.payments.maxDaily, 20, 'file value stands where env is silent — above the profile line');
+});
