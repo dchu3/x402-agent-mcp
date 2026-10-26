@@ -831,8 +831,10 @@ it("#66: standard keeps unknown hosts payable only under the low per-call price 
   assert.equal(state.config.services.unknown.action, 'allow');
   assert.equal(state.config.services.unknown.maxPerRequest, 0.05);
   assert.equal(state.config.anomaly.enabled, true);
-  // recipients stays change-detect in standard (allowlist is strict-only)
-  assert.equal(state.config.recipients.mode, 'change-detect');
+  // Post-merge review (#86): standard is "otherwise like strict" — the
+  // recipient gate flips to allowlist here too, so the first payment to a new
+  // recipient is refused until the operator lists payees (no approval channel).
+  assert.equal(state.config.recipients.mode, 'allowlist');
 });
 
 it("#66: anomaly.enabled is turned on only INSIDE strict/standard — never in the permissive default", () => {
