@@ -194,6 +194,46 @@ direct `node --test "dist-test/**/*.test.js"` (glob) form only expands from
 Node ≥ 21, so on Node 20 it matches no files — the explicit list runs
 identically on Node 20 and newer.
 
+The suite is **hermetic by default**: tests talk to loopback or in-process
+mocks (exactly the hosts `X402_ALLOW_PRIVATE_HOSTS` lets through), write
+every state file into a `mkdtemp` temp path (`X402_DIRECTORY_PATH`,
+`PAYMENT_LOG_PATH`), touch no network beyond that loopback, and sign with
+wallet keys that are either generated at runtime — thrown away with the
+temp directory when the suite ends — or fixed dummy values (e.g.
+`'11'.repeat(32)` in the Casper fixtures). Nothing in `npm test` reaches
+a public chain.
+
+**Optional devnet smoke (never part of `npm test`).** The one way to watch
+the payment flow settle for real without touching mainnet is devnet mode
+against the x402 lab devnet ([networks.md](networks.md)) with a key that
+holds no real value:
+
+```bash
+X402_NETWORK_MODE=devnet
+SOLANA_PRIVATE_KEY=<THROWAWAY_DEVNET_KEY>       # generated, never a mainnet key
+# SOLANA_DEVNET_RPC_URL=<DEVNET_RPC_URL>        # optional; the public SDK devnet RPC is the fallback
+```
+
+Add the devnet network to the policy's `networks.allowed`, then make one
+small paid call, e.g. `x402_fetch({ url: "<DEVNET_ENDPOINT_URL>" })`
+against the lab seller, and check the ledger: the row must carry the devnet
+network id in `network`, spend must land in the devnet bucket, and the
+fund-from-faucet wallet (`<DEVNET_TEST_WALLET>` if you name it anywhere)
+must be the throwaway — never a key that holds value.
+
+**No real addresses or keys in tests, fixtures, docs or examples.** Every
+address-shaped value that is not already-documented public infra (the
+devnet ids in networks.md) must be an angle-bracket placeholder, written
+so a copy-paste can never carry value. Two automated checks guard that
+rule, on different material. The
+[pre-push security scan](#pre-push-security-scan) below blocks a push
+whose diff carries key material or secret-shaped assignments — it never
+matches wallet addresses. A 40-hex EVM address or a 32-44 character
+base58 address is caught only by guard G in `src/docs-guard.test.ts`,
+which reads README.md and docs/*.md and nothing else — tests and
+fixtures carry no automated address check, so keep them valueless by
+construction.
+
 ### CI
 
 `.github/workflows/ci.yml` builds and tests on Node 20 and 22, installs with

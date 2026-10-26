@@ -331,3 +331,208 @@ it('discovery (#73): README and llms.txt reference every docs/ file', () => {
     assert.ok(llms.includes(rel), `llms.txt must reference ${rel}`);
   }
 });
+
+// ---- Guard F (#60 stage 2-3): trust-boundary claims stay tied to proofs --
+//
+// The payments doc's redirect/size-bounds paragraph must keep every claim
+// tied to the code it names — structurally, not by quoting prose:
+//
+//   1. Redirect refusal is scoped to the SHARED guard, never to Casper only.
+//      The one measured narrow claim ("… and Casper redirects are refused",
+//      retired with the docs correction) must never come back;
+//   2. the paragraph names the exact redirect modes the code uses:
+//      `redirect: "manual"` (src/transport/guard.ts rebuilds every foreign
+//      Request with it; the signed paid leg passes it in its own init —
+//      src/tools/fetch.ts) and `redirect: "error"` (the Casper leg —
+//      src/tools/casper-fetch.ts);
+//   3. the claims are backed by the suites that assert them. MEASURED on
+//      master@410475d: the 3xx refusals (REDIRECT_REFUSED) are pinned in
+//      guarded-fetch.test.ts (guard + every tool-shaped path),
+//      probe-utils.test.ts (shared probe utils) and inspector.test.ts; the
+//      guard's other refusals (private hosts) live in guard.test.ts, which
+//      carries NO redirect assertion — so guard F requires the redirect
+//      token only from the files that actually assert it.
+
+const PAYMENTS_DOC = readFileSync(join(DOCS_DIR, 'payments.md'), 'utf8');
+
+// The retired narrow scoping — redirect refusal pinned to one chain — is the
+// claim guard F exists to keep out.
+const NARROW_REDIRECT_CLAIM = 'Casper redirects are refused';
+
+// Structural tokens straight from the guard and leg implementations.
+const SHARED_GUARD_REDIRECT_TOKENS = ['redirect: "manual"', 'redirect: "error"'] as const;
+
+// Returns the narrow-scope violations: the retired claim found again, or a
+// shared-guard token missing.
+function findNarrowRedirectScope(text: string): string[] {
+  const violations: string[] = [];
+  if (text.includes(NARROW_REDIRECT_CLAIM)) violations.push(NARROW_REDIRECT_CLAIM);
+  for (const token of SHARED_GUARD_REDIRECT_TOKENS) {
+    if (!text.includes(token)) violations.push(`missing ${token}`);
+  }
+  return violations;
+}
+
+// Each [file, tokens] pair must exist and contain every token — the docs
+// claims are only as true as the test file that asserts them.
+const CLAIM_PROVER_FILES: ReadonlyArray<[string, readonly string[]]> = [
+  // The guard's refusal matrix: private-host/refusal codes (the guard.test.ts
+  // half of the proof; the 3xx half lives in guarded-fetch.test.ts below).
+  ['src/transport/guard.test.ts', ['PRIVATE_HOST_REFUSED']],
+  // Guard-driven 3xx refusal on the tool-shaped paths: probe, health, crawl,
+  // shared probe utils — the "every payment path" claim.
+  ['src/transport/guarded-fetch.test.ts', ['REDIRECT_REFUSED']],
+  // The probe surface's own caps: header > 64 KiB refused, header-less 402
+  // body bounded (PAYMENT_REQUIRED_BODY_CAP), redirects refused there too.
+  ['src/tools/probe-utils.test.ts', ['REDIRECT_REFUSED', 'Payment header exceeds size limit', 'Payment response exceeds size limit']],
+  // x402_inspect renders the paid path's own cap wording as refusals.
+  ['src/tools/inspector.test.ts', ['REDIRECT_REFUSED', 'Payment response exceeds size limit']],
+  // The paid body's 1 MiB bound surfacing as a counted authorized_unserved row.
+  ['src/tools/fetch-paid-limits.test.ts', ['authorized_unserved']],
+  // The Casper leg's streamed-body cap is 64 KiB — boundedText's 65536-byte
+  // default in src/tools/casper-fetch.ts, NOT the 1 MiB paid-body cap.
+  ['src/tools/casper-fetch.test.ts', ['size limit']],
+];
+
+// Identifier-level pin matching the table's style: docs/payments.md must keep
+// naming the Casper streamed-body cap as the code's own number — boundedText's
+// default limit of 65536 bytes (= 64 KiB) in src/tools/casper-fetch.ts — so
+// the 1 MiB USD-rail paid-body cap can never stand in for it.
+const CASPER_STREAMED_BODY_CAP_TOKEN = '65536';
+
+function missingClaimProofs(root: string, files: ReadonlyArray<[string, readonly string[]]>): string[] {
+  const gaps: string[] = [];
+  for (const [rel, tokens] of files) {
+    const path = join(root, rel);
+    if (!existsSync(path)) {
+      gaps.push(`${rel}: missing file`);
+      continue;
+    }
+    const text = readFileSync(path, 'utf8');
+    for (const token of tokens) {
+      if (!text.includes(token)) gaps.push(`${rel}: proof token not asserted: ${token}`);
+    }
+  }
+  return gaps;
+}
+
+it('guard F (#60): docs/payments.md scopes redirect refusal to the shared guard and names the code\'s redirect modes', () => {
+  assert.deepEqual(
+    findNarrowRedirectScope(PAYMENTS_DOC),
+    [],
+    'redirect refusal must be scoped to the shared guard (redirect: "manual" + the Casper leg\'s redirect: "error"), never to Casper only',
+  );
+});
+
+it('guard F (#60): every trust-boundary claim in docs/payments.md is proven by the suite file that asserts it', () => {
+  assert.deepEqual(
+    missingClaimProofs(REPO_ROOT, CLAIM_PROVER_FILES),
+    [],
+    'the redirect/size-bounds claims must keep their proving test files (and the exact asserted tokens) in the suite',
+  );
+});
+
+it('guard F (#60): docs/payments.md states the Casper streamed-body cap as the code\'s 65536-byte default', () => {
+  assert.ok(
+    PAYMENTS_DOC.includes(CASPER_STREAMED_BODY_CAP_TOKEN),
+    "the Casper leg's streamed-body cap must be stated as 64 KiB — boundedText's default limit of 65536 bytes in src/tools/casper-fetch.ts (not the 1 MiB paid-body cap)",
+  );
+});
+
+it('positive + negative control (#60): the guard F scanners fail on the narrow claim / missing proofs and pass the correct shape', () => {
+  const BAD = [
+    'Payment response bodies/headers are size-bounded and ' + NARROW_REDIRECT_CLAIM + '.',
+    'redirects are refused by the guard and the Casper leg alike (no exact mode named)',
+  ].join('\n');
+  const flagged = findNarrowRedirectScope(BAD);
+  assert.equal(flagged.length, 3, `the narrow claim + the missing tokens must be flagged, got: ${JSON.stringify(flagged)}`);
+  assert.deepEqual(findNarrowRedirectScope(PAYMENTS_DOC), [], 'the real docs must pass');
+  // A prover file that does not exist is reported as a gap (fail closed):
+  const gaps = missingClaimProofs(REPO_ROOT, [['src/does-not-exist.test.ts', ['X']] as [string, readonly string[]]]);
+  assert.equal(gaps.length, 1, 'a missing prover file must be reported');
+});
+
+// ---- Guard G (#60 stage 2-3): no real-looking address material in docs ---
+//
+// Fail-closed rule for README.md and docs/*.md: every base58-shaped 32-44
+// char token and every 0x+40-hex token must be either (a) a documented
+// public infrastructure address — allowlisted inline below, all of them
+// already rows of docs/networks.md's asset table — or (b) inside an angle
+// bracket placeholder, which is the one sanctioned shape for example
+// values. Anything else fails, so a copy-paste-able wallet-shaped token can
+// never enter the docs unnoticed.
+const DOCUMENTED_PUBLIC_ADDRESSES: ReadonlySet<string> = new Set([
+  // docs/networks.md asset table — the Solana genesis ids (the CAIP-2 names):
+  '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp',
+  'EtWTRABZaYq6iMfeYKouRu166VU2xqa1',
+  // …and the USDC mints per network:
+  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+  '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU',
+  // …and the EVM USDC contracts (Base / Polygon / Arbitrum):
+  '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+  '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359',
+  '0xaf88d065e77c8cC2239327C5EDb3A432268e5831',
+]);
+
+// EVM `0x` addresses are case-insensitive (docs/policy.md pins the EIP-55
+// comparison), so their allowlist matches are compared lowercased.
+const DOCUMENTED_EVM_ADDRESSES_LOWER: ReadonlySet<string> = new Set(
+  [...DOCUMENTED_PUBLIC_ADDRESSES].filter((a) => a.startsWith('0x')).map((a) => a.toLowerCase()),
+);
+
+// Base58 alphabet run (no 0, O, I, l) at token boundaries. The lookarounds
+// never consume the delimiter, so two back-to-back CAIP-2 names cannot hide
+// behind a shared separator.
+const BASE58_TOKEN = /(?<![0-9A-Za-z])[1-9A-HJ-NP-Za-km-z]{32,44}(?![0-9A-Za-z])/g;
+const EVM_ADDRESS_TOKEN = /0x[0-9a-fA-F]{40}/g;
+
+function findUndocumentedAddressMaterial(rawText: string): string[] {
+  // Angle-bracket placeholders are the sanctioned shape; strip their spans
+  // first so a placeholder never counts as material.
+  const text = rawText.replace(/<[^<>\n]*>/g, ' ');
+  const undocumented: string[] = [];
+  for (const match of text.matchAll(EVM_ADDRESS_TOKEN)) {
+    const token = match[0];
+    if (!DOCUMENTED_EVM_ADDRESSES_LOWER.has(token.toLowerCase())) undocumented.push(token);
+  }
+  for (const match of text.matchAll(BASE58_TOKEN)) {
+    if (!DOCUMENTED_PUBLIC_ADDRESSES.has(match[0])) undocumented.push(match[0]);
+  }
+  return undocumented;
+}
+
+const DOC_PAGES: ReadonlyArray<[string, string]> = [
+  ['README.md', README],
+  ...REFERENCE_DOCS.map((name) => [`docs/${name}`, readFileSync(join(DOCS_DIR, name), 'utf8')] as [string, string]),
+];
+
+it('guard G (#60): README.md and docs/*.md carry no undocumented wallet-shaped address material', () => {
+  for (const [where, text] of DOC_PAGES) {
+    assert.deepEqual(
+      findUndocumentedAddressMaterial(text),
+      [],
+      `${where}: every address-shaped token must be an allowlisted documented public infra address (docs/networks.md asset table) or an angle-bracket placeholder`,
+    );
+  }
+});
+
+it('positive + negative control (#60): the guard G scanner fails on lookalike addresses and passes allowlisted/placeholder shapes', () => {
+  // A base58 lookalike of the devnet USDC mint (last char differs) and an EVM
+  // lookalike — assembled from fragments so this file's diff never carries a
+  // contiguous address-shaped literal outside fixture assembly (the same
+  // rule guards B/C follow for secret-shaped assignments).
+  const lookalikeMint = ['4zMMC9srt5Ri5X14GAgXhaHii3GnPAEE', 'RYPJgZJDncDV'].join('');
+  const lookalikeEvm = ['0xdead', 'beef'.repeat(9)].join('');
+  const BAD = [`mint: ${lookalikeMint}`, `payTo: ${lookalikeEvm}`].join('\n');
+  const flagged = findUndocumentedAddressMaterial(BAD);
+  assert.equal(flagged.length, 2, `both lookalikes must be flagged, got: ${JSON.stringify(flagged)}`);
+
+  // The sanctioned shapes pass: an allowlisted asset-table address and the
+  // same material wrapped as an angle-bracket placeholder.
+  const CLEAN = [
+    'USDC on Base: 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+    'SOLANA_PRIVATE_KEY=<throwaway-devnet-key>',
+    'recipient: <0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef>',
+  ].join('\n');
+  assert.deepEqual(findUndocumentedAddressMaterial(CLEAN), [], 'allowlisted + placeholder shapes must pass');
+});

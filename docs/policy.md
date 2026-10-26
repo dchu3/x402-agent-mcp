@@ -141,7 +141,7 @@ Tightening example — only ever pay one global recipient, except one host which
     "mode": "allowlist",
     "allowed": ["0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"],
     "perService": {
-      "trusted-merchant.example": ["0x2222222222222222222222222222222222222222"]
+      "trusted-merchant.example": ["<MERCHANT_PAYTO_ADDRESS>"]
     },
     "known": {}
   }
