@@ -49,7 +49,8 @@ export function resolvePolicyProfile(raw: string | undefined = process.env.X402_
  * profile cap is min()-ed against this line so an operator's raised legacy
  * env can never lift a shipped profile above today's cap — the profiles
  * tighten, never widen (non-widening by construction; test-pinned in
- * config.test.ts, including the MAX_PAYMENT_PER_CALL=5 case). */
+ * config.test.ts, including the MAX_PAYMENT_PER_CALL=5 case). LEGACY_DEFAULT_MAX_DAILY
+ * is also the fallback for a per-host daily cap when the level carries none. */
 const LEGACY_DEFAULT_MAX_PER_REQUEST = 0.5;
 const LEGACY_DEFAULT_MAX_DAILY = 10.0;
 
@@ -58,6 +59,19 @@ const LEGACY_DEFAULT_MAX_DAILY = 10.0;
  * writes it on services.discovered as the defense-in-depth second line
  * (capTrustForProfile is the first — see config.ts buildPolicyContext). */
 const PROFILE_LOW_PER_REQUEST_CAP = 0.05;
+
+/** The per-host cap line the tightening profiles write on the levels a
+ * directory row can never demote into (TRUSTED — and VERIFIED, the level the
+ * type system allows even though resolveTrustLevel never returns it): the
+ * SAME low per-request line as PROFILE_LOW_PER_REQUEST_CAP, so in strict an
+ * explicitly-trusted host is capped exactly like a directory row, and a
+ * per-host DAILY line one order of magnitude below the $10 legacy global
+ * (config.ts failClosedConfig aside, no per-level maxDaily exists in the
+ * defaults — this is the per-host cap that makes the profiles' "cap
+ * declared = cap applied" true; the engine projects services.<level>.maxDaily
+ * to its perServiceDaily limit and enforces it as SERVICE_LIMIT_EXCEEDED). */
+const PROFILE_HOST_PER_REQUEST_CAP = 0.05;
+const PROFILE_HOST_DAILY_CAP = 1.0;
 
 /** Overlay the profile's own fields onto a freshly built config — called by
  * loadPolicyConfig BETWEEN defaultPolicyConfig() and applyFileConfig(), which
@@ -73,7 +87,13 @@ const PROFILE_LOW_PER_REQUEST_CAP = 0.05;
  * constraint), and NO chain/token/network default is touched.
  *
  * permissive → a complete no-op: it IS the behavior-compat default, and the
- * deep-equality test against defaultPolicyConfig() is the proof. */
+ * deep-equality test against defaultPolicyConfig() is the proof.
+ *
+ * standard is "otherwise like strict" (both tightening profiles ship): the
+ * recipient gate is allowlist in BOTH — with no approval channel the first
+ * payment to a new recipient is refused until the operator lists payees via a
+ * POLICY_CONFIG_PATH file (file-only, applies after this overlay), and both
+ * carry the same per-host cap line on services.trusted / services.verified. */
 export function applyProfileDefaults(config: PolicyConfig, profile: PolicyProfile): void {
   if (profile === "permissive") return;
   if (profile === "standard") {
@@ -86,7 +106,6 @@ export function applyProfileDefaults(config: PolicyConfig, profile: PolicyProfil
       action: "allow",
       maxPerRequest: Math.min(config.services.unknown.maxPerRequest ?? config.payments.maxPerRequest, PROFILE_LOW_PER_REQUEST_CAP),
     };
-    config.anomaly = { ...config.anomaly, enabled: true };
   } else {
     // strict: unknown hosts refused entirely. Directory rows carry NO trust
     // elevation in strict (capTrustForProfile demotes DISCOVERED → UNKNOWN at
@@ -97,14 +116,33 @@ export function applyProfileDefaults(config: PolicyConfig, profile: PolicyProfil
       ...config.services.discovered,
       maxPerRequest: Math.min(config.services.discovered.maxPerRequest ?? config.payments.maxPerRequest, PROFILE_LOW_PER_REQUEST_CAP),
     };
-    config.anomaly = { ...config.anomaly, enabled: true };
-    // The issue's "approval required" with no approval channel in this stage:
-    // allowlist mode — the first payment to a new recipient is refused (the
-    // MCP stdio surface renders APPROVAL_REQUIRED the same way). Fail-closed
-    // direction: the operator lists payees (a POLICY_CONFIG_PATH file wins
-    // over this overlay); an empty effective list denies every recipient.
-    config.recipients = { ...config.recipients, mode: "allowlist" };
   }
+  // The per-host cap line — BOTH tightening profiles. capTrustForProfile
+  // demotes directory rows to UNKNOWN in strict/standard, so TRUSTED (an
+  // explicit POLICY_TRUSTED_HOSTS entry) is the level that still pays through
+  // untouched defaults — without this line a strict "cap" would never bind
+  // anywhere. VERIFIED is unreachable today (resolveTrustLevel never returns
+  // it) but is the level the type system allows; capping it costs nothing.
+  // The existing action is kept (fail-closed: the overlay never upgrades a
+  // configured deny to allow); maxPerRequest falls back through the global
+  // per-request cap, maxDaily through the legacy default.
+  config.services.trusted = {
+    ...config.services.trusted,
+    maxPerRequest: Math.min(config.services.trusted.maxPerRequest ?? config.payments.maxPerRequest, PROFILE_HOST_PER_REQUEST_CAP),
+    maxDaily: Math.min(config.services.trusted.maxDaily ?? LEGACY_DEFAULT_MAX_DAILY, PROFILE_HOST_DAILY_CAP),
+  };
+  config.services.verified = {
+    ...config.services.verified,
+    maxPerRequest: Math.min(config.services.verified.maxPerRequest ?? config.payments.maxPerRequest, PROFILE_HOST_PER_REQUEST_CAP),
+    maxDaily: Math.min(config.services.verified.maxDaily ?? LEGACY_DEFAULT_MAX_DAILY, PROFILE_HOST_DAILY_CAP),
+  };
+  // The issue's "approval required" with no approval channel in this stage:
+  // allowlist mode — the first payment to a new recipient is refused (the
+  // MCP stdio surface renders APPROVAL_REQUIRED the same way). Fail-closed
+  // direction: the operator lists payees (a POLICY_CONFIG_PATH file wins
+  // over this overlay); an empty effective list denies every recipient.
+  config.recipients = { ...config.recipients, mode: "allowlist" };
+  config.anomaly = { ...config.anomaly, enabled: true };
   // The cap line: a profile never rides an operator's raised legacy env caps.
   config.payments.maxPerRequest = Math.min(config.payments.maxPerRequest, LEGACY_DEFAULT_MAX_PER_REQUEST);
   config.payments.maxDaily = Math.min(config.payments.maxDaily, LEGACY_DEFAULT_MAX_DAILY);

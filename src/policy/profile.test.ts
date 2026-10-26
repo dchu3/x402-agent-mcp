@@ -13,7 +13,9 @@
 // afterEach).
 import { strict as assert } from 'node:assert';
 import { afterEach, it } from 'node:test';
-import { DEFAULT_POLICY_PROFILE, POLICY_PROFILES, capTrustForProfile, resolvePolicyProfile } from './profile.js';
+import { DEFAULT_POLICY_PROFILE, POLICY_PROFILES, applyProfileDefaults, capTrustForProfile, resolvePolicyProfile } from './profile.js';
+import { defaultPolicyConfig } from './config.js';
+import type { PolicyConfig } from './types.js';
 
 const baseEnv = { ...process.env };
 afterEach(() => { process.env = { ...baseEnv }; });
@@ -78,4 +80,79 @@ it('#66: capTrustForProfile demotes a directory row to UNKNOWN only in strict/st
   // levels a derivation can carry besides DISCOVERED are untouched
   assert.equal(capTrustForProfile('UNKNOWN', 'host.example', 'standard', () => false), 'UNKNOWN');
   assert.equal(capTrustForProfile('VERIFIED', 'host.example', 'strict', () => false), 'VERIFIED');
+});
+
+// ---------------------------------------------------------------------------
+// Post-merge review of the shipped profiles — the per-host cap the tightening
+// profiles declare must actually apply. The gap: the overlays wrote a
+// per-request cap ONLY on services.discovered, but capTrustForProfile demotes
+// every non-allowlisted directory host to UNKNOWN — so in strict the only
+// payable level (TRUSTED, no cap in the defaults) rode the global caps, and
+// standard had no per-host cap at all. Pinned here (RED first): BOTH
+// tightening profiles carry a per-host line on TRUSTED/VERIFIED — maxPerRequest
+// 0.05 (the same low line strict already writes on services.discovered) and
+// maxDaily 1.0 (one order of magnitude below the $10 legacy global) — every
+// value Math.min()-ed against whatever is already configured, never raised.
+// Standard additionally flips the recipient gate to allowlist so it is
+// "otherwise like strict" — the first payment to a new recipient is refused.
+// ---------------------------------------------------------------------------
+
+/** A pinned compat default: the legacy 0.5 / 10.0 line regardless of the
+ * operator env this suite may run under (applyProfileDefaults reads nothing
+ * from env itself — hermetic by construction). */
+function pinnedCompatConfig(): PolicyConfig {
+  return defaultPolicyConfig();
+}
+
+function strictConfig(): PolicyConfig {
+  const cfg = pinnedCompatConfig();
+  cfg.payments = { enabled: true, maxPerRequest: 0.5, maxDaily: 10.0 };
+  return cfg;
+}
+
+it('#86: strict caps the one level that can pay (TRUSTED) per host — 0.05 per request, 1.00 per host daily', () => {
+  const cfg = strictConfig();
+  applyProfileDefaults(cfg, 'strict');
+  assert.deepEqual(cfg.services.trusted, { action: 'allow', maxPerRequest: 0.05, maxDaily: 1.0 });
+});
+
+it('#86: strict caps services.verified with the same per-host line (the level the type system allows)', () => {
+  const cfg = strictConfig();
+  applyProfileDefaults(cfg, 'strict');
+  assert.deepEqual(cfg.services.verified, { action: 'allow', maxPerRequest: 0.05, maxDaily: 1.0 });
+});
+
+it('#86: standard carries the same per-host caps as strict (trusted + verified)', () => {
+  const cfg = strictConfig();
+  applyProfileDefaults(cfg, 'standard');
+  assert.deepEqual(cfg.services.trusted, { action: 'allow', maxPerRequest: 0.05, maxDaily: 1.0 });
+  assert.deepEqual(cfg.services.verified, { action: 'allow', maxPerRequest: 0.05, maxDaily: 1.0 });
+});
+
+it('#86: standard flips the recipient gate to allowlist — otherwise like strict', () => {
+  const cfg = strictConfig();
+  applyProfileDefaults(cfg, 'standard');
+  assert.equal(cfg.recipients.mode, 'allowlist', 'the first payment to a new recipient must be refused in standard too');
+  const strict = strictConfig();
+  applyProfileDefaults(strict, 'strict');
+  assert.equal(strict.recipients.mode, 'allowlist');
+});
+
+it('#86: the per-host caps never raise a preset level cap — min() against the existing value (non-widening)', () => {
+  const cfg = strictConfig();
+  cfg.services.trusted = { action: 'allow', maxPerRequest: 5, maxDaily: 20 };
+  applyProfileDefaults(cfg, 'strict');
+  assert.equal(cfg.services.trusted.maxPerRequest, 0.05);
+  assert.equal(cfg.services.trusted.maxDaily, 1.0);
+});
+
+it('#86: a preset below the host line survives untouched, and a missing preset falls back through the global line', () => {
+  const cfg = strictConfig();
+  cfg.payments = { enabled: true, maxPerRequest: 0.01, maxDaily: 10.0 };
+  cfg.services.verified = { action: 'allow', maxPerRequest: 0.02, maxDaily: 0.5 };
+  applyProfileDefaults(cfg, 'standard');
+  assert.equal(cfg.services.verified.maxPerRequest, 0.02, 'a preset below the line is min()-ed, never raised');
+  assert.equal(cfg.services.verified.maxDaily, 0.5);
+  assert.equal(cfg.services.trusted.maxPerRequest, 0.01, 'no preset → fallback is the global per-request cap, then the host line');
+  assert.equal(cfg.services.trusted.maxDaily, 1.0, 'no preset → fallback is the legacy default daily, then the host line');
 });

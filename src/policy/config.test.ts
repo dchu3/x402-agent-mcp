@@ -831,8 +831,10 @@ it("#66: standard keeps unknown hosts payable only under the low per-call price 
   assert.equal(state.config.services.unknown.action, 'allow');
   assert.equal(state.config.services.unknown.maxPerRequest, 0.05);
   assert.equal(state.config.anomaly.enabled, true);
-  // recipients stays change-detect in standard (allowlist is strict-only)
-  assert.equal(state.config.recipients.mode, 'change-detect');
+  // Post-merge review (#86): standard is "otherwise like strict" — the
+  // recipient gate flips to allowlist here too, so the first payment to a new
+  // recipient is refused until the operator lists payees (no approval channel).
+  assert.equal(state.config.recipients.mode, 'allowlist');
 });
 
 it("#66: anomaly.enabled is turned on only INSIDE strict/standard — never in the permissive default", () => {
@@ -979,4 +981,31 @@ it("#66: POLICY_BLOCKED_HOSTS stays BLOCKED in every profile", () => {
     else process.env.X402_POLICY_PROFILE = profile;
     assert.equal(buildPolicyContext('https://dirsvc.example/x', 'base', 'USDC', 0.01).trustLevel, 'BLOCKED', `profile=${profile ?? 'unset'}`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// Post-merge review (#86): an invalid X402_POLICY_PROFILE must be REPORTABLE
+// as invalid — the state carries the resolver message in profileError while
+// the fail-closed behaviour (CONFIG_INVALID, payments disabled) is unchanged.
+// resolvePolicyProfile still returns profile "strict" on the error path so no
+// code path reads permissive off a bad value; the new field is what the
+// startup log and x402_check_payment report from.
+// ---------------------------------------------------------------------------
+
+it('#86: a bad profile value sets profileError with the resolver message (alongside the unchanged fail-closed state)', () => {
+  process.env.X402_POLICY_PROFILE = 'bogus';
+  const state = loadPolicyConfig();
+  assert.equal(typeof state.profileError, 'string', 'profileError must carry the resolver message');
+  assert.ok(state.profileError!.includes("'bogus'"), 'the message must echo the raw value');
+  assert.ok(state.profileError!.startsWith('X402_POLICY_PROFILE='), 'the message must name the variable');
+  assert.equal(state.profile, 'strict', 'no code path reads permissive off a bad value (unchanged)');
+  assert.ok(state.configErrors.includes(state.profileError!), 'the same message fails the load closed');
+  assert.equal(state.config.payments.enabled, false, 'fail-closed behaviour is unchanged');
+});
+
+it('#86: a valid profile load carries no profileError', () => {
+  process.env.X402_POLICY_PROFILE = 'strict';
+  assert.equal(loadPolicyConfig().profileError, undefined);
+  delete process.env.X402_POLICY_PROFILE;
+  assert.equal(loadPolicyConfig().profileError, undefined);
 });

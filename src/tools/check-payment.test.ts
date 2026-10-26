@@ -541,3 +541,16 @@ it('#66: reports the active policy profile in the inspection output (standard)',
   const parsed = JSON.parse(result.content[0].text);
   assert.equal(parsed.policy_profile, 'standard');
 });
+
+// Post-merge review (#86): an invalid X402_POLICY_PROFILE must be reported as
+// "invalid" — with the resolver message — not as the fail-closed fallback
+// "strict" an operator cannot tell apart from a deliberate choice.
+it('#86: reports an invalid X402_POLICY_PROFILE as policy_profile "invalid" + policy_profile_error', async () => {
+  process.env.X402_POLICY_PROFILE = 'bogus';
+  const result = await handler()({ url: 'https://analyzer.example/score', amount: 0.05, chain: 'base', token: 'USDC' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.policy_profile, 'invalid');
+  assert.equal(typeof parsed.policy_profile_error, 'string');
+  assert.ok(parsed.policy_profile_error.includes("'bogus'"), 'the reported error must echo the raw value');
+  assert.ok(parsed.policy_profile_error.startsWith('X402_POLICY_PROFILE='), 'the reported error must name the variable');
+});

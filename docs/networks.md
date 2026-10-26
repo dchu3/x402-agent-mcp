@@ -15,9 +15,9 @@ Which chains can pay, the explicit no-default `X402_NETWORK_MODE` rule, devnet, 
 
 Chain is auto-detected from the 402 response's real CAIP-2 network id (`eip155:8453` ⇒ base, `eip155:137` ⇒ polygon, `eip155:42161` ⇒ arbitrum — an unrecognised `eip155:*` id keeps its verbatim identity and is denied by the default policy, never collapsed onto base). The Solana side is exact too: only the protocol's exact identifiers classify (`solana:5eykt4Us…`, the devnet id `solana:EtWTRAB…`, the testnet id, the V1 name, the bare mainnet genesis); a namespace whose name merely CONTAINS "solana" (e.g. `devnet;solana`) or an unknown `solana:*` genesis stays verbatim and is refused by policy. Override with the `chain` parameter (`base`/`polygon`/`arbitrum`/`solana`/`casper`). All EVM chains share the one `EVM_PRIVATE_KEY`; the Ethereum L1 (`eip155:1`) is always refused (see rule 3 in [policy.md](policy.md)). `BASE_RPC_URL` applies to Base only — EVM payments on Polygon/Arbitrum sign locally (EIP-3009) with no RPC dependency. Policy note: Polygon and Arbitrum are **opt-in** — add them to `networks.allowed` (and keep the facilitator settle-list `evm.facilitatorNetworks` covering their CAIP-2 ids) to make them payable; the default policy pays Base only among EVM chains.
 
-## Network mode — explicit, no default (BREAKING CHANGE since v0.3)
+## Network mode — explicit, no default
 
-**⚠ BREAKING CHANGE (v0.3+):** `X402_NETWORK_MODE` is required before any paid call. Older deployments that relied on the implicit mainnet behavior must set the variable explicitly at upgrade — there is **no default**, by operator decision on record.
+**`X402_NETWORK_MODE` is required before any paid call.** There is **no default**, by operator decision on record — the variable must be set explicitly.
 
 | Value | Effect |
 |-------|--------|
@@ -27,7 +27,7 @@ Chain is auto-detected from the 402 response's real CAIP-2 network id (`eip155:8
 
 **`mainnet` settles real, irreversible funds.** A mainnet payment is a live on-chain transaction you cannot claw back. Start on `devnet` with a throwaway key first (see the quick start just below) — devnet mode exists precisely so a key that holds no real value can exercise the whole payment flow, and **devnet spend has its own daily bucket** that never moves the mainnet totals.
 
-Mechanics: the registration network is the MODE's exact CAIP-2 (req 2 — a devnet wallet never signs a mainnet challenge, and vice versa); the Solana devnet runs `SOLANA_DEVNET_RPC_URL` (its documented public fallback is the SDK's devnet RPC; a mainnet RPC is never touched in devnet mode and vice versa); every result carries `network_mode` and the leg's exact `network` (req 8), and one stderr line at startup renders the mode, the RPC host (host only) and the asset table. The ledger rows carry `network`; **devnet spend has its own daily bucket** (req 7) — a devnet payment never moves the mainnet daily totals or the mainnet reservations, and vice versa.
+Mechanics: the registration network is the MODE's exact CAIP-2 (a devnet wallet never signs a mainnet challenge, and vice versa); the Solana devnet runs `SOLANA_DEVNET_RPC_URL` (its documented public fallback is the SDK's devnet RPC; a mainnet RPC is never touched in devnet mode and vice versa); every result carries `network_mode` and the leg's exact `network`, and one stderr line at startup renders the mode, the RPC host (host only) and the asset table. The ledger rows carry `network`; **devnet spend has its own daily bucket** — a devnet payment never moves the mainnet daily totals or the mainnet reservations, and vice versa.
 
 ### Devnet quick start (throwaway key only)
 
@@ -41,7 +41,7 @@ SOLANA_DEVNET_RPC_URL=<OPTIONAL — the public SDK devnet RPC is the fallback>
 
 The default policy still gates every leg: add the devnet network to `networks.allowed` (e.g. `"solana"` — the mode boundary is what separates devnet from mainnet payments) and keep the devnet USDC symbol (`USDC`) in `tokens.allowed`. A devnet settlement writes a ledger row with `network: "solana:EtWTRAB…"` and accounts in the devnet bucket.
 
-### Casper agreement (req 3)
+### Casper agreement
 
 The mode and `CASPER_NETWORK` must agree or the leg refuses with `CHAIN_NOT_ALLOWED` before any binding, budget hold or signing (`mainnet` + `casper-test` ⇒ refuse; `devnet` + `casper` ⇒ refuse; an explicit mode with `CASPER_NETWORK` unset follows the mode: mainnet ⇒ `casper:casper`, devnet ⇒ `casper:casper-test`).
 

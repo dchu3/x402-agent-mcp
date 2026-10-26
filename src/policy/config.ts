@@ -800,15 +800,29 @@ export function loadPolicyConfig(): PolicyEngineState {
   // On a profile parse error the overlay is skipped (config is discarded
   // into the fail-closed state below anyway) and the returned `profile` is
   // resolvePolicyProfile's "strict" — irrelevant to any decision, the engine
-  // short-circuits on configErrors first.
+  // short-circuits on configErrors first. The error is ALSO carried verbatim
+  // in `profileError` (post-merge review #86) so a reporting surface can
+  // render the state as profile "invalid" instead of the fallback "strict",
+  // which an operator cannot tell apart from a deliberate strict choice; the
+  // fail-closed engine behaviour is unchanged.
   if (profileResult.error === undefined) applyProfileDefaults(config, profileResult.profile);
   applyFileConfig(config, errors);
   applyEnvOverrides(config, errors);
 
   if (errors.length > 0) {
-    return { config: failClosedConfig(errors), configErrors: errors, profile: profileResult.profile };
+    return {
+      config: failClosedConfig(errors),
+      configErrors: errors,
+      profile: profileResult.profile,
+      ...(profileResult.error !== undefined ? { profileError: profileResult.error } : {}),
+    };
   }
-  return { config, configErrors: [], profile: profileResult.profile };
+  return {
+    config,
+    configErrors: [],
+    profile: profileResult.profile,
+    ...(profileResult.error !== undefined ? { profileError: profileResult.error } : {}),
+  };
 }
 
 /** Build a PolicyEngine from the current configuration. Deliberately NOT
