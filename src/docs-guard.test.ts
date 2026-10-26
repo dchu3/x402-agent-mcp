@@ -253,7 +253,23 @@ it('positive + negative control (#73): the local-link scanner filters external U
   assert.equal(existsSync(join(REPO_ROOT, 'does-not-exist.md')), false);
 });
 
-// ---- Discovery metadata (#73): MIT licence fields -----------------------
+// ---- Guard F (#66): policy profiles are documented -----------------------
+
+// Issue #66 stage A: the shipped opt-in profile switch must be discoverable —
+// the README names the variable and docs/policy.md documents the three
+// values. Identifier-level tokens only: the prose may be rewritten freely,
+// the vocabulary may not (no sentence-shaped assertions here — the repo's
+// docs-guard style).
+it('#66: the policy profiles are documented — X402_POLICY_PROFILE in README.md and docs/policy.md, all three profile names in docs/policy.md', () => {
+  assert.ok(README.includes('X402_POLICY_PROFILE'), 'README.md must name the X402_POLICY_PROFILE variable');
+  const policyDoc = readFileSync(join(DOCS_DIR, 'policy.md'), 'utf8');
+  assert.ok(policyDoc.includes('X402_POLICY_PROFILE'), 'docs/policy.md must name the X402_POLICY_PROFILE variable');
+  for (const profile of ['strict', 'standard', 'permissive']) {
+    assert.ok(policyDoc.includes(profile), `docs/policy.md must name the ${profile} profile`);
+  }
+});
+
+// ---- Discovery metadata (#73): MIT licence fields ----------------------
 
 // The standard MIT template text the LICENSE file must carry (the canonical
 // template, with the public repo handle as the copyright line).

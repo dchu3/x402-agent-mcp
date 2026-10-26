@@ -525,3 +525,19 @@ it('a network id that maps OUTSIDE the project chain set does not claim a chain 
   assert.equal(parsed.chain_source, 'assumed_default', 'an unmapped network never invents a project chain');
   assert.equal(parsed.network, 'eip155:999777');
 });
+
+// ---- Issue #66 stage A (req 1): the active policy profile is visible ----
+
+it('#66: reports the active policy profile in the inspection output (strict)', async () => {
+  process.env.X402_POLICY_PROFILE = 'strict';
+  const result = await handler()({ url: 'https://analyzer.example/score', amount: 0.05, chain: 'base', token: 'USDC' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.policy_profile, 'strict');
+});
+
+it('#66: reports the active policy profile in the inspection output (standard)', async () => {
+  process.env.X402_POLICY_PROFILE = 'standard';
+  const result = await handler()({ url: 'https://analyzer.example/score', amount: 0.05, chain: 'base', token: 'USDC' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.policy_profile, 'standard');
+});

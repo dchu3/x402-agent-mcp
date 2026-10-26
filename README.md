@@ -61,7 +61,7 @@ Paid routes and prices rotate — confirm the route and price on the seller's `G
 
 ## Safety and network defaults
 
-- The default payment policy is permissive — any x402 endpoint is payable up to the global caps — and every cap fails closed on a malformed value (it disables payments rather than widening them). Tighten via a config file pointed at by `POLICY_CONFIG_PATH`.
+- The default payment policy is permissive — any x402 endpoint is payable up to the global caps — and every cap fails closed on a malformed value (it disables payments rather than widening them). Tighten via a config file pointed at by `POLICY_CONFIG_PATH`, or opt into a shipped profile with `X402_POLICY_PROFILE=strict|standard` — unset stays `permissive` (the behavior-compat default; see the [policy engine](docs/policy.md) reference for the three profiles).
 - Polygon and Arbitrum are opt-in (add them to the policy's `networks.allowed`); the Ethereum mainnet (`eip155:1`) is always refused.
 - Payment receipts come from the seller and are not verified on-chain (`receipt_verified: false`).
 - There is no default network: `X402_NETWORK_MODE` must be set explicitly (#59).
