@@ -29,6 +29,10 @@ import { parseChainFromNetwork } from "./probe-utils.js";
 // Issue #59/#62 (C9 visibility): the run's explicit mode + the asset table.
 import { modeAllowsNetwork, resolveNetworkMode } from "../networks.js";
 import { assetTableSummary } from "../assets.js";
+// Issue #66 (stage A, req 1): the active policy profile is reported beside
+// trust_level. DEFAULT_POLICY_PROFILE is the fallback for hand-built states
+// that carry no profile (loadPolicyConfig always sets one).
+import { DEFAULT_POLICY_PROFILE } from "../policy/profile.js";
 // Issue #65/#67 (plan C1): amounts print through the exact atomic formatter —
 // a small value is never rounded to zero (a $0.001 check printed "0.00"
 // through toFixed(2)). Issue #67 (plan C6): the check output additionally
@@ -162,6 +166,11 @@ export function registerCheckPaymentTool(server: McpServer): void {
       const modeState = resolveNetworkMode();
       const modeStateError = modeState.error;
 
+      // Issue #66 (stage A): loadPolicyConfig re-reads env/the file on every
+      // call (deliberately not memoised) — capture the state ONCE so the
+      // asset-table summary and the profile report below see the same load.
+      const policyState = loadPolicyConfig();
+
       const output = {
         decision: result.decision,
         service: ctx.service,
@@ -182,7 +191,7 @@ export function registerCheckPaymentTool(server: McpServer): void {
         // can see which assets may pay before probing any seller.
         asset_table: {
           ...assetTableSummary(),
-          operator_extensions: loadPolicyConfig().config.assets.extensions.length,
+          operator_extensions: policyState.config.assets.extensions.length,
         },
         ...(args.network !== undefined ? {
           network: args.network,
@@ -192,6 +201,11 @@ export function registerCheckPaymentTool(server: McpServer): void {
         } : {}),
         ...recipientEcho,
         trust_level: result.limits.trustLevel,
+        // Issue #66 (stage A, req 1): the active policy profile beside
+        // trust_level — reported from the loaded state (no second env read
+        // at this call site). With X402_POLICY_PROFILE unset this is the
+        // stage-A default "permissive".
+        policy_profile: policyState.profile ?? DEFAULT_POLICY_PROFILE,
         // Issue #34: echo the endpoint liveness verdict the gate saw (rule
         // 4.7) — computed in buildPolicyContext from the directory row +
         // liveness config — so an agent can inspect pin/probe state BEFORE
