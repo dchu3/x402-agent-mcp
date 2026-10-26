@@ -373,9 +373,16 @@ const CLAIM_PROVER_FILES: ReadonlyArray<[string, readonly string[]]> = [
   ['src/tools/inspector.test.ts', ['REDIRECT_REFUSED', 'Payment response exceeds size limit']],
   // The paid body's 1 MiB bound surfacing as a counted authorized_unserved row.
   ['src/tools/fetch-paid-limits.test.ts', ['authorized_unserved']],
-  // The Casper leg's streamed body is bounded the same way.
+  // The Casper leg's streamed-body cap is 64 KiB — boundedText's 65536-byte
+  // default in src/tools/casper-fetch.ts, NOT the 1 MiB paid-body cap.
   ['src/tools/casper-fetch.test.ts', ['size limit']],
 ];
+
+// Identifier-level pin matching the table's style: docs/payments.md must keep
+// naming the Casper streamed-body cap as the code's own number — boundedText's
+// default limit of 65536 bytes (= 64 KiB) in src/tools/casper-fetch.ts — so
+// the 1 MiB USD-rail paid-body cap can never stand in for it.
+const CASPER_STREAMED_BODY_CAP_TOKEN = '65536';
 
 function missingClaimProofs(root: string, files: ReadonlyArray<[string, readonly string[]]>): string[] {
   const gaps: string[] = [];
@@ -406,6 +413,13 @@ it('guard F (#60): every trust-boundary claim in docs/payments.md is proven by t
     missingClaimProofs(REPO_ROOT, CLAIM_PROVER_FILES),
     [],
     'the redirect/size-bounds claims must keep their proving test files (and the exact asserted tokens) in the suite',
+  );
+});
+
+it('guard F (#60): docs/payments.md states the Casper streamed-body cap as the code\'s 65536-byte default', () => {
+  assert.ok(
+    PAYMENTS_DOC.includes(CASPER_STREAMED_BODY_CAP_TOKEN),
+    "the Casper leg's streamed-body cap must be stated as 64 KiB — boundedText's default limit of 65536 bytes in src/tools/casper-fetch.ts (not the 1 MiB paid-body cap)",
   );
 });
 
