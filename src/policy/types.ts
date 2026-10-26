@@ -7,6 +7,10 @@
  * refusal (stdio MCP has no human-approval channel — fail-closed, see README). */
 export type PolicyDecision = "ALLOW" | "DENY" | "APPROVAL_REQUIRED";
 
+// Issue #66 (stage A): the profile vocabulary lives in src/policy/profile.ts;
+// this TYPE-ONLY import keeps the file's runtime surface unchanged (no cycle).
+import type { PolicyProfile } from "./profile.js";
+
 /** Trust levels backed by directory provenance + operator env allowlists
  * (see src/policy/config.ts resolveTrustLevel). No reputation system. */
 export type TrustLevel = "TRUSTED" | "VERIFIED" | "DISCOVERED" | "UNKNOWN" | "BLOCKED";
@@ -306,4 +310,11 @@ export interface PolicyResult {
 export interface PolicyEngineState {
   config: PolicyConfig;
   configErrors: string[];
+  /** Issue #66 (stage A): the active policy profile, carried so callers
+   * (x402_check_payment, the startup log) can report it without re-reading
+   * env themselves. loadPolicyConfig ALWAYS sets it — for an unrecognized
+   * X402_POLICY_PROFILE value it is "strict" while configErrors carries the
+   * parse error (the engine fails closed regardless). Optional only because
+   * hand-built fixtures construct states without one. */
+  profile?: PolicyProfile;
 }

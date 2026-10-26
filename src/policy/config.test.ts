@@ -3,7 +3,7 @@ import { afterEach, after, it } from 'node:test';
 import { mkdtempSync, writeFileSync, rmSync, chmodSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { loadPolicyConfig, getPolicyEngine, resolveTrustLevel, DEFAULT_POLICY_CONFIG } from './config.js';
+import { loadPolicyConfig, getPolicyEngine, resolveTrustLevel, DEFAULT_POLICY_CONFIG, defaultPolicyConfig } from './config.js';
 import type { PolicyConfig } from './types.js';
 import { clearDirectoryCache } from '../directory.js';
 
@@ -793,4 +793,99 @@ it('buildPolicyContext supplies the liveness verdict (injected clock; directory 
   const stranger = buildPolicyContext('https://stranger.example/api', 'base', 'USDC', 0.1, { now: NOW });
   assert.equal(stranger.endpointLiveness?.ok, true, 'a non-catalog host is INERT in seed mode (L3)');
   assert.equal(stranger.endpointLiveness?.status, 'never_probed');
+});
+
+// ---------------------------------------------------------------------------
+// Issue #66 stage A — policy profiles (X402_POLICY_PROFILE).
+// Stage boundary: the DEFAULT stays permissive; the compat proof is the
+// deep-equality assertions against defaultPolicyConfig() below.
+// ---------------------------------------------------------------------------
+
+it("#66: X402_POLICY_PROFILE unset loads a config that deep-equals defaultPolicyConfig() (the compat proof)", () => {
+  delete process.env.X402_POLICY_PROFILE;
+  const state = loadPolicyConfig();
+  assert.deepEqual(state.configErrors, []);
+  assert.deepEqual(state.config, defaultPolicyConfig());
+});
+
+it("#66: the permissive profile IS the compat default — no overlay field changes anything", () => {
+  process.env.X402_POLICY_PROFILE = 'permissive';
+  assert.deepEqual(loadPolicyConfig().config, defaultPolicyConfig());
+});
+
+it("#66: strict refuses unknown services, turns the anomaly gate on, flips recipients to allowlist, and caps directory rows at the low line", () => {
+  process.env.X402_POLICY_PROFILE = 'strict';
+  const state = loadPolicyConfig();
+  assert.deepEqual(state.configErrors, []);
+  assert.equal(state.config.services.unknown.action, 'deny');
+  assert.equal(state.config.anomaly.enabled, true);
+  assert.equal(state.config.recipients.mode, 'allowlist');
+  assert.equal(state.config.services.discovered.action, 'allow');
+  assert.equal(state.config.services.discovered.maxPerRequest, 0.05);
+});
+
+it("#66: standard keeps unknown hosts payable only under the low per-call price and turns the anomaly gate on", () => {
+  process.env.X402_POLICY_PROFILE = 'standard';
+  const state = loadPolicyConfig();
+  assert.deepEqual(state.configErrors, []);
+  assert.equal(state.config.services.unknown.action, 'allow');
+  assert.equal(state.config.services.unknown.maxPerRequest, 0.05);
+  assert.equal(state.config.anomaly.enabled, true);
+  // recipients stays change-detect in standard (allowlist is strict-only)
+  assert.equal(state.config.recipients.mode, 'change-detect');
+});
+
+it("#66: anomaly.enabled is turned on only INSIDE strict/standard — never in the permissive default", () => {
+  for (const profile of ['permissive', undefined]) {
+    if (profile === undefined) delete process.env.X402_POLICY_PROFILE;
+    else process.env.X402_POLICY_PROFILE = profile;
+    assert.equal(loadPolicyConfig().config.anomaly.enabled, false);
+  }
+  process.env.X402_POLICY_PROFILE = 'standard';
+  assert.equal(loadPolicyConfig().config.anomaly.enabled, true);
+  process.env.X402_POLICY_PROFILE = 'strict';
+  assert.equal(loadPolicyConfig().config.anomaly.enabled, true);
+});
+
+it("#66: every shipped profile cap is min()-ed against the legacy caps (non-widening)", () => {
+  for (const profile of ['strict', 'standard']) {
+    delete process.env.MAX_PAYMENT_PER_CALL;
+    delete process.env.MAX_DAILY_SPEND;
+    process.env.X402_POLICY_PROFILE = profile;
+    const state = loadPolicyConfig();
+    assert.ok(state.config.payments.maxPerRequest <= 0.5, `${profile}: payments.maxPerRequest must not exceed the legacy cap`);
+    assert.ok(state.config.payments.maxDaily <= 10.0, `${profile}: payments.maxDaily must not exceed the legacy cap`);
+    for (const level of ['unknown', 'discovered'] as const) {
+      const cap = state.config.services[level].maxPerRequest;
+      if (cap !== undefined) assert.ok(cap <= 0.5, `${profile}: services.${level}.maxPerRequest must not exceed the legacy cap`);
+    }
+  }
+});
+
+it("#66: a raised legacy cap cannot lift a profile above its line — min() holds the 0.5/10.0 boundary (permissive stays compat)", () => {
+  process.env.MAX_PAYMENT_PER_CALL = '5';
+  process.env.MAX_DAILY_SPEND = '50';
+  for (const profile of ['strict', 'standard']) {
+    process.env.X402_POLICY_PROFILE = profile;
+    const state = loadPolicyConfig();
+    assert.equal(state.config.payments.maxPerRequest, 0.5, `${profile}: the profile line must hold under MAX_PAYMENT_PER_CALL=5`);
+    assert.equal(state.config.payments.maxDaily, 10.0, `${profile}: the profile line must hold under MAX_DAILY_SPEND=50`);
+  }
+  // permissive is the compat profile: the operator's legacy caps pass through untouched
+  process.env.X402_POLICY_PROFILE = 'permissive';
+  assert.deepEqual(loadPolicyConfig().config, defaultPolicyConfig());
+});
+
+it("#66: an invalid profile value fails closed — configErrors non-empty, payments disabled, evaluate() DENYs", () => {
+  process.env.X402_POLICY_PROFILE = 'bogus';
+  const state = loadPolicyConfig();
+  assert.ok(state.configErrors.length > 0, 'an invalid profile value must produce a config error');
+  assert.ok(state.configErrors.some((e) => e.includes("X402_POLICY_PROFILE")), 'the error must name the variable');
+  assert.equal(state.config.payments.enabled, false);
+  const result = getPolicyEngine().evaluate(discoveredCtx);
+  assert.equal(result.decision, 'DENY');
+  assert.ok(result.reasons.some((r) => r.code === 'CONFIG_INVALID'));
+  assert.ok(result.reasons.some((r) => r.code === 'PAYMENTS_DISABLED'));
+  // Free tools never consult the policy config — the failure is confined to
+  // the payment path by construction (this suite imports no paying code).
 });

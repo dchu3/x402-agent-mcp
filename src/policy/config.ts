@@ -40,6 +40,7 @@
 import { readFileSync } from "fs";
 import { PolicyEngine } from "./engine.js";
 import { DEFAULT_ANOMALY_CONFIG } from "./anomaly.js";
+import { applyProfileDefaults, resolvePolicyProfile } from "./profile.js";
 import { DEFAULT_FACILITATOR_NETWORKS } from "../evm/networks.js";
 import { findEntryForUrl, loadDirectory } from "../directory.js";
 import { livenessVerdict } from "./liveness.js";
@@ -778,17 +779,36 @@ function applyEnvOverrides(config: PolicyConfig, errors: string[]): void {
 
 /** Load and validate the policy configuration. Returns the engine state —
  * with configErrors non-empty (and payments disabled) whenever anything is
- * wrong, per the fail-closed rule. Reads env at call time. */
+ * wrong, per the fail-closed rule. Reads env at call time.
+ *
+ * Issue #66 (stage A) — profiles slot into the documented precedence chain
+ * (comment at the top of this file, decision 3) as
+ *   legacy env (default source) < PROFILE overlay < POLICY_CONFIG_PATH file < X402_POLICY_* overrides.
+ * The profile resolves FIRST; an unrecognized X402_POLICY_PROFILE value lands
+ * in `errors` so the whole load fails closed (payments disabled,
+ * CONFIG_INVALID — the fail-closed engine state, never silently permissive;
+ * free tools never consult this config). applyProfileDefaults runs between
+ * defaultPolicyConfig() and applyFileConfig(), which makes "a policy file
+ * always overrides the profile" true BY CONSTRUCTION: the file merges after
+ * the overlay, and env overrides after that. */
 export function loadPolicyConfig(): PolicyEngineState {
   const errors: string[] = [];
+  const profileResult = resolvePolicyProfile();
+  if (profileResult.error !== undefined) errors.push(profileResult.error);
+
   const config = defaultPolicyConfig(errors); // legacy env feeds the default caps
+  // On a profile parse error the overlay is skipped (config is discarded
+  // into the fail-closed state below anyway) and the returned `profile` is
+  // resolvePolicyProfile's "strict" — irrelevant to any decision, the engine
+  // short-circuits on configErrors first.
+  if (profileResult.error === undefined) applyProfileDefaults(config, profileResult.profile);
   applyFileConfig(config, errors);
   applyEnvOverrides(config, errors);
 
   if (errors.length > 0) {
-    return { config: failClosedConfig(errors), configErrors: errors };
+    return { config: failClosedConfig(errors), configErrors: errors, profile: profileResult.profile };
   }
-  return { config, configErrors: [] };
+  return { config, configErrors: [], profile: profileResult.profile };
 }
 
 /** Build a PolicyEngine from the current configuration. Deliberately NOT
