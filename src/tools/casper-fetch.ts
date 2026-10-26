@@ -6,20 +6,48 @@ import { logPayment } from '../payment-utils.js';
 import { blockingEnforcement, intentEnforcement } from '../payment-intent/executor.js';
 import { intentManager } from '../payment-intent/manager.js';
 import type { IntentRejectCode, PaymentIntent } from '../payment-intent/types.js';
+// Issue #80: the SAME paid-leg bound the USD leg honours — the Casper paid
+// transport takes X402_PAID_TIMEOUT_MS (parsed fail-closed, default 30000)
+// as its request deadline instead of a hardcoded literal, so both rails
+// share the one configured paid-leg budget.
+import { paidTimeoutMs } from '../transport/replay.js';
 
-export async function boundedText(response: Response, limit = 65536): Promise<string> {
+export async function boundedText(response: Response, limit = 65536, signal?: AbortSignal): Promise<string> {
   if (!response.body) return '';
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
   let size = 0;
+  // Issue #80 (R1a): an optional caller signal bounds the read in TIME, not
+  // just in bytes — a mid-body stall is the unbounded read the issue pins.
+  // The read races the abort (one shared rejector per call); on abort the
+  // signal's reason (the paid-leg deadline's TimeoutError) propagates.
+  const aborted = signal === undefined
+    ? undefined
+    : new Promise<never>((_resolve, reject) => {
+      const onAbort = () => reject(signal.reason);
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    });
   try {
     for (;;) {
-      const { value, done } = await reader.read();
+      const { value, done } = aborted === undefined
+        ? await reader.read()
+        : await Promise.race([reader.read(), aborted]);
       if (done) break;
       size += value.byteLength;
       if (size > limit) { await reader.cancel(); throw new Error('Payment response exceeds size limit'); }
       chunks.push(value);
     }
+  } catch (err) {
+    // Best-effort stream hygiene (never masks the real error): free the
+    // socket promptly when the read stopped early — an abort or the size cap.
+    await reader.cancel().catch(() => undefined);
+    if (aborted !== undefined && signal!.aborted) {
+      // The abort stopped this read — the call surfaces the caller's reason
+      // (the paid-leg deadline's TimeoutError), never a stream detail.
+      throw signal!.reason;
+    }
+    throw err;
   } finally { reader.releaseLock(); }
   return Buffer.concat(chunks).toString('utf8');
 }
@@ -59,7 +87,11 @@ export async function fetchCasper(
     registerCasperScheme(client, key, network);
     authorized = guardCasperPayments(client, network);
     const transport: typeof fetch = async (input, init) => {
-      const response = await fetch(input, { ...init, redirect: 'error', signal: AbortSignal.timeout(30000) });
+      // Issue #80: X402_PAID_TIMEOUT_MS bounds the paid Casper leg exactly as
+      // it bounds the USD paid leg — the parsed (fail-closed) value, no
+      // hardcoded 30 s literal; the request's headers AND bounded body read
+      // below run inside this signal.
+      const response = await fetch(input, { ...init, redirect: 'error', signal: AbortSignal.timeout(paidTimeoutMs(process.env)) });
       for (const name of ['payment-required', 'payment-response', 'x-payment-response']) {
         if ((response.headers.get(name)?.length ?? 0) > 65536) throw new Error('Payment header exceeds size limit');
       }
@@ -82,14 +114,33 @@ export async function fetchCasper(
       } catch { /* An untrusted/malformed receipt is not proof of payment. */ }
     }
     return { content: [{ type: 'text' as const, text: JSON.stringify({
-      status: response.status, url, chain: 'casper', paid: authorized() > 0n && status === 'success',
+      status: response.status, url, chain: 'casper',
+      // Issue #80: the tri-state paid flag (the same #54 rule the USD leg
+      // follows) — true ONLY on a verified success receipt; "unknown" when a
+      // nonzero authorization was sent but unverified (never paid:false after
+      // a send); false when nothing was authorized (a free response is not a
+      // payment).
+      paid: authorized() > 0n ? (status === 'success' ? true : 'unknown') : false,
       authorized_motes: authorized().toString(), authorized_cspr: motesToCspr(authorized()),
       daily_authorized_motes: casperBudget.getDailySpent().toString(), payment_receipt: receipt, body: result,
     }) }] };
   } catch {
     // Never echo SDK/key-loading errors: they may contain secret key material.
     error = 'Casper payment failed validation, signing or transport; authorization budget remains reserved if signing was attempted';
-    return { content: [{ type: 'text' as const, text: JSON.stringify({ error, url, chain: 'casper' }) }] };
+    // Issue #80: the catch path reports the SAME tri-state the USD leg uses
+    // — when the leg threw AFTER the authorization was sent (e.g. a paid-leg
+    // transport error), the caller is told paid:'unknown' (never paid:false
+    // after a send), with the explicit authorization_sent flag and the
+    // authorized mote amount, so a sent attempt is never retried blindly
+    // (the ledger counts this row as authorized_unserved below — output and
+    // ledger agree). Nothing authorized ⇒ paid:false, exactly as before.
+    const authorizationSent = authorized() > 0n;
+    return { content: [{ type: 'text' as const, text: JSON.stringify({
+      error, url, chain: 'casper',
+      paid: authorizationSent ? 'unknown' : false,
+      authorization_sent: authorizationSent,
+      authorized_motes: authorized().toString(),
+    }) }] };
   } finally {
     // Issue #54 (req 6): the Casper row keeps the TRUE outcome too — a
     // verified success receipt settles; a nonzero authorization with no
@@ -99,18 +150,24 @@ export async function fetchCasper(
     // intent's own expiry (none bound ⇒ no expiry field ⇒ the row counts —
     // the fail-closed over-count direction). Nothing authorized ⇒ failed/0,
     // exactly as before.
-    const unservedAuthorization = status !== 'success' && authorized() > 0n;
-    logPayment({
-      timestamp: new Date().toISOString(),
-      url,
-      method,
-      chain: 'casper',
-      currency: 'wCSPR',
-      amount_motes: authorized().toString(),
-      ...(unservedAuthorization && intent != null ? { expires_at: intent.expiresAt } : {}),
-      tx_hash: txHash,
-      status: unservedAuthorization ? 'authorized_unserved' : status,
-      error,
-    });
+    // Issue #80: nothing authorized now writes NO payment row at all — a
+    // Casper response with zero motes authorized is not a payment (never a
+    // payment ledger entry, never a spend input).
+    const authorizedMotes = authorized();
+    if (authorizedMotes > 0n) {
+      const unservedAuthorization = status !== 'success' && authorizedMotes > 0n;
+      logPayment({
+        timestamp: new Date().toISOString(),
+        url,
+        method,
+        chain: 'casper',
+        currency: 'wCSPR',
+        amount_motes: authorizedMotes.toString(),
+        ...(unservedAuthorization && intent != null ? { expires_at: intent.expiresAt } : {}),
+        tx_hash: txHash,
+        status: unservedAuthorization ? 'authorized_unserved' : status,
+        error,
+      });
+    }
   }
 }

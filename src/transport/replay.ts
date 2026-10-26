@@ -94,3 +94,79 @@ export function paidTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
   }
   return value;
 }
+
+/** Issue #80 (R1c): the free PROBE's timeout is configurable too — it was a
+ * hardcoded 30 s literal at the probe fetch. Default kept at 30000 ms. */
+export const DEFAULT_PROBE_TIMEOUT_MS = 30_000;
+
+/** Parse X402_PROBE_TIMEOUT_MS fail-closed — the exact discipline of
+ * paidTimeoutMs: absent/blank ⇒ the documented default; whole-digit positive
+ * integers pass through verbatim; anything else throws a RangeError — never
+ * clamped, never silently defaulted. */
+export function probeTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.X402_PROBE_TIMEOUT_MS;
+  if (raw === undefined || raw.trim() === "") return DEFAULT_PROBE_TIMEOUT_MS;
+  const trimmed = raw.trim();
+  if (!/^[0-9]+$/.test(trimmed)) {
+    throw new RangeError(`X402_PROBE_TIMEOUT_MS must be a positive integer number of milliseconds, got: ${trimmed.slice(0, 32)}`);
+  }
+  const value = Number(trimmed);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new RangeError(`X402_PROBE_TIMEOUT_MS must be a positive integer number of milliseconds, got: ${trimmed.slice(0, 32)}`);
+  }
+  return value;
+}
+
+/** Issue #80 (R1a): ONE repo-owned deadline for the whole paid leg — headers
+ * AND body. The pre-#80 flow bounded the paid leg only by setting
+ * AbortSignal.timeout(paidTimeoutMs()) on the SDK init. Measured on node 22
+ * that bound is not repo-owned: wrapFetchWithPayment resolves the paid
+ * response at headers-complete, and the signal must survive the SDK's
+ * new Request(input, init) → request.clone() → headers.set →
+ * fetch(clonedRequest.clone()) chain and undici's post-headers propagation
+ * into the returned body stream — reproducibly UNRELIABLE (runs where the
+ * init signal and the SDK's first request's signal abort at the bound while
+ * the paid request's clone-of-clone signal never does; a paid fetch or body
+ * read that then hangs until undici's own minutes-long socket timeouts).
+ *
+ * This deadline therefore owns the bound itself: an AbortController whose
+ * signal rides the paid-fetch init (the pre-headers path it reaches), and a
+ * promise that rejects at `ms` with a TimeoutError-NAMED error — raced
+ * against the paid call AND the body read, so the bound no longer depends on
+ * undici's signal propagation. The timer is unref()ed (an un-awaited deadline
+ * never keeps the process alive) and cleared by end() (finally discipline). */
+export interface PaidLegDeadline {
+  /** The controller's signal — passed as the paid-fetch init signal. */
+  readonly signal: AbortSignal;
+  /** Race a paid-leg promise against the deadline. */
+  race<T>(work: Promise<T>): Promise<T>;
+  /** Clear the timer (idempotent; call in a finally). */
+  end(): void;
+}
+
+export function paidLegDeadline(ms: number): PaidLegDeadline {
+  if (!Number.isSafeInteger(ms) || ms <= 0) {
+    throw new RangeError(`paidLegDeadline needs a positive integer millisecond bound, got: ${String(ms)}`);
+  }
+  const controller = new AbortController();
+  let rejectDeadline: (err: unknown) => void = () => undefined;
+  // The race loser: fires exactly once, at the bound. Promise.race subscribes
+  // to it, so its rejection is always handled (settled races ignore it).
+  const deadline = new Promise<never>((_resolve, reject) => { rejectDeadline = reject; });
+  const timer = setTimeout(() => {
+    const reason = new DOMException("the paid leg exceeded its repo-owned deadline", "TimeoutError");
+    controller.abort(reason);
+    rejectDeadline(reason);
+  }, ms);
+  timer.unref();
+  let ended = false;
+  return {
+    signal: controller.signal,
+    race: <T>(work: Promise<T>): Promise<T> => Promise.race([work, deadline]),
+    end: () => {
+      if (ended) return;
+      ended = true;
+      clearTimeout(timer);
+    },
+  };
+}

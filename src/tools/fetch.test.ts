@@ -143,9 +143,12 @@ it('default policy: the paid flow completes exactly as before (compat proof thro
   const result = await handler()({ url: 'https://compat-test.invalid/api' });
   const parsed = JSON.parse(result.content[0].text);
   assert.equal(parsed.status, 200, 'default policy must not refuse an ordinary payable request');
-  assert.equal(parsed.paid, true);
   // Issue #53: this flow is the UNSIGNED pass-through (the SDK never creates a
-  // payload for the asset-less offer) — nothing was signed, so the recorded
+  // payload for the asset-less offer) — nothing was signed. Issue #80: a
+  // response with nothing signed is a FREE response — paid:false (the pre-#80
+  // flow reported paid:true and wrote a success/0 row).
+  assert.equal(parsed.paid, false);
+  // Issue #53: nothing was signed, so the recorded
   // cost reads 0 (a free endpoint is not spend); the pre-#53 code reported the
   // probe estimate here.
   assert.equal(parsed.cost_usdc, 0);
@@ -406,7 +409,9 @@ it('intent boundary compat proof: an unpaid endpoint answers 200 directly — no
   assert.equal(calls, 2, 'the pass-through claim is proven: probe + direct 200');
   assert.equal(signatureSeen, false, 'no payment payload was ever created or attached');
   assert.equal(parsed.status, 200);
-  assert.equal(parsed.paid, true);
+  // Issue #80: nothing was signed or sent — a free response is paid:false
+  // (the pre-#80 flow reported paid:true for this pass-through).
+  assert.equal(parsed.paid, false);
   // Issue #53: nothing was signed in this pass-through — the recorded cost is
   // 0 (pre-#53 this echoed the probe estimate).
   assert.equal(parsed.cost_usdc, 0);
@@ -765,10 +770,12 @@ it('forced chain solana: an endpoint that does not charge (probe answers 200) pa
   // creation, no signature) — never refused.
   assert.equal(calls, 1, 'the probe response itself settles the request — exactly one network contact');
   assert.equal(parsed.status, 200);
-  assert.equal(parsed.paid, true);
+  // Issue #80: a free response is not a payment — paid:false, and NO success
+  // row (the pre-#80 flow wrote a success/0 ledger row + reported paid:true).
+  assert.equal(parsed.paid, false);
   assert.equal(parsed.policy_decision, undefined, 'ALLOW adds no policy keys to the success output');
   const entries = ledgerLines().slice(before.length).map((l) => JSON.parse(l));
-  assert.equal(entries.find((e: any) => e.url === url)?.status, 'success');
+  assert.equal(entries.find((e: any) => e.url === url), undefined, 'a free response writes no payment row (issue #80)');
 });
 
 // ---------------------------------------------------------------------------
@@ -1414,7 +1421,9 @@ it('liveness gate OFF (require_fresh_402: false): the flow is unchanged for a ca
   const result = await handler()({ url: `https://${host}/api` });
   const parsed = JSON.parse(result.content[0].text);
   assert.equal(parsed.status, 200, 'with the gate off, today’s behaviour is unchanged (L3 / L10 escape hatch)');
-  assert.equal(parsed.paid, true);
+  // Issue #80: the gate-off flow settles 200 with nothing signed (the legacy
+  // asset-less offer) — a free response is paid:false.
+  assert.equal(parsed.paid, false);
   assert.equal(parsed.policy_decision, undefined);
 });
 
