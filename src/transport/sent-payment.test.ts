@@ -12,9 +12,12 @@ import bs58 from 'bs58';
 // ledger row can later be reconciled against the chain:
 //   - an EVM exact payload's `signature` (a 0x-prefixed hex string) passes
 //     through verbatim;
-//   - a Solana exact payload's `transaction` (the base64 wire transaction)
-//     decodes to bytes whose FIRST 64 are the ed25519 signature — reported
-//     base58-encoded, the chain's canonical signature spelling;
+//   - a Solana exact payload's `transaction` is the base64 WIRE
+//     transaction: shortvec(signature count), then the 64-byte signature
+//     slots (index 0 the fee payer's — the facilitator's, added only at
+//     settlement — index 1 the client's), then the message. No bytes in it
+//     are the on-chain transaction signature, so the report must carry
+//     NONE;
 //   - an unparseable envelope still reports sent: true (the header was
 //     there — counting must never depend on parse success) with no signature.
 //
@@ -42,9 +45,20 @@ const EVM_PAYLOAD = {
   payload: { authorization: { from: '0xaaa', nonce: '0xbbb' }, signature: '0x' + 'd'.repeat(130) },
 };
 
+// The REAL Solana wire format: shortvec(signature count), then the 64-byte
+// signatures, then the compiled message (see @solana/transactions). A
+// partially-signed x402 client transaction carries TWO slots: index 0 is the
+// FEE PAYER's (the facilitator's signature — it does not exist on the client
+// and is only added at settlement; zero here), index 1 is the client's own.
+// Byte 0 is therefore the count (0x02), NOT a signature byte.
 const SVM_PAYLOAD = (() => {
-  const tx = Buffer.alloc(80);
-  Buffer.from('SIG'.repeat(24), 'ascii').copy(tx, 0, 0, 64); // 64-byte signature bytes
+  const message = Buffer.from('compiled-message-bytes', 'ascii');
+  const tx = Buffer.concat([
+    Buffer.from([0x02]), // shortvec: two signature slots
+    Buffer.alloc(64), // the fee-payer slot — the facilitator's own, unknowable here
+    Buffer.from('C'.repeat(64), 'ascii'), // the client's own signature bytes
+    message,
+  ]);
   return { x402Version: 2, payload: { transaction: tx.toString('base64') } };
 })();
 
@@ -55,13 +69,18 @@ it('an outgoing request carrying PAYMENT-SIGNATURE is reported sent, with the EV
   assert.equal(info.signature, '0x' + 'd'.repeat(130), 'the EVM payload signature passes through verbatim');
 });
 
-it('a Solana exact payload decodes the base64 wire transaction to its first-64 base58 signature', () => {
+it('a Solana payload in the real wire format reports sent WITHOUT a signature — never throws, never invents one', () => {
   const { sentPaymentOf } = requireSentPayment();
   const header = paymentHeaderValue(SVM_PAYLOAD);
   const info = sentPaymentOf('https://seller.invalid/api', { headers: { 'payment-signature': header } } as never);
-  assert.equal(info.sent, true);
-  const raw = Buffer.from(String(SVM_PAYLOAD.payload.transaction), 'base64');
-  assert.equal(info.signature, bs58.encode(raw.subarray(0, 64)), 'the chain signature is the first 64 bytes, base58');
+  assert.equal(info.sent, true, 'the paid request left the client regardless of the payload contents');
+  // The on-chain signature of a Solana payment is unknowable at payload time
+  // — byte 0 is the shortvec count, the fee-payer slot is the facilitator's
+  // own signature added at settlement, and the client's slot is not the tx
+  // signature. Any bytes read out of the envelope can never spell a real
+  // signature, so the report must carry NONE (settle evidence comes from the
+  // response receipt later, never from the payload).
+  assert.equal(info.signature, undefined, 'no signature can be derived from the payload envelope');
 });
 
 it('an X-PAYMENT header (legacy name) is equally a send signal', () => {
