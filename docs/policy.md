@@ -91,10 +91,11 @@ JSON via `POLICY_CONFIG_PATH` (no new dependencies), with `X402_POLICY_*` env ov
 }
 ```
 
-The example above **is** the behavior-compat default: non-directory hosts are payable at the global caps (`services.unknown: allow` — before the policy engine, directory membership played no role in the limit checks), the recipient gate is inactive by construction (`recipients` defaults to `change-detect` with **no** recorded baselines — nothing to compare, so rule 4.5 never fires), and the price anomaly gate ships disabled (`anomaly.enabled: false`). Tightening is opt-in and never the default — for example, the following refuses every non-directory host and tightens directory-service caps (a copy-paste of the block above does NOT apply any of this):
+The example above **is** the behavior-compat default: non-directory hosts are payable at the global caps (`services.unknown: allow` — before the policy engine, directory membership played no role in the limit checks), the recipient gate is inactive by construction (`recipients` defaults to `change-detect` with **no** recorded baselines — nothing to compare, so rule 4.5 never fires), and the price anomaly gate ships disabled (`anomaly.enabled: false`). Tightening is opt-in and never the default — for example, the following refuses every non-directory host and tightens directory-service caps (a copy-paste of the block above does NOT apply any of this). Every policy file carries its own `payments` block — it is the one required section:
 
 ```json
 {
+  "payments": { "enabled": true, "maxPerRequest": 0.50, "maxDaily": 10.00 },
   "services": {
     "unknown":    { "action": "deny" },
     "discovered": { "action": "allow", "maxPerRequest": 0.25, "maxDaily": 1.00 },
@@ -103,17 +104,28 @@ The example above **is** the behavior-compat default: non-directory hosts are pa
 }
 ```
 
+A file that carries only `recipients` (or only `services`) does not load: validation fails, the engine lands in the payments-disabled error state (`CONFIG_INVALID`, payments refused, fail closed). An allowlist-only policy therefore needs at least the `payments` block plus the recipient gate:
+
+```json
+{
+  "payments": { "enabled": true, "maxPerRequest": 0.50, "maxDaily": 10.00 },
+  "recipients": { "mode": "allowlist", "allowed": [], "perService": {}, "known": {} }
+}
+```
+
+(list your payees in `recipients.allowed` / `recipients.perService`; an empty effective list denies every recipient.)
+
 #### Profiles — `X402_POLICY_PROFILE`
 
-Three **operator opt-in** profiles ship on top of the defaults; `X402_POLICY_PROFILE` (`strict` | `standard` | `permissive`, exact lowercase match) selects one. With the variable unset the profile is **`permissive`** — exactly the behavior-compat default above; nothing changes until an operator opts in, and the startup log names the active profile (with the permissive default it warns that unknown services are payable up to the global caps — unless a policy file tightened them past that default). An unrecognized value fails closed: the engine lands in the payments-disabled error state (`CONFIG_INVALID`, payments refused), the failure is reported as `policy_profile=invalid` with the resolver message in the startup log and in `x402_check_payment` (`policy_profile_error`), and free tools are unaffected.
+Three **operator opt-in** profiles ship on top of the defaults; `X402_POLICY_PROFILE` (`strict` | `standard` | `permissive`, exact lowercase match) selects one. With the variable unset the profile is **`permissive`** — exactly the behavior-compat default above; nothing changes until an operator opts in, and the startup log names the active profile (with the permissive default it warns that unknown services are payable up to the global caps — unless a policy file tightened them past that default).
 
 | Profile | Effect |
 |---------|--------|
 | `permissive` (default) | The behavior-compat default: every service level payable at the global caps (`services.unknown: allow`), the recipient gate inactive (`change-detect` with no recorded baselines — nothing to compare against), the price-anomaly gate off. It does **not** turn the shipped gates off: the `BLOCKED` trust level (`POLICY_BLOCKED_HOSTS`) always denies, the `networks.allowed` / `tokens.allowed` allowlists still bind, and the endpoint liveness gate (`liveness.require_fresh_402: true` — the one deliberate default tightening, see below) refuses payments to unpinned or stale directory rows. |
 | `standard` | Non-directory hosts stay payable only at or below a **USD 0.05 per-request** line (written as `services.unknown.maxPerRequest`), directory membership raises no trust, and the price-anomaly gate turns on. Otherwise like `strict`: the recipient gate flips to **allowlist** mode — there is no approval channel, so the first payment to a new recipient is refused until the payee is listed via the config file — and the explicitly-trusted service levels are capped per host at **USD 0.05 per request** and **USD 1.00 per host per day** (`services.trusted` / `services.verified` carry that line). |
-| `strict` | The recipient gate flips to **allowlist** mode — with an empty effective list every recipient is denied, so nothing is payable until at least one payee is listed or a host is explicitly trusted (`POLICY_TRUSTED_HOSTS`, the one exception where a level survives the trust cap). Non-directory hosts are refused outright (`services.unknown: deny`) and directory membership raises no trust either. The price-anomaly gate turns on and the per-host cap binds everywhere: `services.trusted` / `services.verified` carry **USD 0.05 per request** and **USD 1.00 per host per day**, and `services.discovered` carries the same per-request line as defense in depth — no service level rides the global caps alone. |
+| `strict` | BOTH host and recipient gates must be satisfied before anything pays. The recipient gate flips to **allowlist** mode — an unlisted payee is refused with `RECIPIENT_NOT_ALLOWED` (with an empty effective list every recipient is denied) — and non-directory hosts are refused outright (`services.unknown: deny`): an unknown host is refused with `UNKNOWN_SERVICE` even when its payee is listed, and a trusted host (`POLICY_TRUSTED_HOSTS`, the one level that survives the trust cap) with an unlisted payee is refused with `RECIPIENT_NOT_ALLOWED`. Directory membership raises no trust either. The price-anomaly gate turns on and the per-host cap binds everywhere: `services.trusted` / `services.verified` carry **USD 0.05 per request** and **USD 1.00 per host per day**, and `services.discovered` carries the same per-request line as defense in depth — no service level rides the global caps alone. |
 
-The table states exactly what the code applies (`src/policy/profile.ts`): the caps are not aspirational. Every profile cap is `min()`-ed against the existing value and the legacy line — a profile can never raise a cap. An invalid `X402_POLICY_PROFILE` value fails closed: the engine lands in the payments-disabled error state (`CONFIG_INVALID`, payments refused), the failure is reported as `policy_profile=invalid` with the resolver message (startup log and `x402_check_payment`), and free tools are unaffected.
+The table states exactly what the code applies (`src/policy/profile.ts`): the caps are not aspirational. Every profile cap is `min()`-ed against the existing value and the legacy line — a profile can never raise a cap. An invalid `X402_POLICY_PROFILE` value fails closed: the engine lands in the payments-disabled error state (`CONFIG_INVALID`, payments refused), the failure is reported as `policy_profile=invalid` with the resolver message (in the startup log and in `x402_check_payment` as `policy_profile_error`), and free tools are unaffected.
 
 Precedence is unchanged and **a policy file always wins over the profile**: profile < `POLICY_CONFIG_PATH` file < `X402_POLICY_*` env overrides. With the variable unset the profile is `permissive`.
 
