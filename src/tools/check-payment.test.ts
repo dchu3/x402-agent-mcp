@@ -542,6 +542,16 @@ it('#66: reports the active policy profile in the inspection output (standard)',
   assert.equal(parsed.policy_profile, 'standard');
 });
 
+// D3: an UNSET profile reports the shipping default "permissive" — an operator
+// reading the inspection surface must see the actual default, not an implied one.
+it('D3: an unset X402_POLICY_PROFILE is reported as the default "permissive", with no error text', async () => {
+  delete process.env.X402_POLICY_PROFILE;
+  const result = await handler()({ url: 'https://analyzer.example/score', amount: 0.05, chain: 'base', token: 'USDC' });
+  const parsed = JSON.parse(result.content[0].text);
+  assert.equal(parsed.policy_profile, 'permissive');
+  assert.equal(parsed.policy_profile_error, undefined);
+});
+
 // Post-merge review (#86): an invalid X402_POLICY_PROFILE must be reported as
 // "invalid" — with the resolver message — not as the fail-closed fallback
 // "strict" an operator cannot tell apart from a deliberate choice.

@@ -314,3 +314,91 @@ it('a Polygon intent passes through on an exact eip155:137 requirement and abort
   assert.equal(after.valid, false, 'the pass-through consumed the intent exactly once');
   assert.ok(after.valid === false && after.code === 'ALREADY_USED');
 });
+
+// ---------------------------------------------------------------------------
+// Issue #66 (D7): changed terms between probe and payment. The challenge
+// scope the probe's offer bound (issue #55) must still hold at payload
+// creation: the requirement the SDK is about to sign is compared against
+// EVERY bound scope field — name, version (EIP-712 domain), fee payer, memo,
+// the validity window and the extension key set — and any drift aborts with
+// INTENT_OFFER_MISMATCH:<field> BEFORE a signature exists, leaving the
+// intent unconsumed. The comparator's own matrix lives in manager.test.ts;
+// what is pinned HERE is the hook wiring: drift actually aborts, pass-through
+// actually consumes (once).
+// ---------------------------------------------------------------------------
+
+function scopedIntent(): PaymentIntent {
+  return makeIntent({
+    chain: 'solana',
+    network: 'solana:5eykt4UsFv8P8NJdTREpY1vzBCKp7DvX',
+    asset: 'FakeSolanaUsdcMint',
+    maxTimeoutSeconds: 60,
+    extensionKeys: ['bazaar', 'zeta'],
+    evmDomainName: 'USDC',
+    evmDomainVersion: '2',
+    solanaFeePayer: 'FakeFeePayerAccount',
+    memo: 'receipt-x',
+  });
+}
+
+function scopedReq(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    scheme: 'exact',
+    network: 'solana:5eykt4UsFv8P8NJdTREpY1vzBCKp7DvX',
+    asset: 'FakeSolanaUsdcMint',
+    amount: '10000',
+    payTo: 'FakeRecipientAccount',
+    maxTimeoutSeconds: 60,
+    extra: { name: 'USDC', version: '2', feePayer: 'FakeFeePayerAccount', memo: 'receipt-x' },
+    ...overrides,
+  };
+}
+
+it('D7: the hook aborts when the paid requirement drifts from the bound challenge scope (name / version / fee payer / memo / validity / extensions), before signing, without consuming', async () => {
+  const goodExtensions = { bazaar: {}, zeta: {} };
+  // fullCtx has NO default for extensions: a fresh paymentRequired carries
+  // no extensions key at all unless this test puts one there, so the
+  // comparator's absent-extensions behaviour is exercisable.
+  const fullCtx = (requirements: Record<string, unknown>, extensions: unknown) =>
+    ({ ...matchingCtx, paymentRequired: { x402Version: 2, accepts: [], extensions }, selectedRequirements: requirements } as any);
+  const GOOD_EXTENSIONS = { bazaar: {}, zeta: {} };
+  const cases: Array<[Record<string, unknown>, string]> = [
+    [scopedReq({ extra: { name: 'Tampered', version: '2', feePayer: 'FakeFeePayerAccount', memo: 'receipt-x' } }), 'evmDomain'],
+    [scopedReq({ extra: { name: 'USDC', version: '3', feePayer: 'FakeFeePayerAccount', memo: 'receipt-x' } }), 'evmDomain'],
+    [scopedReq({ extra: { name: 'USDC', feePayer: 'FakeFeePayerAccount', memo: 'receipt-x' } }), 'evmDomain'],
+    [scopedReq({ extra: { name: 'USDC', version: '2', feePayer: 'FakeOtherAccount', memo: 'receipt-x' } }), 'feePayer'],
+    [scopedReq({ extra: { name: 'USDC', version: '2', feePayer: 'FakeFeePayerAccount', memo: 'other' } }), 'memo'],
+    [scopedReq({ maxTimeoutSeconds: 61 }), 'validity'],
+    [scopedReq({ maxTimeoutSeconds: 60, extra: undefined }), 'evmDomain'],
+  ];
+  for (const [requirements, field] of cases) {
+    _resetRegistryForTests();
+    const intent = scopedIntent();
+    const hook = intentEnforcement({ intent, manager: intentManager, executorLabel: 'x402_fetch' });
+    const res = await hook(fullCtx(requirements, GOOD_EXTENSIONS) as any);
+    assert.deepEqual(res, { abort: true, reason: `INTENT_OFFER_MISMATCH:${field}` }, `scoped drift ${JSON.stringify(requirements)} must abort on ${field}`);
+    const still = intentManager.validate(intent);
+    assert.ok(still.valid === true, `a ${field} drift must not consume (burn) the intent`);
+  }
+  // The extension key SET is compared too: a paid challenge missing or
+  // carrying extra extensions must abort.
+  for (const extensions of [undefined, {}, { bazaar: {} }, { bazaar: {}, zeta: {}, extra: {} }]) {
+    _resetRegistryForTests();
+    const intent = scopedIntent();
+    const hook = intentEnforcement({ intent, manager: intentManager, executorLabel: 'x402_fetch' });
+    const res = await hook(fullCtx(scopedReq(), extensions) as any);
+    assert.deepEqual(res, { abort: true, reason: 'INTENT_OFFER_MISMATCH:extensions' }, `extension set ${JSON.stringify(extensions ?? null)} must abort`);
+    assert.ok(intentManager.validate(intent).valid === true, 'an extension drift must not consume the intent');
+  }
+});
+
+it('D7: the unchanged signed requirement passes through and consumes the intent exactly once', async () => {
+  _resetRegistryForTests();
+  const intent = scopedIntent();
+  const hook = intentEnforcement({ intent, manager: intentManager, executorLabel: 'x402_fetch' });
+  const res = await hook(({ ...matchingCtx, paymentRequired: { x402Version: 2, accepts: [], extensions: { bazaar: {}, zeta: {} } }, selectedRequirements: scopedReq() } as any));
+  assert.equal(res, undefined, 'matching terms sign without an abort');
+  const after = intentManager.validate(intent);
+  assert.equal(after.valid, false);
+  assert.ok(after.valid === false && after.code === 'ALREADY_USED', 'pass-through consumed the intent exactly once');
+});

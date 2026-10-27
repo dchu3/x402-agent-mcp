@@ -14,7 +14,7 @@
 import { strict as assert } from 'node:assert';
 import { afterEach, it } from 'node:test';
 import { DEFAULT_POLICY_PROFILE, POLICY_PROFILES, applyProfileDefaults, capTrustForProfile, resolvePolicyProfile } from './profile.js';
-import { defaultPolicyConfig } from './config.js';
+import { defaultPolicyConfig, loadPolicyConfig } from './config.js';
 import { PolicyEngine } from './engine.js';
 import type { PolicyConfig } from './types.js';
 
@@ -233,4 +233,27 @@ it('#93 (C1): the engine refuses an unknown host past its per-host daily cap (SE
   assert.ok(!codes.includes('REQUEST_LIMIT_EXCEEDED'), 'the $0.04 request passes the per-request cap');
   assert.ok(!codes.includes('DAILY_LIMIT_EXCEEDED'), 'the global daily cap is not the binding one here');
   assert.equal(result.limits.perServiceDaily, 1.0, 'the engine projects the per-host cap into the limits report');
+});
+
+// Issue #66 (D2): the per-host caps must hold through the REAL loader when a
+// raised legacy env (MAX_PAYMENT_PER_CALL / MAX_DAILY_SPEND) tries to lift
+// them. The pure-engine cases above pin the overlay min(); this one drives
+// loadPolicyConfig() — the exact path index.ts and the tools take — with the
+// env captured and NO policy file, and checks the effective standard config:
+// per-request 0.05, per-host daily 1.00, payments 0.5/10 — the raised env
+// never widens anything the profile tightened.
+it('#66 (D2): raised legacy env cannot lift the standard per-host caps through the real loader', () => {
+  process.env.X402_POLICY_PROFILE = 'standard';
+  process.env.MAX_PAYMENT_PER_CALL = '5';
+  process.env.MAX_DAILY_SPEND = '50';
+  delete process.env.POLICY_CONFIG_PATH;
+  const state = loadPolicyConfig();
+  assert.deepEqual(state.configErrors, [], 'no file, raised env — the load itself must be clean');
+  assert.equal(state.profile, 'standard');
+  const unknown = state.config.services.unknown as unknown as Record<string, unknown>;
+  assert.equal(unknown.maxPerRequest, 0.05, 'raised MAX_PAYMENT_PER_CALL=5 is min()-ed back to the host line');
+  assert.equal(unknown.maxDaily, 1.0, 'raised MAX_DAILY_SPEND=50 is min()-ed back to the host line');
+  assert.equal(unknown.action, 'allow');
+  assert.equal(state.config.payments.maxPerRequest, 0.5, 'the global per-request cap is the profile line, not the env 5');
+  assert.equal(state.config.payments.maxDaily, 10, 'the global daily cap stays the profile line');
 });
