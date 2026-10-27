@@ -15,6 +15,7 @@ import { strict as assert } from 'node:assert';
 import { afterEach, it } from 'node:test';
 import { DEFAULT_POLICY_PROFILE, POLICY_PROFILES, applyProfileDefaults, capTrustForProfile, resolvePolicyProfile } from './profile.js';
 import { defaultPolicyConfig } from './config.js';
+import { PolicyEngine } from './engine.js';
 import type { PolicyConfig } from './types.js';
 
 const baseEnv = { ...process.env };
@@ -155,4 +156,81 @@ it('#86: a preset below the host line survives untouched, and a missing preset f
   assert.equal(cfg.services.verified.maxDaily, 0.5);
   assert.equal(cfg.services.trusted.maxPerRequest, 0.01, 'no preset → fallback is the global per-request cap, then the host line');
   assert.equal(cfg.services.trusted.maxDaily, 1.0, 'no preset → fallback is the legacy default daily, then the host line');
+});
+
+// ---------------------------------------------------------------------------
+// Issue #93 (C1) — the standard profile caps UNKNOWN hosts per day. The
+// overlay gave unknown hosts only a per-request cap, so a host stays payable
+// in unlimited small increments inside one day ($0.04 × N > any daily total)
+// — the per-host budget line the profile is named for never bound on the one
+// level non-directory hosts actually pay at. Same min() discipline as every
+// cap in the overlay: an existing tighter value survives, the legacy per-host
+// fallback (LEGACY_DEFAULT_MAX_DAILY) applies when the level carries none,
+// and a raised legacy env can never lift the profile line. strict (unknown
+// denied) and permissive (the deep-equal no-op, pinned in config.test.ts)
+// are untouched.
+// ---------------------------------------------------------------------------
+
+/** A raised-legacy-caps compat default: the values an operator's env would
+ * feed via legacyCaps before the overlay runs (hermetic — no env reads). */
+function raisedStdConfig(): PolicyConfig {
+  const cfg = pinnedCompatConfig();
+  cfg.payments = { enabled: true, maxPerRequest: 5, maxDaily: 50 };
+  return cfg;
+}
+
+it('#93 (C1): standard gives services.unknown the per-host daily cap line (1.00), min()-ed like every cap', () => {
+  const cfg = raisedStdConfig();
+  applyProfileDefaults(cfg, 'standard');
+  assert.equal(cfg.services.unknown.action, 'allow', 'unknown hosts stay payable in standard — the daily cap tightens, nothing else');
+  assert.equal(cfg.services.unknown.maxPerRequest, 0.05, 'the per-request line is unchanged');
+  assert.equal(cfg.services.unknown.maxDaily, 1.0, 'the per-host daily cap binds over the raised legacy default');
+});
+
+it('#93 (C1): a preset tighter than the line survives, a raised preset is min()-ed down — never lifted', () => {
+  const tightened = raisedStdConfig();
+  tightened.services.unknown = { action: 'allow', maxPerRequest: 0.01, maxDaily: 0.25 };
+  applyProfileDefaults(tightened, 'standard');
+  assert.equal(tightened.services.unknown.maxDaily, 0.25, 'a preset below the line survives untouched');
+
+  const raised = raisedStdConfig();
+  raised.services.unknown = { action: 'allow', maxPerRequest: 5, maxDaily: 20 };
+  applyProfileDefaults(raised, 'standard');
+  assert.equal(raised.services.unknown.maxPerRequest, 0.05);
+  assert.equal(raised.services.unknown.maxDaily, 1.0, 'a raised preset (or raised legacy env) can never lift the profile line');
+});
+
+it('#93 (C1): strict and permissive are untouched by the C1 change (unknown deny / compat default)', () => {
+  const strict = raisedStdConfig();
+  applyProfileDefaults(strict, 'strict');
+  assert.deepEqual(Object.keys(strict.services.unknown), ['action'], 'strict still configures services.unknown as plain deny');
+  assert.equal(strict.services.unknown.action, 'deny');
+});
+
+// The issue's hermetic engine case: with the standard profile loaded, an
+// unknown host, the payee LISTED (the recipient gate satisfied), $5.00
+// already spent at that host and a $0.04 request — the per-request cap
+// (0.05) and the global daily cap (10.00) both pass, and the per-host daily
+// cap (1.00) refuses with SERVICE_LIMIT_EXCEEDED. Pure inputs: the engine
+// never touches the ledger or the directory (the budget state is a stub).
+it('#93 (C1): the engine refuses an unknown host past its per-host daily cap (SERVICE_LIMIT_EXCEEDED)', () => {
+  const cfg = pinnedCompatConfig();
+  applyProfileDefaults(cfg, 'standard');
+  // The payee is listed (the operator file carries the recipients block after
+  // the overlay): the recipient gate must be satisfied so the per-service
+  // rule is the binding refusal.
+  const PAYEE = '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913';
+  cfg.recipients = { mode: 'allowlist', allowed: [PAYEE], perService: {}, known: {} };
+  const engine = new PolicyEngine({ config: cfg, configErrors: [], profile: 'standard' });
+  const result = engine.evaluate(
+    { service: 'unknown-host.example', chain: 'base', token: 'USDC', amount: 0.04, recipient: PAYEE, trustLevel: 'UNKNOWN' },
+    { dailySpentUsd: 5.0, perServiceSpentUsd: 5.0 },
+  );
+  const codes = result.reasons.map((r) => r.code);
+  assert.equal(result.decision, 'DENY');
+  assert.ok(codes.includes('SERVICE_LIMIT_EXCEEDED'), `the per-host daily cap must refuse (got: ${codes.join(', ')})`);
+  assert.ok(!codes.includes('RECIPIENT_NOT_ALLOWED'), 'the listed payee satisfied the recipient gate');
+  assert.ok(!codes.includes('REQUEST_LIMIT_EXCEEDED'), 'the $0.04 request passes the per-request cap');
+  assert.ok(!codes.includes('DAILY_LIMIT_EXCEEDED'), 'the global daily cap is not the binding one here');
+  assert.equal(result.limits.perServiceDaily, 1.0, 'the engine projects the per-host cap into the limits report');
 });

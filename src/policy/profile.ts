@@ -102,9 +102,18 @@ export function applyProfileDefaults(config: PolicyConfig, profile: PolicyProfil
     // expressed entirely in the EXISTING services.<level> schema — no engine
     // change, no new schema). This is a NEW allowance shape that exists only
     // when the operator opts in — called out in the #66 widening statement.
+    // Issue #93 (C1): the same line carries the per-host DAILY cap the other
+    // levels get (PROFILE_HOST_DAILY_CAP) — with only a per-request cap an
+    // unknown host stays payable in unlimited small increments inside one day
+    // ($0.04 × N > any daily total), which defeats the profile's per-host
+    // budget line. Same min() discipline as every cap in this overlay: an
+    // existing tighter value survives, the legacy per-host fallback applies
+    // when the level carries none, and a raised legacy env can never lift the
+    // profile line.
     config.services.unknown = {
       action: "allow",
       maxPerRequest: Math.min(config.services.unknown.maxPerRequest ?? config.payments.maxPerRequest, PROFILE_LOW_PER_REQUEST_CAP),
+      maxDaily: Math.min(config.services.unknown.maxDaily ?? LEGACY_DEFAULT_MAX_DAILY, PROFILE_HOST_DAILY_CAP),
     };
   } else {
     // strict: unknown hosts refused entirely. Directory rows carry NO trust
