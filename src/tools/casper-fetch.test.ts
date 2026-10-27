@@ -1,5 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { afterEach, after, it } from 'node:test';
+import { randomBytes } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -17,7 +18,7 @@ process.env.X402_DIRECTORY_PATH = join(dir, 'endpoints.json');
 writeFileSync(process.env.X402_DIRECTORY_PATH, JSON.stringify({ endpoints: [], categories: [], last_updated: '2026-09-25' }), 'utf8');
 const { registerFetchTool } = await import('./fetch.js');
 const { boundedText } = await import('./casper-fetch.js');
-const { logPayment, getDailySpent } = await import('../payment-utils.js');
+const { logPayment, getDailySpent, isCountedSpend } = await import('../payment-utils.js');
 const { casperBudget } = await import('../casper/budget.js');
 const { getPerServiceSpent } = await import('../policy/budget-store.js');
 const originalFetch = globalThis.fetch;
@@ -264,4 +265,41 @@ it('issue #80: a small X402_PAID_TIMEOUT_MS aborts a stalled Casper paid leg', {
   assert.equal(rows.length, before + 1, 'the stalled send stays a counted row — output and ledger agree');
   assert.equal(rows.at(-1).status, 'authorized_unserved');
   assert.equal(rows.at(-1).amount_motes, '1000000000');
+});
+
+// ---------------------------------------------------------------------------
+// Issue #97: a held (sent-but-unproven) Casper authorization is spend with an
+// UNKNOWN outcome — it may already have settled. The row is written with NO
+// expires_at and counts until the UTC day rollover, exactly like the USD and
+// Solana rails' rows: nothing releases it at the ~60 s payment-intent TTL,
+// and a restarted process rehydrates the identical held total (fail-closed
+// over-count direction). Hermetic end to end: the file's globalThis.fetch
+// mock, a throwaway key generated in the test, the temp ledger, a fake clock
+// on the pure isCountedSpend predicate, and the restart simulated by a
+// cache-busted rehydration.
+// ---------------------------------------------------------------------------
+let holdBust = 0;
+it('issue #97: a held unserved authorization is written with NO expires_at — it counts past the intent TTL and rehydrates', async () => {
+  process.env.CASPER_MAX_PAYMENT_PER_CALL = '1';
+  process.env.CASPER_MAX_DAILY_SPEND = '10';
+  process.env.CASPER_PRIVATE_KEY = randomBytes(32).toString('hex');
+  const rec = signedRecorder(async () => { throw new TypeError('terminated'); });
+  const before = ledgerLines().length, spentBefore = casperBudget.getDailySpent();
+  const restartBefore = ((await import(`../casper/budget.js?hold97=${++holdBust}`)) as typeof import('../casper/budget.js')).casperBudget.getDailySpent();
+  const parsed = JSON.parse((await handler()({ url: 'https://example.invalid', chain: 'casper', method: 'POST', body: '{}' })).content[0].text);
+  assert.equal(parsed.paid, 'unknown', `a sent-but-unproven authorization is an unknown outcome: ${JSON.stringify(parsed)}`);
+  assert.equal(parsed.authorization_sent, true);
+  assert.equal(rec.signed, 1, 'exactly one signed request left the mock');
+  const rows = ledgerLines();
+  assert.equal(rows.length, before + 1, 'the ledger keeps the row');
+  const row = rows.at(-1);
+  assert.equal(row.status, 'authorized_unserved');
+  assert.equal(row.amount_motes, '1000000000');
+  assert.ok(!('expires_at' in row), `the hold carries no expiry — nothing under the UTC day rollover releases it: ${JSON.stringify(row)}`);
+  assert.equal(isCountedSpend(row, Date.now()), true);
+  assert.equal(isCountedSpend(row, Date.now() + 61_000), true, 'past the ~60 s intent TTL the row still counts — the outcome is still unknown');
+  assert.equal(isCountedSpend(row, Date.now() + 12 * 3_600_000), true, 'still counting half a day on — the UTC day rollover is the only bound');
+  assert.equal(casperBudget.getDailySpent(), spentBefore + 1000000000n, 'the mote budget counts the hold');
+  const restartAfter = ((await import(`../casper/budget.js?hold97=${++holdBust}`)) as typeof import('../casper/budget.js')).casperBudget.getDailySpent();
+  assert.equal(restartAfter, restartBefore + 1000000000n, 'across a rehydration the hold still counts — a restart never drops it');
 });

@@ -17,6 +17,7 @@ process.env.X402_STATE_DIR = join(dir, 'state');
 mkdirSync(process.env.X402_STATE_DIR, { recursive: true });
 const env = { ...process.env };
 const { CasperBudget, guardCasperPayments, casperBudget } = await import('./budget.js');
+const { isCountedSpend } = await import('../payment-utils.js');
 type CasperBudgetInstance = InstanceType<typeof CasperBudget>;
 
 afterEach(() => { process.env = { ...env, PAYMENT_LOG_PATH: join(dir, 'ledger.jsonl'), X402_STATE_DIR: join(dir, 'state') }; });
@@ -172,4 +173,42 @@ it('the unset-rate path still refuses rather than pricing an unknown rail — re
   const fresh = await import(`./budget.js?casper54=${++bust}`) as typeof import('./budget.js');
   assert.equal(fresh.casperBudget.getDailySpent(), 5000000000n, 'the rehydrated total is exact motes — never a priced conversion');
   assert.throws(() => fresh.casperBudget.check(1000000000n), /RAIL_DISABLED_NO_RATE/, 'the cross-chain ceiling refuses an unpriced rail, rehydrated or not');
+});
+
+// ---------------------------------------------------------------------------
+// Issue #97: the fail-closed hold rule at the ledger/budget level — a Casper
+// row written today (the fixed writer's shape) carries NO expires_at: the
+// held authorization counts past the ~60 s payment-intent TTL and rehydrates
+// identically across a restart — the UTC day rollover is the only bound. A
+// LEGACY row that still carries an expires_at keeps its old read semantics
+// (a past expiry releases; inside the expiry it counts) — the change stays
+// narrow, isCountedSpend itself is untouched.
+// ---------------------------------------------------------------------------
+it('issue #97: a held unserved authorization (no expires_at) counts +61 s, +12 h and after a restart; a legacy past expiry still releases', async () => {
+  const now = Date.now();
+  const held = {
+    timestamp: new Date(now).toISOString(),
+    url: 'https://casper-svc.invalid/api',
+    method: 'GET',
+    chain: 'casper',
+    currency: 'wCSPR',
+    amount_motes: '2500000000',
+    status: 'authorized_unserved',
+  };
+  writeFileSync(process.env.PAYMENT_LOG_PATH!, rows(
+    held, // the fixed writer's shape: NO expires_at
+    { ...held, amount_motes: '1000000000', expires_at: new Date(now - 60_000).toISOString() }, // legacy: past expiry
+    { ...held, amount_motes: '500000000', status: 'success' }, // settled: counts permanently
+  ) + '\n', 'utf8');
+  // The fake clock on the ONE counted-spend predicate: no release at the
+  // intent TTL, none half a day on.
+  assert.equal(isCountedSpend(held, now + 61_000), true, '+61 s: past the ~60 s intent TTL the hold still counts');
+  assert.equal(isCountedSpend(held, now + 12 * 3_600_000), true, '+12 h: still counting — nothing under the UTC day rollover releases');
+  // Negative control: legacy rows keep their old read semantics.
+  const legacy = { ...held, amount_motes: '1000000000', expires_at: new Date(now - 60_000).toISOString() };
+  assert.equal(isCountedSpend(legacy, now), false, 'a legacy row with a past expires_at releases exactly as before');
+  assert.equal(isCountedSpend({ ...legacy, expires_at: new Date(now + 60_000).toISOString() }, now), true, 'a legacy row inside its expiry still counts');
+  // Restart simulation: a fresh module rehydrates the identical total.
+  const fresh = await import(`./budget.js?issue97=${++bust}`) as typeof import('./budget.js');
+  assert.equal(fresh.casperBudget.getDailySpent(), 3000000000n, 'the hold counts across a restart; the legacy past expiry releases');
 });
