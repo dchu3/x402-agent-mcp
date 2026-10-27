@@ -550,16 +550,23 @@ it('positive + negative control (#60): the guard G scanner fails on lookalike ad
 const GUARD_H_TOKENS: ReadonlyArray<[string, RegExp]> = [
   ['issue reference', /[Ii]ssues? #[0-9]+/],
   ['issue reference', /\(#[0-9]+\)/],
+  // a bare "refs #123"-style pointer — no "issue" word, no parens (widened
+  // for #93: the reference must not survive either spelling)
+  ['issue reference', /#[0-9]+/],
   ['requirement number', /\(?req(?:uirement)? [0-9]+\)?/],
   ['stage label', /[Ss]tage [A-C]\b/],
   ['release-note wording', /BREAKING CHANGE/],
   ['history note', /[Pp]reviously/],
   ['history note', /[Ff]ormerly/],
   ['history note', /before chain-scoping/],
-  ['history note', /old payment_info/],
+  // widened for #93: the backticked token (`old `payment_info``) must be
+  // caught exactly like the bare word, and the straight or curly apostrophe
+  // in "Today's/Today’s behaviour" phrasing — prose style must not hide the
+  // history note from the scanner.
+  ['history note', /old `?payment_info`?/],
   ['history note', /once dragged/],
   ['history note', /hardcoded 30 s/],
-  ['history note', /Today's behavio/],
+  ['history note', /Today['’]s behavio/],
 ];
 
 function findGuardHViolations(text: string): string[] {
@@ -594,11 +601,14 @@ it('positive + negative control (#87): the guard H scanner fails on every token 
   // prose tokens (nothing secret-shaped), so direct strings are fine here.
   const BAD = [
     'added in issue ' + '#86' + ' (see ' + '(' + '#87' + '))',
+    'recorded in the triage list as ' + '#93' + ' — a bare ' + '#42' + ' pointer too',
     'req ' + '2' + ' of the rollout, requirement ' + '3' + ' for casper',
     'Stage ' + 'A' + ' shipped it — BREAKING ' + 'CHANGE:',
     'Previously the flow estimated; formerly it fell back',
     'an old ' + 'payment_info' + ' echo once ' + 'dragged' + ' baselines to zero (a once-d' + 'ragged baseline…)',
+    'the retired ' + 'old ' + '`payment_info`' + ' backticked echo is caught too',
     'a hardcoded ' + '30 s' + ' literal; Today' + "'" + 's behavio' + 'ur row',
+    'and the curly-spelled ' + 'Today\u2019s behavio' + 'ur row as well',
     'before chain-' + 'scoping the vocabulary was one chain',
   ].join('\n');
   assert.equal(findGuardHViolations(BAD).length, GUARD_H_TOKENS.length, 'every token class must be flagged');
