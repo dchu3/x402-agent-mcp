@@ -82,8 +82,14 @@ import type { IntentRejectCode, PaymentIntent } from "../payment-intent/types.js
  * max_daily) and adds policy_decision + reasons (issue #19 Phase 6:
  * machine-readable codes, never message-only). Reasons pass through verbatim,
  * including their optional detail payload (issue #30: PRICE_ANOMALY carries
- * the z-score / fallback ratio plus baseline stats there for the audit log). */
-
+ * the z-score / fallback ratio plus baseline stats there for the audit log).
+ * Issue #93 (A1): daily_spent_usdc is the figure the refusing gate compared —
+ * gateDailySpent(legNetwork) (the leg's own bucket plus its daily hold scope)
+ * whenever the leg's network is known; when the network is not yet resolved
+ * the field keeps the plain getDailySpent() mainnet total, and the Casper leg
+ * is the notable resolved-but-unchanged case: its own gate reads exactly that
+ * mainnet total, no holds and no spend bucket (issue #59's bucket rule never
+ * touches the mote leg). */
 // Issue #55: the one call-site extra key the fetch seam feeds the SDK —
 // extra.recentBlockhash is the payload block hint the SVM signing code
 // consumes (its VALUE is never bound; the scope boundary shape-checks it).
@@ -139,11 +145,29 @@ function sdkSpendControls(registeredNetwork: string, extensions: readonly Operat
   return { maxAmountPerPayment: getMaxPerCall(), allowedAssets: entries };
 }
 
+/** Issue #93 (A1): the daily-spend figure this leg's daily gate compares. The
+ * leg's OWN spend bucket governs, exactly like the Step 3.5 policy gate's
+ * budget inputs: a Solana-devnet leg reads the DEVNET bucket's ledger total
+ * (getDailySpent of the devnet bucket — a total the mainnet whole-map sum
+ * never sees) plus the outstanding holds in the devnet daily hold scope
+ * (reservedUsd(dailyHoldScope(...))); every other leg reads the mainnet
+ * whole-map total plus the 'global'-scope holds. The structured refusals and
+ * the success output print this same figure at their daily_spent_usdc sites,
+ * so a devnet leg stops displaying the mainnet-only total. A call site whose
+ * leg network is not yet resolved (no offer observed) keeps the plain
+ * getDailySpent() mainnet total instead — see the refusal helpers' doc
+ * comments for the fallback rule. */
+function gateDailySpent(network: string | undefined): number {
+  const bucket = spendBucketForNetwork(network);
+  return getDailySpent(bucket) + reservedUsd(dailyHoldScope(bucket));
+}
+
 function policyRefusal(
   result: ReturnType<ReturnType<typeof getPolicyEngine>["evaluate"]>,
   url: string,
   chain: string,
   amountUsdc: number,
+  legNetwork?: string,
 ): { content: Array<{ type: "text"; text: string }> } {
   return {
     content: [{
@@ -153,7 +177,7 @@ function policyRefusal(
         url,
         chain,
         estimated_cost_usdc: amountUsdc,
-        daily_spent_usdc: getDailySpent(),
+        daily_spent_usdc: legNetwork !== undefined ? gateDailySpent(legNetwork) : getDailySpent(),
         max_per_call: getMaxPerCall(),
         max_daily: getMaxDailySpend(),
         policy_decision: result.decision,
@@ -167,12 +191,17 @@ function policyRefusal(
  * policyRefusal (error, url, chain, estimated_cost_usdc, daily_spent_usdc,
  * max_per_call, max_daily, policy_decision, reasons), with policy_decision +
  * machine-readable reasons. Only an ALLOWed request can reach the payment
- * layer, so policy_decision is ALLOW here by construction. */
+ * layer, so policy_decision is ALLOW here by construction. Issue #93 (A1):
+ * daily_spent_usdc follows the same leg-scoped rule as policyRefusal —
+ * gateDailySpent(legNetwork) (the leg's own bucket plus its daily hold scope)
+ * when the leg's network is known, the plain getDailySpent() mainnet total
+ * otherwise (network not yet resolved). */
 function intentRefusal(
   url: string,
   chain: string,
   amountUsdc: number,
   reasons: Array<{ code: string; message: string }>,
+  legNetwork?: string,
 ): { content: Array<{ type: "text"; text: string }> } {
   return {
     content: [{
@@ -182,7 +211,7 @@ function intentRefusal(
         url,
         chain,
         estimated_cost_usdc: amountUsdc,
-        daily_spent_usdc: getDailySpent(),
+        daily_spent_usdc: legNetwork !== undefined ? gateDailySpent(legNetwork) : getDailySpent(),
         max_per_call: getMaxPerCall(),
         max_daily: getMaxDailySpend(),
         policy_decision: "ALLOW",
@@ -1108,7 +1137,8 @@ export function registerFetchTool(server: McpServer): void {
           getAnomalyInputs(url),
         );
         if (policyResult.decision !== "ALLOW") {
-          return policyRefusal(policyResult, url, useChain, amountUsdc);
+          // Issue #93 (A1): the refusal reports the leg's own gate figure.
+          return policyRefusal(policyResult, url, useChain, amountUsdc, probedOffer?.network);
         }
 
         // Issue #80 (R2): the caller's PER-CALL NARROWING limits,
@@ -1176,7 +1206,7 @@ export function registerFetchTool(server: McpServer): void {
                   url,
                   chain: useChain,
                   estimated_cost_usdc: amountUsdc,
-                  daily_spent_usdc: getDailySpent(),
+                  daily_spent_usdc: gateDailySpent(probedOffer?.network),
                   max_per_call: getMaxPerCall(),
                   max_daily: getMaxDailySpend(),
                   policy_decision: "ALLOW",
@@ -1298,7 +1328,7 @@ export function registerFetchTool(server: McpServer): void {
                 url,
                 chain: useChain,
                 estimated_cost_usdc: amountUsdc,
-                daily_spent_usdc: getDailySpent(),
+                daily_spent_usdc: gateDailySpent(probedOffer?.network),
                 max_per_call: getMaxPerCall(),
                 max_daily: getMaxDailySpend(),
               }),
@@ -1320,7 +1350,7 @@ export function registerFetchTool(server: McpServer): void {
           return intentRefusal(url, useChain, amountUsdc, [
             { code: "INTENT_UNAUTHORISED", message: "the signed amount could not be converted to USD for spend accounting — refusing before signing (fail closed)" },
             { code: "AMOUNT_UNBINDABLE", message: "atomic amount of the bound intent is not convertible even though the intent itself is valid" },
-          ]);
+          ], probedOffer?.network);
         }
 
         // (payloadSigned is declared above the try — the catch reads it.)
@@ -1350,7 +1380,7 @@ export function registerFetchTool(server: McpServer): void {
                 url,
                 chain: useChain,
                 estimated_cost_usdc: amountUsdc,
-                daily_spent_usdc: getDailySpent(),
+                daily_spent_usdc: gateDailySpent(probedOffer?.network),
                 reserved_usdc: reservedUsd("global"),
                 max_per_call: getMaxPerCall(),
                 max_daily: getMaxDailySpend(),
@@ -1446,7 +1476,7 @@ export function registerFetchTool(server: McpServer): void {
             return intentRefusal(url, useChain, amountUsdc, [
               { code: "INTENT_UNAUTHORISED", message: `payment-intent boundary refused execution (${guarded.code})` },
               { code: guarded.code, message: `${guarded.code}: ${guarded.message}` },
-            ]);
+            ], probedOffer?.network);
           }
           const resp = guarded.result;
 
@@ -1637,7 +1667,12 @@ export function registerFetchTool(server: McpServer): void {
                   })),
                 }),
                 ...(sellerReportedCost !== undefined ? { seller_reported_cost: sellerReportedCost } : {}),
-                daily_spent_usdc: parseFloat(getDailySpent().toFixed(4)),
+                // Issue #93 (A1): the leg's own gate figure — the devnet
+                // bucket's total (plus its hold scope) for a devnet leg, the
+                // mainnet total for every other leg. The reservation of this
+                // leg is already settled by this point, so the holds figure
+                // covers only overlapping legs that still hold budget.
+                daily_spent_usdc: parseFloat(gateDailySpent(probedOffer?.network).toFixed(4)),
                 payment_receipt: paymentReceipt,
                 receipt_verified: RECEIPT_VERIFIED,
                 receipt_note: RECEIPT_NOTE,
@@ -1719,7 +1754,7 @@ export function registerFetchTool(server: McpServer): void {
         // SDK error string as the message.
         const abortReasons = intentAbortReasons(String(err?.message ?? err));
         if (abortReasons) {
-          return intentRefusal(url, useChain, amountUsdc, abortReasons);
+          return intentRefusal(url, useChain, amountUsdc, abortReasons, probedOffer?.network);
         }
 
         // Issue #56+#54: the paid request ran out of its own timeout bound. A
