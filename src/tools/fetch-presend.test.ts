@@ -14,8 +14,9 @@ import bs58 from 'bs58';
 // request ever leaves: no request carries a payment header, the seller sees
 // zero paid attempts. The catch path must classify that as a plain
 // pre-send failure:
-//   - the response's tri-state paid is "no" (today it reports "unknown",
-//     which forbids the agent from retrying a call that never left);
+//   - the response's tri-state paid is false (the pre-#54 "nothing was
+//     paid" spelling — today it reports "unknown", which forbids the agent
+//     from retrying a call that never left);
 //   - the ledger row is a zero-amount `failed` row (today a counted
 //     authorized_unserved row appears for a call that never left);
 //   - no money is counted (today's daily total moves by the price);
@@ -141,7 +142,7 @@ function installNetwork(opts: { rpcStatus: number }): {
   return counters;
 }
 
-it('an RPC failure during payload creation leaves zero-signed contacts: no counted row, no daily spend, paid "no" (today it counts a payment that never left)', async () => {
+it('an RPC failure during payload creation leaves zero-signed contacts: no counted row, no daily spend, paid:false (today it counts a payment that never left)', async () => {
   const url = 'https://presend-429.invalid/api';
   const counters = installNetwork({ rpcStatus: 429 });
   const dailyBefore = PM.getDailySpent();
@@ -152,7 +153,7 @@ it('an RPC failure during payload creation leaves zero-signed contacts: no count
   assert.equal(counters.rpcCalls, 1, 'payload creation touched the RPC once');
   assert.equal(counters.sellerSignedContacts, 0, 'the seller saw zero paid requests — the payment never left');
   assert.equal(counters.headerRequests, 0, 'no outgoing request carried a payment header at all');
-  assert.equal(parsed.paid, 'no', 'a call that never left is "no" — never "unknown" (today: it reports unknown)');
+  assert.equal(parsed.paid, false, 'a call that never left is paid:false (the #54 vocabulary) — never "unknown" (today: it reports unknown)');
   const row = ledgerRows().find((r) => r.url === url);
   assert.ok(row, 'the ledger records the attempt');
   assert.equal(row.status, 'failed', 'a pre-send failure records a failed row (today: a counted authorized_unserved row)');
@@ -162,7 +163,7 @@ it('an RPC failure during payload creation leaves zero-signed contacts: no count
   assert.ok(Math.abs(RES.reservedUsd('global') - reservedBefore) < 1e-9, 'the reservation was released (no hold lingers)');
 });
 
-it('the same pre-send classification applies when the RPC says 500', async () => {
+it('the same pre-send classification applies when the RPC says 500 (paid:false, failed row, no spend)', async () => {
   const url = 'https://presend-500.invalid/api';
   const counters = installNetwork({ rpcStatus: 500 });
   const dailyBefore = PM.getDailySpent();
@@ -170,7 +171,7 @@ it('the same pre-send classification applies when the RPC says 500', async () =>
   const parsed = JSON.parse(result.content[0].text);
 
   assert.equal(counters.sellerSignedContacts, 0, 'the seller saw zero paid requests');
-  assert.equal(parsed.paid, 'no', 'no payment left — paid "no"');
+  assert.equal(parsed.paid, false, 'no payment left — paid:false');
   const row = ledgerRows().find((r) => r.url === url);
   assert.ok(row, 'a row exists');
   assert.equal(row.status, 'failed', 'a pre-send failure is a failed row');

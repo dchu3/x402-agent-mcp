@@ -1710,7 +1710,7 @@ export function registerFetchTool(server: McpServer): void {
           // Issue #80 (R1a): the paid-leg deadline is cleared exactly here —
           // the paid fetch AND its body read completed (or threw) by now.
           paidDeadline?.end();
-          if (payloadSigned) settleReservation(reservation.id);
+          if (payloadSigned && paidRequestSent) settleReservation(reservation.id);
           else releaseReservation(reservation.id);
         }
       } catch (err: any) {
@@ -1721,6 +1721,15 @@ export function registerFetchTool(server: McpServer): void {
         // per-service store moves identically (one predicate, both sides).
         // Only a path that never signed keeps the zero-spend failed row
         // exactly as before.
+        // Issue #92: the catch's classification needs the OUTGOING-REQUEST
+        // signal, not the payload-only one. The SDK can ABORT inside payload
+        // creation AFTER the local signing (an RPC 429/5xx in the scheme's
+        // metadata fetch) — payloadSigned is true, but the wrapper saw no
+        // request carrying a payment header: nothing left the client. That
+        // is a plain pre-send failure: a zero-amount failed row, paid "no",
+        // no counted spend, reservation released. Only a request the wrapper
+        // actually saw (paidRequestSent) earns the counted
+        // authorized_unserved row and the unknown tri-state.
         logPayment({
           timestamp: new Date().toISOString(),
           url,
@@ -1730,7 +1739,7 @@ export function registerFetchTool(server: McpServer): void {
           // carry it too — the audit trail is complete; only SUCCESS devnet
           // rows feed the devnet bucket).
           ...(probedOffer?.network ? { network: probedOffer.network } : {}),
-          ...(payloadSigned && intent !== null
+          ...(payloadSigned && paidRequestSent && intent !== null
             ? {
                 amount_usdc: signedAmountUsdc ?? 0,
                 amount_atomic: intent.amountAtomic,
@@ -1743,7 +1752,7 @@ export function registerFetchTool(server: McpServer): void {
             : { amount_usdc: 0, status: "failed" as const }),
           error: err.message,
         });
-        if (payloadSigned && intent !== null) {
+        if (payloadSigned && paidRequestSent && intent !== null) {
           recordServicePayment(url, signedAmountUsdc ?? 0);
         }
 
@@ -1787,7 +1796,7 @@ export function registerFetchTool(server: McpServer): void {
                 error: "PAID_TIMEOUT",
                 url,
                 chain: useChain,
-                ...(payloadSigned
+                ...(payloadSigned && paidRequestSent
                   ? {
                       paid: "unknown",
                       authorization_sent: true,
@@ -1819,9 +1828,13 @@ export function registerFetchTool(server: McpServer): void {
               chain: useChain,
               url,
               // Issue #54 (Option A): after a send, a throw is UNKNOWN
-              // spend, not a bare `paid: false` — the counted
-              // authorized_unserved row was already written above.
-              ...(payloadSigned
+              // spend — but "send" is the OUTGOING-REQUEST fact (issue
+              // #92): a payload that failed during creation after signing
+              // never left, so this is the pre-send failure case again:
+              // paid:false (the #54 "nothing was paid" spelling — retrying
+              // cannot double-pay), a zero-amount failed row, no counted
+              // spend.
+              ...(payloadSigned && paidRequestSent
                 ? {
                     paid: "unknown",
                     authorization_sent: true,
@@ -1829,7 +1842,7 @@ export function registerFetchTool(server: McpServer): void {
                     cost_usdc: signedAmountUsdc ?? 0,
                     note: "the signed payment was sent but the call failed without settlement evidence — do not retry blindly (this client never auto-retries a paid call); the amount counts against today's budget until the sent payload's validity expires",
                   }
-                : {}),
+                : { paid: false }),
             }),
           }],
         };
