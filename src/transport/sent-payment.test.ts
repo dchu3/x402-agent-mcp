@@ -1,17 +1,16 @@
 import { strict as assert } from 'node:assert';
 import { it } from 'node:test';
-import bs58 from 'bs58';
 
 // ---------------------------------------------------------------------------
 // The outgoing-payment signal: the wrapper around the paid transport reads
-// EVERY request the SDK sends and reports (a) whether the outgoing request
+// EVERY request the SDK sends and reports whether the outgoing request
 // carried a payment header — the exact "the paid request left the client"
 // signal the pre-send classification keys on (case-insensitive header names:
-// the v2 PAYMENT-SIGNATURE and the legacy X-PAYMENT) — and (b) the on-chain
-// signature of the sent payment when the payload envelope carries it, so the
-// ledger row can later be reconciled against the chain:
-//   - an EVM exact payload's `signature` (a 0x-prefixed hex string) passes
-//     through verbatim;
+// the v2 PAYMENT-SIGNATURE and the legacy X-PAYMENT). The report carries NO
+// on-chain signature — at payload time the client cannot know one:
+//   - an EVM exact payload's `signature` is the EIP-3009 authorization
+//     signature, not the settlement transaction — it stays inside the
+//     envelope;
 //   - a Solana exact payload's `transaction` is the base64 WIRE
 //     transaction: shortvec(signature count), then the 64-byte signature
 //     slots (index 0 the fee payer's — the facilitator's, added only at
@@ -62,11 +61,10 @@ const SVM_PAYLOAD = (() => {
   return { x402Version: 2, payload: { transaction: tx.toString('base64') } };
 })();
 
-it('an outgoing request carrying PAYMENT-SIGNATURE is reported sent, with the EVM payload signature', () => {
+it('an outgoing request carrying PAYMENT-SIGNATURE is reported sent', () => {
   const { sentPaymentOf } = requireSentPayment();
   const info = sentPaymentOf('https://seller.invalid/api', { headers: { 'payment-signature': paymentHeaderValue(EVM_PAYLOAD) } } as never);
-  assert.equal(info.sent, true);
-  assert.equal(info.signature, '0x' + 'd'.repeat(130), 'the EVM payload signature passes through verbatim');
+  assert.deepEqual(info, { sent: true }, 'sent — and nothing else: the envelope yields no signature');
 });
 
 it('a Solana payload in the real wire format reports sent WITHOUT a signature — never throws, never invents one', () => {
@@ -80,36 +78,32 @@ it('a Solana payload in the real wire format reports sent WITHOUT a signature �
   // signature. Any bytes read out of the envelope can never spell a real
   // signature, so the report must carry NONE (settle evidence comes from the
   // response receipt later, never from the payload).
-  assert.equal(info.signature, undefined, 'no signature can be derived from the payload envelope');
+  assert.deepEqual(info, { sent: true }, 'no signature can be derived from the payload envelope');
 });
 
 it('an X-PAYMENT header (legacy name) is equally a send signal', () => {
   const { sentPaymentOf } = requireSentPayment();
   const info = sentPaymentOf('https://seller.invalid/api', { headers: { 'X-Payment': paymentHeaderValue(EVM_PAYLOAD) } } as never);
-  assert.equal(info.sent, true);
-  assert.equal(info.signature, '0x' + 'd'.repeat(130));
+  assert.deepEqual(info, { sent: true });
 });
 
 it('an unparseable payment header still counts as sent (counting never depends on parse success)', () => {
   const { sentPaymentOf } = requireSentPayment();
   for (const bad of ['!!!not-base64!!!', Buffer.from('{"x402Version":2,"payload":{}}').toString('base64')]) {
     const info = sentPaymentOf('h', { headers: { 'payment-signature': bad } } as never);
-    assert.equal(info.sent, true, `header value ${bad.slice(0, 20)} still marks the send`);
-    assert.equal(info.signature, undefined, `header value ${bad.slice(0, 20)} yields no signature`);
+    assert.deepEqual(info, { sent: true }, `header value ${bad.slice(0, 20)} still marks the send`);
   }
 });
 
 it('a request without any payment header is not sent (the unpaid probe is not a send)', () => {
   const { sentPaymentOf } = requireSentPayment();
   const none = sentPaymentOf('https://seller.invalid/api', { headers: { accept: 'application/json' } } as never);
-  assert.equal(none.sent, false);
-  assert.equal(none.signature, undefined);
+  assert.deepEqual(none, { sent: false });
 });
 
 it('a Request instance carrying the header is read like an (input, init) pair', () => {
   const { sentPaymentOf } = requireSentPayment();
   const request = new Request('https://seller.invalid/api', { headers: { 'payment-signature': paymentHeaderValue(EVM_PAYLOAD) } });
   const info = sentPaymentOf(request, undefined);
-  assert.equal(info.sent, true);
-  assert.equal(info.signature, '0x' + 'd'.repeat(130));
+  assert.deepEqual(info, { sent: true });
 });

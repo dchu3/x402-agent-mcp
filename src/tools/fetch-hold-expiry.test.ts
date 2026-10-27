@@ -19,9 +19,9 @@ import { join } from 'node:path';
 //     authorized_unserved row (nothing settled, a send happened) whose
 //     expires_at follows the payload validity;
 //   - a throw AFTER the signed request left the client records the same row
-//     on the catch path, AND carries the sent payment's on-chain signature
-//     (captured from the outgoing payment header) so a settlement reconciler
-//     can find it later;
+//     on the catch path; the row carries NO captured signature (the client
+//     cannot know the on-chain signature at payload time — settle evidence
+//     comes only from the response receipt);
 //   - the payload-validity expiry helper itself is pure and pinned directly.
 //
 // Drive the REAL x402_fetch flow against a loopback mock seller (the
@@ -128,9 +128,13 @@ it('a settled-unreached (non-200, no receipt) row counts until the payload valid
 });
 
 // ---------------------------------------------------------------------------
-// Row expiry + signature capture — the throw-after-send catch-path row.
+// Row expiry — the throw-after-send catch-path row. The row carries no
+// signature: the sent request's envelope cannot spell the on-chain
+// signature (on Solana the first wire-transaction signature slot is the
+// facilitator fee payer's; on EVM the payload signature is the
+// authorization, not the settlement tx).
 // ---------------------------------------------------------------------------
-it('a throw after the signed request left records the same validity-based expiry and the sent signature', async () => {
+it('a throw after the signed request left records the same validity-based expiry and no signature', async () => {
   const url = 'https://hold-expiry-throw.invalid/api';
   globalThis.fetch = (async (input: unknown, init: unknown) => {
     const u = input instanceof Request ? input.url : String(input);
@@ -150,10 +154,7 @@ it('a throw after the signed request left records the same validity-based expiry
   const holdSeconds = (Date.parse(row.expires_at) - Date.parse(row.timestamp)) / 1000;
   assert.ok(holdSeconds >= 85, `the catch-path hold must span the 90 s validity (got ${holdSeconds.toFixed(1)} s)`);
   assert.ok(holdSeconds <= 95, `the catch-path hold must not run far past it (got ${holdSeconds.toFixed(1)} s)`);
-  assert.ok(
-    typeof row.signature === 'string' && row.signature.startsWith('0x') && row.signature.length > 40,
-    `the row carries the sent payment's on-chain signature (got: ${JSON.stringify(row.signature)})`,
-  );
+  assert.equal(row.signature, undefined, 'the client cannot know the on-chain signature at payload time — the row carries none');
   assert.ok(Math.abs(PM.getDailySpent() - dailyBefore - 0.01) < 1e-9, 'the sent payment counts while its payload is valid');
 });
 

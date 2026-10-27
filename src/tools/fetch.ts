@@ -19,8 +19,11 @@ import { checkSpendingLimit, logPayment, getDailySpent, spendBucketForNetwork, g
 import type { PaymentLogEntry } from "../payment-utils.js";
 // The outgoing-payment signal: the paid transport wrapper reports every
 // outgoing request that carries a payment header (the exact "left the
-// client" signal) and captures the sent payment's on-chain signature when
-// the payload envelope carries one (the reconciler's row field).
+// client" signal). No signature is extracted: the client cannot know the
+// on-chain signature at payload time (on Solana the first signature slot
+// is the facilitator fee payer's, added only at settlement) — settle
+// evidence reaches the ledger through the response receipt, never the
+// request payload.
 import { sentPaymentTracking } from "../transport/sent-payment.js";
 // Issue #59 (D7): the DEVNET CAIP-2 decides the spend bucket of a leg.
 import { SOLANA_DEVNET_CAIP2 } from "@x402/svm";
@@ -971,11 +974,8 @@ export function registerFetchTool(server: McpServer): void {
       let blockedCode: IntentRejectCode | undefined;
       let signedAmountUsdc: number | undefined;
       // The outgoing-payment signal: flips when an outgoing request carried
-      // a payment header (the paid request left the client); sentSignature
-      // carries the on-chain signature the transport wrapper captured from
-      // that header, feeding the ledger row's reconciler field.
+      // a payment header (the paid request left the client).
       let paidRequestSent = false;
-      let sentSignature: string | undefined;
       // Issue #53/#54: flips inside the enforcement hook right after the
       // intent is consumed — the only point where a signature may exist.
       let payloadSigned = false;
@@ -1455,10 +1455,9 @@ export function registerFetchTool(server: McpServer): void {
               // leg alike — passes through the tracking wrapper BEFORE the
               // transport does, so a refusal or failure further down the
               // chain still counts as an outgoing payment attempt (fail
-              // closed) and the paid request's signature lands on the row.
+              // closed).
               const trackedTransport = sentPaymentTracking(transport, (info) => {
                 paidRequestSent = info.sent;
-                sentSignature = info.signature;
               });
               const paidFetch = wrapFetchWithPayment(trackedTransport, client);
               // Issue #56+#80: the paid leg carries ONE repo-owned deadline
@@ -1610,10 +1609,6 @@ export function registerFetchTool(server: McpServer): void {
             ...(probedOffer?.network ? { network: probedOffer.network } : {}),
             ...(rowCountsNow ? { amount_usdc: recordedAmountUsdc, ...intentTrail } : { amount_usdc: 0 }),
             ...(rowExpiresAt === undefined ? {} : { expires_at: rowExpiresAt }),
-            // The sent payment's on-chain signature (captured from the
-            // outgoing payment header) rides the sent row so the settlement
-            // reconciler can convert it to a permanent count later.
-            ...(rowStatus === "authorized_unserved" && sentSignature !== undefined ? { signature: sentSignature } : {}),
             ...non200DetailFields,
             tx_hash: txHash,
             status: rowStatus,
@@ -1746,7 +1741,6 @@ export function registerFetchTool(server: McpServer): void {
                 decimals: intent.decimals,
                 ...(intent.asset !== "" ? { asset: intent.asset } : {}),
                 expires_at: sentPayloadExpiryIso(intent, useChain === "solana"),
-                ...(sentSignature !== undefined ? { signature: sentSignature } : {}),
                 status: "authorized_unserved" as const,
               }
             : { amount_usdc: 0, status: "failed" as const }),

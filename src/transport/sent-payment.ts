@@ -1,38 +1,30 @@
 // The outgoing-payment signal: a thin wrapper over the paid transport that
-// reads EVERY request the SDK sends and reports (a) whether the outgoing
-// request carried a payment header — the exact "the paid request left the
-// client" signal (the header names are checked case-insensitively: the v2
-// PAYMENT-SIGNATURE and the legacy X-PAYMENT) — and (b) the on-chain
-// signature of the sent payment when the payload envelope carries one, so
-// the ledger row can later be reconciled against the chain:
-//   - an EVM exact payload's `signature` (a 0x-prefixed hex string) passes
-//     through verbatim;
-//   - a Solana exact payload's `transaction` (the base64 wire transaction)
-//     decodes to bytes whose FIRST 64 are the ed25519 signature — reported
-//     base58-encoded, the chain's canonical signature spelling;
-//   - an unparseable envelope still reports sent: true (the header was
-//     there — counting must never depend on parse success) with no
-//     signature (fail closed: the row then counts to expiry, unreconcilable).
+// reads EVERY request the SDK sends and reports whether the outgoing request
+// carried a payment header — the exact "the paid request left the client"
+// signal (the header names are checked case-insensitively: the v2
+// PAYMENT-SIGNATURE and the legacy X-PAYMENT). An unparseable header still
+// reports sent: true (the header was there — counting must never depend on
+// parse success; fail closed).
 //
-// The envelope is the v2 payment header value: base64url-encoded JSON of
-// { x402Version, payload, resource, accepted }. Only the payload is
-// consulted. Nothing here mutates the request; the underlying transport
+// The report carries NO on-chain signature: at payload time the client
+// cannot know one, by construction. On Solana the wire transaction's first
+// signature slot is the FEE PAYER's (the facilitator's) — the client only
+// partially signs, so the real transaction signature does not exist until
+// the facilitator settles; on every chain, the settlement evidence that
+// matters arrives with the response's settlement receipt, not with the
+// request. Nothing here mutates the request; the underlying transport
 // always receives it verbatim.
-
-import bs58 from "bs58";
 
 /** What the tracking wrapper reports per outgoing request. */
 export interface SentPaymentInfo {
   /** An outgoing request carried a payment header. */
   sent: boolean;
-  /** The on-chain signature when it could be captured (else undefined). */
-  signature?: string;
 }
 
 /** The fetch-like shape of the transport chain this wraps. */
 export type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
-/** Read one outgoing request's payment header and decode its payload.
+/** Read one outgoing request for the presence of a payment header.
  * Pure with respect to the caller's inputs; never throws. */
 export function sentPaymentOf(input: unknown, init?: unknown): SentPaymentInfo {
   try {
@@ -41,35 +33,9 @@ export function sentPaymentOf(input: unknown, init?: unknown): SentPaymentInfo {
       : new Headers((init as { headers?: HeadersInit } | undefined)?.headers ?? (input as { headers?: HeadersInit } | undefined)?.headers ?? undefined);
     const value = headers.get("payment-signature") ?? headers.get("x-payment");
     if (value === null || value === "") return { sent: false };
-    const info: SentPaymentInfo = { sent: true };
-    const signature = signatureFromPaymentHeader(value);
-    if (signature !== undefined) info.signature = signature;
-    return info;
+    return { sent: true };
   } catch {
     return { sent: false };
-  }
-}
-
-/** Decode the base64url envelope and extract the on-chain signature:
- * the EVM payload carries its hex signature directly; the Solana payload
- * carries the base64 wire transaction whose first 64 bytes are the
- * ed25519 signature. Anything unexpected yields undefined (never throws). */
-export function signatureFromPaymentHeader(headerValue: string): string | undefined {
-  try {
-    const json = Buffer.from(headerValue, "base64").toString("utf-8");
-    const envelope = JSON.parse(json) as { payload?: { signature?: unknown; transaction?: unknown } };
-    const payload = envelope.payload;
-    if (!payload || typeof payload !== "object") return undefined;
-    if (typeof payload.signature === "string" && payload.signature.startsWith("0x") && payload.signature.length > 10) {
-      return payload.signature;
-    }
-    if (typeof payload.transaction === "string" && payload.transaction.length > 0) {
-      const txBytes = Buffer.from(payload.transaction, "base64");
-      if (txBytes.length >= 64) return bs58.encode(txBytes.subarray(0, 64));
-    }
-    return undefined;
-  } catch {
-    return undefined;
   }
 }
 
