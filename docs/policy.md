@@ -203,7 +203,7 @@ Env overrides (each fails closed on a malformed value — never silently ignored
 | `X402_POLICY_TOKENS` | comma-separated token allowlist |
 | `X402_EVM_FACILITATOR_NETWORKS` | comma-separated CAIP-2 ids the facilitator settles |
 | `X402_POLICY_SERVICE_<LEVEL>` | `allow` / `deny` / `approval` for `unknown\|discovered\|verified\|trusted\|blocked` |
-| `X402_POLICY_SERVICE_<LEVEL>_MAX_PER_REQUEST` / `_MAX_DAILY` | per-level caps |
+| `X402_POLICY_SERVICE_<LEVEL>_MAX_PER_REQUEST` / `X402_POLICY_SERVICE_<LEVEL>_MAX_DAILY` | per-level caps |
 | `POLICY_TRUSTED_HOSTS` / `POLICY_BLOCKED_HOSTS` | comma-separated hostnames for the `TRUSTED` / `BLOCKED` trust levels |
 
 **Fail closed.** A config file that is unreadable (e.g. revoked permissions — any read error other than a missing file), malformed JSON, wrong types, missing critical fields (`payments` is required), unrecognized keys (typo protection — a misspelled cap is an error, not a silent no-op), or unparseable env values puts the engine into a payments-disabled error state: `evaluate()` returns `DENY` with `CONFIG_INVALID` + `PAYMENTS_DISABLED` for **every** request. A missing file at `POLICY_CONFIG_PATH` (ENOENT) loads the default policy (fail-closed applies to unusable content, not to an absent file). The policy layer never weakens a malformed setting into a permissive one.

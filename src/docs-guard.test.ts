@@ -56,6 +56,7 @@ import { join } from 'node:path';
 
 const README = readFileSync(fileURLToPath(new URL('../README.md', import.meta.url)), 'utf8');
 const ENV_EXAMPLE = readFileSync(fileURLToPath(new URL('../.env.example', import.meta.url)), 'utf8');
+const LLMSTXT = readFileSync(fileURLToPath(new URL('../llms.txt', import.meta.url)), 'utf8');
 
 // ---- Guard A: retired routes -------------------------------------------
 
@@ -253,7 +254,7 @@ it('positive + negative control (#73): the local-link scanner filters external U
   assert.equal(existsSync(join(REPO_ROOT, 'does-not-exist.md')), false);
 });
 
-// ---- Guard F (#66): policy profiles are documented -----------------------
+// ---- Profile docs (#66): policy profiles are documented -----------------
 
 // Issue #66 stage A: the shipped opt-in profile switch must be discoverable —
 // the README names the variable and docs/policy.md documents the three
@@ -572,12 +573,13 @@ function findGuardHViolations(text: string): string[] {
 const GUARD_H_PAGES: ReadonlyArray<[string, string]> = [
   ['README.md', README],
   ['.env.example', ENV_EXAMPLE],
+  ['llms.txt', LLMSTXT],
   ...readdirSync(DOCS_DIR).filter((n) => n.endsWith('.md')).map(
     (n) => [`docs/${n}`, readFileSync(join(DOCS_DIR, n), 'utf8')] as [string, string],
   ),
 ];
 
-it('guard H (#87): README.md, docs/*.md and .env.example state current behaviour only — no issue references or history notes', () => {
+it('guard H (#87): README.md, docs/*.md, llms.txt and .env.example state current behaviour only — no issue references or history notes', () => {
   for (const [where, text] of GUARD_H_PAGES) {
     assert.deepEqual(
       findGuardHViolations(text),
@@ -608,4 +610,232 @@ it('positive + negative control (#87): the guard H scanner fails on every token 
     'X402_POLICY_PROFILE=strict|standard|permissive',
   ].join('\n');
   assert.deepEqual(findGuardHViolations(CLEAN), [], 'current-behaviour phrasing must pass');
+});
+
+// ---- README sizes (#93): the front page stays short ----------------------
+//
+// The README is the front page humans and agent harnesses scan first; the
+// reference material lives in docs/*.md (linked at the bottom). Cap its size
+// so doc growth lands in docs/ instead of the front page. MEASURED on
+// master 1aed1fe: 77 lines / 720 words — the caps below keep tight headroom.
+const README_MAX_LINES = 90;
+const README_MAX_WORDS = 850;
+
+function readmeLineCount(text: string): number {
+  return text.split('\n').length;
+}
+
+function readmeWordCount(text: string): number {
+  return text.split(/\s+/).filter(Boolean).length;
+}
+
+it('readme caps (#93): README.md stays within the line and word caps', () => {
+  assert.ok(
+    readmeLineCount(README) <= README_MAX_LINES,
+    `README.md has ${readmeLineCount(README)} lines — cap is ${README_MAX_LINES}; reference material belongs in docs/`,
+  );
+  assert.ok(
+    readmeWordCount(README) <= README_MAX_WORDS,
+    `README.md has ${readmeWordCount(README)} words — cap is ${README_MAX_WORDS}; reference material belongs in docs/`,
+  );
+});
+
+// ---- Tools table (#93): the README table lists the registered tools ------
+//
+// The README "Tools" table promises exactly the server surface: every tool
+// the server registers must have a row, and no row may name a tool the
+// server does not register. The registered names are parsed from the
+// src/tools/*.ts registrations (server.tool("x402_…", …) — one registration
+// per non-test tools file).
+const TOOLS_DIR = join(REPO_ROOT, 'src', 'tools');
+
+interface ToolRegistrationScan {
+  names: string[];
+  /** Files that mention server.tool( but yielded no parsed name. */
+  unparsed: string[];
+}
+
+function registeredToolNames(root: string): ToolRegistrationScan {
+  const names: string[] = [];
+  const unparsed: string[] = [];
+  const files = readdirSync(root).filter((f) => f.endsWith('.ts') && !f.endsWith('.test.ts')).sort();
+  for (const file of files) {
+    const text = readFileSync(join(root, file), 'utf8');
+    if (!text.includes('server.tool(')) continue; // helper files, not registrations
+    const match = /server\.tool\(\s*\n\s*["'`]([^"'`]+)["'`]/.exec(text);
+    if (match) names.push(match[1]);
+    else unparsed.push(file);
+  }
+  return { names: names.sort(), unparsed };
+}
+
+function readmeToolRows(text: string): string[] {
+  const names: string[] = [];
+  for (const line of text.split('\n')) {
+    const match = /^\|\s*`(x402_[a-z_]+)`\s*\|/.exec(line);
+    if (match) names.push(match[1]);
+  }
+  return names.sort();
+}
+
+it('tools table (#93): the README Tools table equals the registered tools', () => {
+  const { names, unparsed } = registeredToolNames(TOOLS_DIR);
+  assert.ok(names.length > 0, 'the registration parser must see the real tools — if this fails the server.tool( shape changed; update the parser and the README table');
+  assert.deepEqual(
+    unparsed,
+    [],
+    'every src/tools file with a server.tool( call must parse to exactly one registered name (one registration per file — extend the parser and the README table if a second one is added)',
+  );
+  assert.deepEqual(
+    readmeToolRows(README),
+    names,
+    'the README Tools table must list exactly the tools the server registers — no missing rows, no stale names',
+  );
+});
+
+// ---- Env vars (#93): every env var the code reads is documented ----------
+//
+// Docs-truth rule: an env var the server reads must exist in the operator
+// docs — .env.example (the annotated key set) AND the public docs
+// (README.md ∪ docs/*.md). The scan covers every read shape used in this
+// repo's production sources (src/**/*.ts minus *.test.ts):
+//   - direct: process.env.NAME and param-env env.NAME (NodeJS.ProcessEnv
+//     arguments, e.g. src/networks.ts, src/transport/replay.ts,
+//     src/payment-intent/challenge-scope.ts);
+//   - bracketed literal: process.env["NAME"];
+//   - helper call sites that take the var name as a literal argument:
+//     readCapUsd / capUsdExactString / legacyNumber / casperBudgetCapAtomic
+//     / envHostList;
+//   - template-built names, added synthetically: X402_POLICY_SERVICE_<LEVEL>
+//     (+ _MAX_PER_REQUEST / _MAX_DAILY) built in src/policy/config.ts;
+//   - template indirection the scanner cannot statically resolve, carried
+//     here fail-closed-by-review: src/reservations.ts reads
+//     process.env[CEILING_VAR] where CEILING_VAR = MAX_DAILY_SPEND_TOTAL_USD,
+//     and src/budget-registry.ts railUsdRateVar() builds X402_RATE_<SYMBOL>_USD
+//     from the registered rail symbols (USDC, wCSPR). A new rail symbol or a
+//     renamed constant must extend these lists.
+// Allowlist: NODE_TEST_CONTEXT — Node's own test-process marker (read in
+// src/directory.ts to keep production directory writes out of test runs);
+// not an operator knob and deliberately absent from the operator docs. The
+// documented templates: X402_POLICY_SERVICE_<LEVEL>[_MAX_PER_REQUEST|_MAX_DAILY]
+// in .env.example, the same family in docs/policy.md's override table.
+const INDIRECT_ENV_NAMES: ReadonlySet<string> = new Set([
+  'MAX_DAILY_SPEND_TOTAL_USD',
+  'X402_RATE_USDC_USD',
+  'X402_RATE_WCSPR_USD',
+]);
+const NON_OPERATOR_ENV_NAMES: ReadonlySet<string> = new Set(['NODE_TEST_CONTEXT']);
+const SERVICE_LEVELS = ['UNKNOWN', 'DISCOVERED', 'VERIFIED', 'TRUSTED', 'BLOCKED'] as const;
+const SERVICE_NAME_RE = /^X402_POLICY_SERVICE_(UNKNOWN|DISCOVERED|VERIFIED|TRUSTED|BLOCKED)(_(?:MAX_PER_REQUEST|MAX_DAILY))?$/;
+
+function walkProdSources(root: string, dir: string): string[] {
+  const out: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) out.push(...walkProdSources(root, full));
+    else if (entry.isFile() && entry.name.endsWith('.ts') && !entry.name.endsWith('.test.ts')) out.push(full);
+  }
+  return out;
+}
+
+function scanEnvReadNames(root: string): string[] {
+  const names = new Set<string>();
+  for (const path of walkProdSources(root, join(root, 'src'))) {
+    const text = readFileSync(path, 'utf8');
+    for (const m of text.matchAll(/process\.env\.([A-Z][A-Z0-9_]+)|\benv\.([A-Z][A-Z0-9_]+)/g)) {
+      // group 1: process.env.NAME — group 2: env.NAME (ProcessEnv params)
+      names.add(m[1] ?? m[2]);
+    }
+    for (const m of text.matchAll(/process\.env\[\s*["']([A-Z][A-Z0-9_]+)["']\s*\]/g)) names.add(m[1]);
+    for (const m of text.matchAll(/(?:readCapUsd|capUsdExactString|legacyNumber|casperBudgetCapAtomic|envHostList)\(\s*["']([A-Z][A-Z0-9_]+)["']/g)) names.add(m[1]);
+  }
+  for (const level of SERVICE_LEVELS) {
+    names.add(`X402_POLICY_SERVICE_${level}`);
+    names.add(`X402_POLICY_SERVICE_${level}_MAX_PER_REQUEST`);
+    names.add(`X402_POLICY_SERVICE_${level}_MAX_DAILY`);
+  }
+  for (const name of INDIRECT_ENV_NAMES) names.add(name);
+  return [...names].sort();
+}
+
+// A name is mentioned in a text when the text carries it verbatim — or, for
+// the template-built service-level family, when the text carries its
+// X402_POLICY_SERVICE_<LEVEL><suffix> template shape.
+function envNameMentioned(text: string, name: string): boolean {
+  const serviceMatch = SERVICE_NAME_RE.exec(name);
+  if (serviceMatch) return text.includes(`X402_POLICY_SERVICE_<LEVEL>${serviceMatch[2] ?? ''}`);
+  return text.includes(name);
+}
+
+function scanEnvDocumentation(names: string[], pages: ReadonlyArray<[string, string]>): string[] {
+  const missing: string[] = [];
+  for (const name of names) {
+    if (NON_OPERATOR_ENV_NAMES.has(name)) continue;
+    if (!envNameMentioned(ENV_EXAMPLE, name)) missing.push(`.env.example documents nothing about ${name}`);
+    if (!pages.some(([, text]) => envNameMentioned(text, name))) missing.push(`README.md ∪ docs/*.md documents nothing about ${name}`);
+  }
+  return missing;
+}
+
+const DOC_CORPUS: ReadonlyArray<[string, string]> = [
+  ['README.md', README],
+  ...readdirSync(DOCS_DIR).filter((n) => n.endsWith('.md')).map(
+    (n) => [`docs/${n}`, readFileSync(join(DOCS_DIR, n), 'utf8')] as [string, string],
+  ),
+];
+
+it('env docs (#93): every env var the code reads is documented in .env.example and the public docs', () => {
+  assert.deepEqual(
+    scanEnvDocumentation(scanEnvReadNames(REPO_ROOT), DOC_CORPUS),
+    [],
+    'every env var read by the code must appear in .env.example AND in README.md ∪ docs/*.md — undocumented reads are docs-truth gaps',
+  );
+});
+
+// ---- Network mode (#93): X402_NETWORK_MODE documented iff read -----------
+//
+// The explicit no-default network mode is the server's most safety-critical
+// knob: while src/ reads it, the operator docs MUST name it; the day the
+// code stops reading it, stale mentions must leave the docs. The asymmetry
+// shapes (read-without-docs, docs-without-read) are asserted against a pure
+// helper below so the control covers both directions without editing src/.
+function assertNetworkModeDocIff(readByCode: boolean, documented: boolean): void {
+  assert.equal(
+    documented,
+    readByCode,
+    'X402_NETWORK_MODE must be documented in the operator docs (.env.example, README.md and docs/networks.md) if and only if the code reads it',
+  );
+}
+
+function networkModeDocumented(): boolean {
+  return (
+    envNameMentioned(ENV_EXAMPLE, 'X402_NETWORK_MODE') &&
+    README.includes('X402_NETWORK_MODE') &&
+    readFileSync(join(DOCS_DIR, 'networks.md'), 'utf8').includes('X402_NETWORK_MODE')
+  );
+}
+
+it('network mode (#93): X402_NETWORK_MODE is documented if and only if the code reads it', () => {
+  const readByCode = walkProdSources(REPO_ROOT, join(REPO_ROOT, 'src')).some(
+    (p) => readFileSync(p, 'utf8').includes('X402_NETWORK_MODE'),
+  );
+  assertNetworkModeDocIff(readByCode, networkModeDocumented());
+});
+
+it('positive + negative control (#93): the iff guard fails on exactly the asymmetric shapes', () => {
+  // [readByCode, documented, mustFail]
+  for (const [read, documented, mustFail] of [
+    [true, false, true],
+    [false, true, true],
+    [true, true, false],
+    [false, false, false],
+  ] as ReadonlyArray<readonly [boolean, boolean, boolean]>) {
+    let failed = false;
+    try {
+      assertNetworkModeDocIff(read, documented);
+    } catch {
+      failed = true;
+    }
+    assert.equal(failed, mustFail, `read=${read}, documented=${documented} must ${mustFail ? 'fail' : 'pass'} the iff`);
+  }
 });
