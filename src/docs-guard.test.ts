@@ -567,6 +567,12 @@ const GUARD_H_TOKENS: ReadonlyArray<[string, RegExp]> = [
   ['history note', /once dragged/],
   ['history note', /hardcoded 30 s/],
   ['history note', /Today['’]s behavio/],
+  // widened for #93 (B5): the pre-policy note and the "deliberate
+  // tightening" decision-note flavour are history prose the same way — the
+  // public docs state the current behaviour, not the design story that led
+  // to it.
+  ['history note', /before the policy engine/],
+  ['history note', /[Dd]eliberate[ _-]+(default[ _-]+)?tightening/],
 ];
 
 function findGuardHViolations(text: string): string[] {
@@ -610,6 +616,8 @@ it('positive + negative control (#87): the guard H scanner fails on every token 
     'a hardcoded ' + '30 s' + ' literal; Today' + "'" + 's behavio' + 'ur row',
     'and the curly-spelled ' + 'Today\u2019s behavio' + 'ur row as well',
     'before chain-' + 'scoping the vocabulary was one chain',
+    'decided ' + 'before the policy engine' + ' shipped, back when it lacked the gate',
+    'the one ' + 'deliberate tightening' + ' of the default — and a ' + 'deliberate default tightening' + ' again',
   ].join('\n');
   assert.equal(findGuardHViolations(BAD).length, GUARD_H_TOKENS.length, 'every token class must be flagged');
 
@@ -639,15 +647,37 @@ function readmeWordCount(text: string): number {
   return text.split(/\s+/).filter(Boolean).length;
 }
 
+function assertReadmeWithinCaps(lineCount: number, wordCount: number): void {
+  assert.ok(
+    lineCount <= README_MAX_LINES,
+    `README.md has ${lineCount} lines — cap is ${README_MAX_LINES}; reference material belongs in docs/`,
+  );
+  assert.ok(
+    wordCount <= README_MAX_WORDS,
+    `README.md has ${wordCount} words — cap is ${README_MAX_WORDS}; reference material belongs in docs/`,
+  );
+}
+
 it('readme caps (#93): README.md stays within the line and word caps', () => {
-  assert.ok(
-    readmeLineCount(README) <= README_MAX_LINES,
-    `README.md has ${readmeLineCount(README)} lines — cap is ${README_MAX_LINES}; reference material belongs in docs/`,
-  );
-  assert.ok(
-    readmeWordCount(README) <= README_MAX_WORDS,
-    `README.md has ${readmeWordCount(README)} words — cap is ${README_MAX_WORDS}; reference material belongs in docs/`,
-  );
+  assertReadmeWithinCaps(readmeLineCount(README), readmeWordCount(README));
+});
+
+it('positive + negative control (#93): the readme-caps guard passes under the caps and fails when either cap is exceeded', () => {
+  assertReadmeWithinCaps(0, 0); // an empty README trivially passes the caps
+  let failed = false;
+  try {
+    assertReadmeWithinCaps(README_MAX_LINES + 1, 0);
+  } catch {
+    failed = true;
+  }
+  assert.ok(failed, 'line count over the cap must fail the guard');
+  failed = false;
+  try {
+    assertReadmeWithinCaps(0, README_MAX_WORDS + 1);
+  } catch {
+    failed = true;
+  }
+  assert.ok(failed, 'word count over the cap must fail the guard');
 });
 
 // ---- Tools table (#93): the README table lists the registered tools ------
@@ -701,6 +731,26 @@ it('tools table (#93): the README Tools table equals the registered tools', () =
     names,
     'the README Tools table must list exactly the tools the server registers — no missing rows, no stale names',
   );
+});
+
+it('positive + negative control (#93): the tools-table comparison fails on a missing row and on a stale row, passes on equal lists', () => {
+  const names = ['x402_fetch', 'x402_status'];
+  const table = '| `x402_fetch` | Endpoint price | Fetch an x402 endpoint and pay the 402 price. |\n| `x402_status` | Free | Show every budget rail. |';
+  assert.deepEqual(readmeToolRows(table), names, 'sanity: the row parser sees exactly the fixture rows');
+  let failed = false;
+  try {
+    assert.deepEqual(readmeToolRows('| `x402_fetch` | Endpoint price | Fetch an x402 endpoint and pay the 402 price. |'), names);
+  } catch {
+    failed = true;
+  }
+  assert.ok(failed, 'a registered tool with no README row must fail the comparison');
+  failed = false;
+  try {
+    assert.deepEqual(readmeToolRows(table + '\n| `x402_removed` | Free | A tool the server no longer registers. |'), names);
+  } catch {
+    failed = true;
+  }
+  assert.ok(failed, 'a README row for an unregistered tool must fail the comparison');
 });
 
 // ---- Env vars (#93): every env var the code reads is documented ----------
@@ -800,6 +850,18 @@ it('env docs (#93): every env var the code reads is documented in .env.example a
     [],
     'every env var read by the code must appear in .env.example AND in README.md ∪ docs/*.md — undocumented reads are docs-truth gaps',
   );
+});
+
+it('positive + negative control (#93): the env-docs guard fails on an undocumented read, passes a documented one, and honours the allowlist and the SERVICE template shape', () => {
+  // A documented read passes (both surfaces carry it verbatim).
+  assert.deepEqual(scanEnvDocumentation(['MAX_PAYMENT_PER_CALL'], [['docs/x.md', 'set MAX_PAYMENT_PER_CALL']]), []);
+  // An undocumented read fails, naming the var and the missing surface.
+  const missing = scanEnvDocumentation(['MAX_PAYMENT_PER_CALL'], [['docs/x.md', 'nothing about the caps here']]);
+  assert.ok(missing.some((m) => m.includes('MAX_PAYMENT_PER_CALL')), 'the failure must name the undocumented var');
+  // The non-operator allowlisted name never contributes a missing entry.
+  assert.deepEqual(scanEnvDocumentation(['NODE_TEST_CONTEXT'], [['docs/x.md', 'nothing']]), []);
+  // The service-level template family matches the <LEVEL> shape in the docs.
+  assert.deepEqual(scanEnvDocumentation(['X402_POLICY_SERVICE_TRUSTED'], [['docs/policy.md', 'X402_POLICY_SERVICE_<LEVEL>=deny']]), []);
 });
 
 // ---- Network mode (#93): X402_NETWORK_MODE documented iff read -----------
