@@ -13,6 +13,12 @@ import { prepareLedgerDir, resolveLedger } from "./ledger-path.js";
 import { atomicStringFromUsdString, exactUsdString } from "./tools/accounting.js";
 import { registerBudget, resolveRailUsdRate } from "./budget-registry.js";
 import { reservedUsd } from "./reservations.js";
+// Issue #93 (A2): the USD rail lists the EFFECTIVE caps — the same policy
+// state the gate reads. policy/config.ts imports no accounting module (its
+// legacy caps re-implement this module's parsing), so the import is
+// cycle-safe: both export hoisted function declarations only, and the rail's
+// closures run long after both module bodies have evaluated.
+import { loadPolicyConfig } from "./policy/config.js";
 
 export interface PaymentLogEntry {
   timestamp: string;
@@ -377,6 +383,38 @@ function usdRailSpentToday(): number {
   return getDailySpent() + getDevnetDailySpent();
 }
 
+// ---------------------------------------------------------------------------
+// Issue #93 (A2): the USD rail lists the caps that ACTUALLY gate the next
+// payment — the effective pair, not the raw legacy env values. The payment
+// layer's gate reads the effective daily cap (reservations.effectiveDailyCapUsd:
+// min MAX_DAILY_SPEND / the policy layer's payments.maxDaily, fail closed to 0
+// on a broken configuration) and rule 6 binds the policy layer's
+// payments.maxPerRequest the same way, while the rail's registry caps were the
+// raw MAX_PAYMENT_PER_CALL / MAX_DAILY_SPEND readings — an operator running a
+// profile or a policy file with lower caps saw x402_status and
+// x402_check_payment display caps wider than what gates their next payment.
+// The rail now renders min(env, policy) per call — LIVE, never cached, exactly
+// like every cap here — so both surfaces report the same numbers. With the
+// behavior-compat default policy the min is byte-identical to the env value
+// (the default policy mirrors the legacy knobs), so this changes nothing for
+// operators without a policy file; every other rail is untouched, and no
+// enforcement path changes — the gates were already enforcing the effective
+// caps; only the listings lagged.
+// ---------------------------------------------------------------------------
+function effectiveUsdCapParts(): { perCall: number; daily: number } {
+  const state = loadPolicyConfig();
+  if (state.configErrors.length > 0) {
+    // Fail closed exactly like the reservation registry's effective cap: an
+    // unusable configuration gates at 0 (the engine refuses every payment
+    // with CONFIG_INVALID — the listing must not display a usable cap).
+    return { perCall: 0, daily: 0 };
+  }
+  return {
+    perCall: Math.min(getMaxPerCall(), state.config.payments.maxPerRequest),
+    daily: Math.min(getMaxDailySpend(), state.config.payments.maxDaily),
+  };
+}
+
 /** Exact integer atomic digit string from a USD float at 6 decimals — ONE
  * toFixed rounding at the display boundary (never a float multiply), then
  * integer string math (atomicStringFromUsdString). Display/registry use
@@ -390,8 +428,21 @@ registerBudget({
   id: "usd",
   unit: "USDC",
   decimals: 6,
-  perCallCap: () => ({ atomic: atomicStringFromUsdString(getMaxPerCallExactUsdString(), 6), decimals: 6 }),
-  dailyCap: () => ({ atomic: atomicStringFromUsdString(getMaxDailySpendExactUsdString(), 6), decimals: 6 }),
+  perCallCap: () => {
+    // Issue #93 (A2): the EFFECTIVE per-call cap (min env/policy) — the same
+    // number rule 6 and the inner spending-limit check bind. Rendered through
+    // the registry's exact display boundary (a USD float narrowed once via
+    // toFixed(6), then integer atomic math — never a float multiply).
+    const { perCall } = effectiveUsdCapParts();
+    return { atomic: atomicStringFromUsdString(exactUsdString(perCall, 6), 6), decimals: 6 };
+  },
+  dailyCap: () => {
+    // Issue #93 (A2): the EFFECTIVE daily cap (min env/policy) — the same
+    // number the reservation registry (effectiveDailyCapUsd) and the policy
+    // gate's rule 7 bind.
+    const { daily } = effectiveUsdCapParts();
+    return { atomic: atomicStringFromUsdString(exactUsdString(daily, 6), 6), decimals: 6 };
+  },
   spentToday: () => ({ atomic: atomicFromUsdNumber(usdRailSpentToday(), 6), decimals: 6 }),
   spentUsdToday: () => usdRailSpentToday(),
   reservedToday: () => {
