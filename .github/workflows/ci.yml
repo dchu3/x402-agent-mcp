@@ -3,9 +3,10 @@
 # - Deps installed with --ignore-scripts: no lifecycle script is needed to
 #   build/test this stdio MCP server, so install-time code never runs in CI.
 # - Third-party actions are pinned by commit SHA (tag noted in a comment).
-# - The audit gate runs at `critical`: the current production tree passes it;
-#   remaining advisories (zod <4.6.6, nested inside @x402/core where we do not
-#   override) are documented in the README Development section.
+# - The audit gate runs on production dependencies at `audit-level=high` with
+#   NO allowlist: any high or critical advisory fails CI (issue #98). The
+#   nested zod advisory (GHSA-mrhx-c7xc-m3w5) is fixed in-tree by the
+#   package.json `overrides` entry forcing zod ^4.6.7 across the tree.
 name: CI
 
 on:
@@ -44,39 +45,8 @@ jobs:
         run: npm test
       - name: Validate policy example against the real config loader
         run: node scripts/validate-policy-example.mjs
-      - name: Audit production dependencies (fail on new high — the one known nested zod advisory is allowlisted inline)
-        run: |
-          npm audit --omit=dev --audit-level=high --json > "${RUNNER_TEMP}/audit.json" || true
-          node -e '
-            const fs = require("node:fs");
-            const raw = fs.readFileSync(process.env.RUNNER_TEMP + "/audit.json", "utf8");
-            let report;
-            try { report = JSON.parse(raw); } catch { console.error("audit gate: npm audit produced no parseable report — failing"); process.exit(1); }
-            if (!report.vulnerabilities) { console.error("audit gate: report carries no vulnerabilities block — failing"); process.exit(1); }
-            // The ONE known nested advisory as of this gate change: GHSA-mrhx-c7xc-m3w5
-            // (zod < 4.6.6, high, CWE-770) — reached only through the x402 SDK
-            // chain (@make-software/casper-x402, @x402/core, @x402/evm,
-            // @x402/fetch, @x402/svm all carry zod < 4.6.6 transitively); npm
-            // offers no compatible fix for our SDK range (the reported fix
-            // available is a semver-major SDK bump) and the validation inputs
-            // are not attacker-scaled operator data. Allowlisted BY ID until
-            // the SDK ships a compatible zod range — every OTHER high or
-            // critical production advisory fails this gate from now on.
-            const ALLOWLISTED = new Set(["GHSA-mrhx-c7xc-m3w5"]);
-            const idFor = (via) => String(via.url || "").split("/").pop() || String(via.title);
-            const advisories = Object.values(report.vulnerabilities)
-              .flatMap((entry) => entry.via || [])
-              .filter((via) => typeof via === "object");
-            const gateable = advisories.filter((via) => via.severity === "high" || via.severity === "critical");
-            const allowed = gateable.filter((via) => ALLOWLISTED.has(idFor(via)));
-            const fresh = gateable.filter((via) => !ALLOWLISTED.has(idFor(via)));
-            if (fresh.length > 0) {
-              console.error("audit gate: NEW high/critical production advisories (not in the inline allowlist):");
-              for (const v of fresh) console.error(" - " + v.title + " [" + v.severity + "] " + String(v.url));
-              process.exit(1);
-            }
-            console.log("audit gate: " + allowed.length + " allowlisted high advisory occurrence(s) (GHSA-mrhx-c7xc-m3w5, known nested zod advisory); no new high/critical advisories");
-          '
+      - name: Audit production dependencies (fail on any high or critical — no allowlist)
+        run: npm audit --omit=dev --audit-level=high
 
   secret-scan:
     name: secret scan (never sources .env)
