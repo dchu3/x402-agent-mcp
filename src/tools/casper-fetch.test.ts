@@ -1,5 +1,6 @@
 import { strict as assert } from 'node:assert';
 import { afterEach, after, it } from 'node:test';
+import { randomBytes } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -17,8 +18,8 @@ process.env.X402_DIRECTORY_PATH = join(dir, 'endpoints.json');
 writeFileSync(process.env.X402_DIRECTORY_PATH, JSON.stringify({ endpoints: [], categories: [], last_updated: '2026-09-25' }), 'utf8');
 const { registerFetchTool } = await import('./fetch.js');
 const { boundedText } = await import('./casper-fetch.js');
-const { logPayment, getDailySpent } = await import('../payment-utils.js');
-const { casperBudget } = await import('../casper/budget.js');
+const { logPayment, getDailySpent, isCountedSpend, _resetForTests } = await import('../payment-utils.js');
+const { casperBudget, _resetCasperBudgetForTests } = await import('../casper/budget.js');
 const { getPerServiceSpent } = await import('../policy/budget-store.js');
 const originalFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = originalFetch; process.env = { ...env, PAYMENT_LOG_PATH: join(dir, 'ledger.jsonl'), X402_DIRECTORY_PATH: join(dir, 'endpoints.json') }; });
@@ -264,4 +265,106 @@ it('issue #80: a small X402_PAID_TIMEOUT_MS aborts a stalled Casper paid leg', {
   assert.equal(rows.length, before + 1, 'the stalled send stays a counted row — output and ledger agree');
   assert.equal(rows.at(-1).status, 'authorized_unserved');
   assert.equal(rows.at(-1).amount_motes, '1000000000');
+});
+
+// ---------------------------------------------------------------------------
+// Issue #97: a held (sent-but-unproven) Casper authorization is spend with an
+// UNKNOWN outcome — it may already have settled. The row is written with NO
+// expires_at and counts until the UTC day rollover, exactly like the USD and
+// Solana rails' rows: nothing releases it at the ~60 s payment-intent TTL,
+// and a restarted process rehydrates the identical held total (fail-closed
+// over-count direction). Hermetic end to end: the file's globalThis.fetch
+// mock, a throwaway key generated in the test, the temp ledger, a fake clock
+// on the pure isCountedSpend predicate; the restart is a fresh rehydration of
+// the singleton from the SAME ledger; the gates scenario follows in this
+// file's last test.
+// ---------------------------------------------------------------------------
+it('issue #97: a held unserved authorization is written with NO expires_at — it counts past the intent TTL and rehydrates', async () => {
+  rmSync(process.env.PAYMENT_LOG_PATH!, { force: true }); // isolated ledger: exact totals
+  _resetCasperBudgetForTests(); // a restarted process reads today's ledger fresh
+  process.env.CASPER_MAX_PAYMENT_PER_CALL = '1';
+  process.env.CASPER_MAX_DAILY_SPEND = '10';
+  process.env.CASPER_PRIVATE_KEY = randomBytes(32).toString('hex');
+  const rec = signedRecorder(async () => { throw new TypeError('terminated'); });
+  assert.equal(casperBudget.getDailySpent(), 0n, 'the isolated ledger rehydrates empty');
+  const parsed = JSON.parse((await handler()({ url: 'https://example.invalid', chain: 'casper', method: 'POST', body: '{}' })).content[0].text);
+  assert.equal(parsed.paid, 'unknown', `a sent-but-unproven authorization is an unknown outcome: ${JSON.stringify(parsed)}`);
+  assert.equal(parsed.authorization_sent, true);
+  assert.equal(rec.signed, 1, 'exactly one signed request left the mock');
+  const rows = ledgerLines();
+  assert.equal(rows.length, 1, 'the ledger keeps the row');
+  const row = rows.at(-1);
+  assert.equal(row.status, 'authorized_unserved');
+  assert.equal(row.amount_motes, '1000000000');
+  assert.ok(!('expires_at' in row), `the hold carries no expiry — nothing under the UTC day rollover releases it: ${JSON.stringify(row)}`);
+  assert.equal(isCountedSpend(row, Date.now()), true);
+  assert.equal(isCountedSpend(row, Date.now() + 61_000), true, 'past the ~60 s intent TTL the row still counts — the outcome is still unknown');
+  assert.equal(isCountedSpend(row, Date.now() + 12 * 3_600_000), true, 'still counting half a day on — the UTC day rollover is the only bound');
+  assert.equal(casperBudget.getDailySpent(), 1000000000n, 'the mote budget counts the hold');
+  // Restart: fresh in-memory state over the SAME ledger — the singleton
+  // rehydrates from it exactly as a restarted process would.
+  _resetCasperBudgetForTests();
+  assert.equal(casperBudget.getDailySpent(), 1000000000n, 'across a rehydration the hold still counts — a restart never drops it');
+});
+
+// ---------------------------------------------------------------------------
+// Issue #97: the held unserved authorization GATES the next paid call. The
+// first call ends sent-but-unproven; immediately, and again past 60 s once
+// across a rehydration (a fresh in-memory state over the SAME ledger, read
+// with a fake clock deliberately past the intent TTL), a second call whose
+// amount would exceed CASPER_MAX_DAILY_SPEND is refused by the existing
+// daily-budget error — it signs nothing and writes no row. The SAME
+// rehydrated hold prices into the optional USD cross-chain ceiling through
+// its configured rate, so a Casper hold can never vanish from the cross-rail
+// total. Isolated ledger for exact totals; the restart is the singleton's
+// fresh-rehydration reset.
+// ---------------------------------------------------------------------------
+it('issue #97: a held unserved authorization gates the next paid call — in process, past 60 s across a rehydration, at the motes cap and in the USD ceiling', async () => {
+  rmSync(process.env.PAYMENT_LOG_PATH!, { force: true }); // isolated ledger: exact totals
+  _resetForTests(); // the USD counters re-read the isolated ledger too
+  _resetCasperBudgetForTests();
+  process.env.CASPER_MAX_PAYMENT_PER_CALL = '1'; // the offer prices exactly 1 CSPR
+  process.env.CASPER_MAX_DAILY_SPEND = '1';      // 1 CSPR/day — a second held call MUST exceed it
+  process.env.CASPER_PRIVATE_KEY = randomBytes(32).toString('hex');
+  process.env.MAX_DAILY_SPEND_TOTAL_USD = '10.00'; // the optional cross-chain ceiling is active
+  process.env.X402_RATE_WCSPR_USD = '0.25';        // the Casper rail prices into it
+  const { ceilingState } = await import('../reservations.js');
+  const rec = signedRecorder(async () => { throw new TypeError('terminated'); });
+
+  // Call 1: the payment is sent but unproven — the hold counts, paid:'unknown'.
+  const first = JSON.parse((await handler()({ url: 'https://example.invalid', chain: 'casper', method: 'POST', body: '{}' })).content[0].text);
+  assert.equal(first.paid, 'unknown', `a sent-but-unproven authorization is an unknown outcome: ${JSON.stringify(first)}`);
+  assert.equal(first.authorization_sent, true);
+  assert.equal(rec.signed, 1);
+  const row = ledgerLines().at(-1);
+  assert.equal(row.status, 'authorized_unserved');
+  assert.equal(row.amount_motes, '1000000000');
+  assert.ok(!('expires_at' in row), `the hold carries no expiry: ${JSON.stringify(row)}`);
+
+  // The NEXT call, still in process, is already gated by the hold.
+  const gatedNow = JSON.parse((await handler()({ url: 'https://example.invalid', chain: 'casper', method: 'POST', body: '{}' })).content[0].text);
+  assert.match(gatedNow.error, /Casper daily budget exceeded/, `the existing budget error refuses: ${JSON.stringify(gatedNow)}`);
+  assert.equal(rec.signed, 1, 'the gated call signed nothing');
+  assert.equal(ledgerLines().length, 1, 'a refusal writes no ledger row');
+
+  // Restart at +61 s: fresh rehydration over the SAME ledger with a clock
+  // deliberately past the intent TTL — the hold must still count and still
+  // gate (a pre-fix row carrying the intent's expires_at released here and
+  // the call would have paid through a "restart is a reset" hole).
+  _resetCasperBudgetForTests();
+  const realNow = Date.now;
+  Date.now = () => realNow() + 61_000;
+  try {
+    assert.equal(casperBudget.getDailySpent(), 1000000000n, 'past the intent TTL the rehydrated hold still counts');
+    const state = ceilingState();
+    assert.equal(state.active, true);
+    assert.ok(Math.abs((state.spent_total_usd ?? -1) - 0.25) < 1e-9, `the USD ceiling sees the held Casper total through its configured rate: ${JSON.stringify(state)}`);
+    assert.deepEqual((state.disabled_rails ?? []).map((d) => d.rail), [], 'a priced rail is never listed as disabled');
+    const gatedAfterRestart = JSON.parse((await handler()({ url: 'https://example.invalid', chain: 'casper', method: 'POST', body: '{}' })).content[0].text);
+    assert.match(gatedAfterRestart.error, /Casper daily budget exceeded/, `the existing budget error refuses after the restart too: ${JSON.stringify(gatedAfterRestart)}`);
+    assert.equal(rec.signed, 1, 'still signed nothing beyond call 1');
+    assert.equal(ledgerLines().length, 1, 'still no row for a refusal');
+  } finally {
+    Date.now = realNow;
+  }
 });
