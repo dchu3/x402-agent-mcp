@@ -92,12 +92,15 @@ function readLedgerLines(path: string | undefined): string[] {
   }
 }
 
-/** Issue #54 (req 6): TODAY's Casper spend rebuilt from the SAME ledger rows
+/** Issue #97: TODAY's Casper spend rebuilt from the SAME ledger rows
  * every other accounting counter reads (the USD counters deliberately
  * exclude casper rows — this is where they are summed). The ONE
  * counted-spend predicate (isCountedSpend) decides: a verified success
- * counts; a signed-but-unverified authorization counts until the sent
- * payload's own expires_at, then releases; failed never counts. Amounts sum
+ * counts; a signed-but-unverified authorization counts for the whole UTC
+ * day it was written — rows written today carry no expires_at, so nothing
+ * releases the count at the intent TTL and the count survives rehydration;
+ * a legacy row that still carries a parseable expires_at keeps its old
+ * release-on-read. Failed never counts. Amounts sum
  * the row's own amount_motes audit field as exact integers — NEVER a USD
  * conversion, NEVER an invented price (an unpriced rail's refusal path stays
  * RAIL_DISABLED_NO_RATE at the budget check). Legacy-first, read-once, the

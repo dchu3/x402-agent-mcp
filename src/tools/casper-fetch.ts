@@ -144,13 +144,13 @@ export async function fetchCasper(
   } finally {
     // Issue #54 (req 6): the Casper row keeps the TRUE outcome too — a
     // verified success receipt settles; a nonzero authorization with no
-    // verified receipt is a signed-and-debited attempt (ambiguous failures
-    // retain the debit in the budget), so the ledger must count it exactly
-    // the same across a restart: authorized_unserved, its validity the
-    // intent's own expiry (none bound ⇒ no expiry field ⇒ the row counts —
-    // the fail-closed over-count direction). Nothing authorized ⇒ failed/0,
-    // exactly as before.
-    // Issue #80: nothing authorized now writes NO payment row at all — a
+    // verified receipt is a signed-and-debited attempt whose outcome is
+    // UNKNOWN (ambiguous failures retain the debit in the budget), so the
+    // ledger must count it exactly the same across a restart:
+    // authorized_unserved, written with NO expires_at. The row counts until
+    // the UTC day rollover and rehydrates identically — nothing releases it
+    // at the intent TTL (the fail-closed over-count direction).
+    // Issue #80: nothing authorized writes NO payment row at all — a
     // Casper response with zero motes authorized is not a payment (never a
     // payment ledger entry, never a spend input).
     const authorizedMotes = authorized();
@@ -163,7 +163,6 @@ export async function fetchCasper(
         chain: 'casper',
         currency: 'wCSPR',
         amount_motes: authorizedMotes.toString(),
-        ...(unservedAuthorization && intent != null ? { expires_at: intent.expiresAt } : {}),
         tx_hash: txHash,
         status: unservedAuthorization ? 'authorized_unserved' : status,
         error,
