@@ -56,7 +56,7 @@ An offer's asset is priced through a per-network asset table (`src/assets.ts`) B
 | `eip155:8453` (Base) | `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` | USDC | 6 | pegged |
 | `eip155:137` (Polygon) | `0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359` | USDC | 6 | pegged |
 | `eip155:42161` (Arbitrum) | `0xaf88d065e77c8cC2239327C5EDb3A432268e5831` | USDC | 6 | pegged |
-| `casper:casper` / `casper:casper-test` | the wCSPR package hashes | wCSPR | 9 | **not pegged** — the Casper leg is mote-budgeted (unchanged) |
+| `casper:casper` / `casper:casper-test` | the wCSPR package hashes | wCSPR | 9 | **not pegged** — the Casper leg is mote-budgeted |
 
 Operators extend the table via the policy config's `assets.extensions` (a list of `{network, asset, symbol, decimals, usdPeg?, usdRate?}` entries, validated fail-closed at load — an entry that prices nothing is rejected, and a valid extension's symbol/decimals override the shipped row for its asset). An `assets.extensions` entry can thus make a new asset payable: its symbol joins the `tokens.allowed` vocabulary and its decimals drive the exact USD conversion.
 
@@ -84,7 +84,7 @@ Casper endpoints advertise CAIP-2 networks `casper:casper` (mainnet) and `casper
 | `CASPER_MAX_PAYMENT_PER_CALL` | disabled | Maximum per authorization in decimal wCSPR (e.g. `1.5`) |
 | `CASPER_MAX_DAILY_SPEND` | disabled | Daily authorization budget in decimal wCSPR (e.g. `10`) |
 
-Both budgets must be explicitly set and positive. **The mote budgets remain the ONLY spend binding for the Casper leg. The leg can now carry an EXPLICITLY CONFIGURED USD rate — `X402_RATE_WCSPR_USD`, or a priced wCSPR entry via `assets.extensions` — used ONLY for visibility (`x402_status` / `x402_inspect` listings) and for the optional cross-chain ceiling `MAX_DAILY_SPEND_TOTAL_USD`; it never converts the mote caps or replaces them, and an unpriced Casper rail is refused outright while a ceiling is active (`RAIL_DISABLED_NO_RATE`). Only the network-specific wCSPR package hashes from [Casper Wallet Core](https://github.com/make-software/casper-wallet-core/blob/master/src/domain/constants/casperNetwork.ts) are accepted. `scheme: "exact"` and x402 v2 are required. Forced-chain calls still probe payment requirements, and the SDK checks the actual requirements again before signing. Settlement is performed by the endpoint's facilitator; this client does not configure a separate facilitator.
+Both budgets must be explicitly set and positive. **The mote budgets remain the ONLY spend binding for the Casper leg. The leg carries an EXPLICITLY CONFIGURED USD rate — `X402_RATE_WCSPR_USD`, or a priced wCSPR entry via `assets.extensions` — used ONLY for visibility (`x402_status` / `x402_inspect` listings) and for the optional cross-chain ceiling `MAX_DAILY_SPEND_TOTAL_USD`; it never converts the mote caps or replaces them, and an unpriced Casper rail is refused outright while a ceiling is active (`RAIL_DISABLED_NO_RATE`). Only the network-specific wCSPR package hashes from [Casper Wallet Core](https://github.com/make-software/casper-wallet-core/blob/master/src/domain/constants/casperNetwork.ts) are accepted. `scheme: "exact"` and x402 v2 are required. Forced-chain calls still probe payment requirements, and the SDK checks the actual requirements again before signing. Settlement is performed by the endpoint's facilitator; this client does not configure a separate facilitator.
 
 ```
 x402_fetch({ url: "https://some-casper-endpoint.example/api", chain: "casper" })
