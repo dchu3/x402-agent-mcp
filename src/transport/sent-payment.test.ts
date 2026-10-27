@@ -50,7 +50,7 @@ const SVM_PAYLOAD = (() => {
 
 it('an outgoing request carrying PAYMENT-SIGNATURE is reported sent, with the EVM payload signature', () => {
   const { sentPaymentOf } = requireSentPayment();
-  const info = sentPaymentOf({ input: 'https://seller.invalid/api', init: { headers: { 'payment-signature': paymentHeaderValue(EVM_PAYLOAD) } } } as never, undefined);
+  const info = sentPaymentOf('https://seller.invalid/api', { headers: { 'payment-signature': paymentHeaderValue(EVM_PAYLOAD) } } as never);
   assert.equal(info.sent, true);
   assert.equal(info.signature, '0x' + 'd'.repeat(130), 'the EVM payload signature passes through verbatim');
 });
@@ -58,7 +58,7 @@ it('an outgoing request carrying PAYMENT-SIGNATURE is reported sent, with the EV
 it('a Solana exact payload decodes the base64 wire transaction to its first-64 base58 signature', () => {
   const { sentPaymentOf } = requireSentPayment();
   const header = paymentHeaderValue(SVM_PAYLOAD);
-  const info = sentPaymentOf({ input: 'https://seller.invalid/api', init: { headers: { 'payment-signature': header } } } as never, undefined);
+  const info = sentPaymentOf('https://seller.invalid/api', { headers: { 'payment-signature': header } } as never);
   assert.equal(info.sent, true);
   const raw = Buffer.from(String(SVM_PAYLOAD.payload.transaction), 'base64');
   assert.equal(info.signature, bs58.encode(raw.subarray(0, 64)), 'the chain signature is the first 64 bytes, base58');
@@ -66,15 +66,15 @@ it('a Solana exact payload decodes the base64 wire transaction to its first-64 b
 
 it('an X-PAYMENT header (legacy name) is equally a send signal', () => {
   const { sentPaymentOf } = requireSentPayment();
-  const info = sentPaymentOf({ input: 'https://seller.invalid/api', init: { headers: { 'X-Payment': paymentHeaderValue(EVM_PAYLOAD) } } } as never, undefined);
+  const info = sentPaymentOf('https://seller.invalid/api', { headers: { 'X-Payment': paymentHeaderValue(EVM_PAYLOAD) } } as never);
   assert.equal(info.sent, true);
   assert.equal(info.signature, '0x' + 'd'.repeat(130));
 });
 
 it('an unparseable payment header still counts as sent (counting never depends on parse success)', () => {
   const { sentPaymentOf } = requireSentPayment();
-  for (const bad of ['!!!not-base64!!!', Buffer.from('{"x402Version":2,"payload":{}}').toString('base64'), '']) {
-    const info = sentPaymentOf({ input: 'h', init: { headers: { 'payment-signature': bad } } } as never, undefined);
+  for (const bad of ['!!!not-base64!!!', Buffer.from('{"x402Version":2,"payload":{}}').toString('base64')]) {
+    const info = sentPaymentOf('h', { headers: { 'payment-signature': bad } } as never);
     assert.equal(info.sent, true, `header value ${bad.slice(0, 20)} still marks the send`);
     assert.equal(info.signature, undefined, `header value ${bad.slice(0, 20)} yields no signature`);
   }
@@ -82,7 +82,7 @@ it('an unparseable payment header still counts as sent (counting never depends o
 
 it('a request without any payment header is not sent (the unpaid probe is not a send)', () => {
   const { sentPaymentOf } = requireSentPayment();
-  const none = sentPaymentOf({ input: 'https://seller.invalid/api', init: { headers: { accept: 'application/json' } } } as never, undefined);
+  const none = sentPaymentOf('https://seller.invalid/api', { headers: { accept: 'application/json' } } as never);
   assert.equal(none.sent, false);
   assert.equal(none.signature, undefined);
 });

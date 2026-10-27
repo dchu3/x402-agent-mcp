@@ -35,6 +35,9 @@ import { FLOAT_EPSILON_USD, formatUsd } from "./money.js";
 // overlapping call can never reserve budget the gate would refuse — and no
 // cycle results: policy/config.ts imports no accounting module.
 import { loadPolicyConfig } from "./policy/config.js";
+// Reconciliation of sent-but-unproven rows: the reserve call site shares the
+// reconciler's rate-limit window (see reconcileSettlementsForReserve above).
+import { maybeReconcileAuthorizedUnserved } from "./settlement-reconcile.js";
 // Issue #65 (req 1): the ceiling reads every registered rail's spend through
 // the budget registry — ONE accounting read for the whole cross-chain total.
 import { getBudgets, railSpendUsd, RAIL_DISABLED_NO_RATE, type BudgetRail } from "./budget-registry.js";
@@ -117,6 +120,9 @@ export function dailyHoldScope(networkBucket?: string): string {
  * one synchronous step (single-threaded atomicity). Returns the reservation
  * id, or a refusal naming the cap that bound. */
 export function reserveSpend(input: ReservationInput): ReservationResult {
+  // Give the settlement reconciler its (rate-limited) turn first: rewritten
+  // rows recount into the daily map this call's checks read below.
+  reconcileSettlementsForReserve();
   const amountUsd = input.amountUsd;
   if (!Number.isFinite(amountUsd) || amountUsd < 0) {
     return { ok: false, reason: `reservation amount $${amountUsd} is not a finite non-negative spend` };
@@ -204,6 +210,17 @@ export function settleReservation(id: string): void {
  * again. A second release/settle of the same id is a no-op. */
 export function releaseReservation(id: string): void {
   active.delete(id);
+}
+
+/** Reconcile-before-release: the reservation call site gives the settlement
+ * reconciler ONE rate-limited turn per window (the same window rehydration
+ * shares) so a signed payment whose chain status just got confirmed keeps
+ * counting through its old expiry — the reconciler rewrites the row and
+ * recounts, and a later call's cap reads see the settled truth. The call is
+ * fire-and-forget from this synchronous registry: the CURRENT call's caps
+ * already read the ledger; the correction lands before the next reads. */
+export function reconcileSettlementsForReserve(): void {
+  void maybeReconcileAuthorizedUnserved(Date.now());
 }
 
 /** USD currently held by outstanding reservations for one scope. */

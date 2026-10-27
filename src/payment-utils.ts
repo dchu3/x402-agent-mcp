@@ -13,6 +13,12 @@ import { prepareLedgerDir, resolveLedger } from "./ledger-path.js";
 import { atomicStringFromUsdString, exactUsdString } from "./tools/accounting.js";
 import { registerBudget, resolveRailUsdRate } from "./budget-registry.js";
 import { reservedUsd } from "./reservations.js";
+// The reconciliation hook the rehydration fires (rate-limited inside the
+// module): an expired signed payment whose chain status is now confirmed is
+// rewritten to a permanent count before it can drop out of the caps. Cycle-
+// safe: both modules import each other's hoisted function declarations only
+// (the same working pattern as reservations.ts ↔ payment-utils.ts).
+import { maybeReconcileAuthorizedUnserved } from "./settlement-reconcile.js";
 
 export interface PaymentLogEntry {
   timestamp: string;
@@ -64,6 +70,16 @@ export interface PaymentLogEntry {
   // Optional: rows written before #59 rehydrate into their chain's mainnet
   // bucket exactly as before (rehydrate tests pin this).
   network?: string;
+  // The on-chain signature of the SENT payment when it was captured from the
+  // outgoing payment header (the Solana wire transaction's first 64 bytes,
+  // base58; the EVM payload's hex signature). Optional: the settlement
+  // reconciler consults ONLY rows carrying it (a row without one simply
+  // counts to its expiry — fail closed); absent on every pre-#90 row.
+  signature?: string;
+  // The reconciliation extension counter: how many failed settlement lookups
+  // already extended this row's expiry (bounded; the reconciler stops
+  // extending at the bound). Optional, reconciler-written only.
+  reconcile_retries?: number;
 }
 
 // Issue #54 (req 3): the ledger location resolves through src/ledger-path.ts
@@ -147,26 +163,50 @@ function rehydrateFromLedger(): void {
   // spend (an upgrade that dropped it would silently widen every cap that
   // reads these totals).
   for (const line of readLedgerLines(LEDGER.legacyReadOnly).concat(readLedgerLines(LOG_PATH))) {
-    try {
-      const entry = JSON.parse(line) as PaymentLogEntry;
-      if (
-        // Issue #54: the ONE counted-spend predicate — success and
-        // settled_unserved count; a sent-but-unproven authorization counts
-        // until its own expiry; failed never counts.
-        isCountedSpend(entry, Date.now()) &&
-        entry.chain !== "casper" &&
-        typeof entry.chain === "string" &&
-        entry.timestamp.slice(0, 10) === dailyDate
-      ) {
-        // Issue #59 (D7): DEVNET rows bucket under their exact network id; old
-        // rows (no `network` field) and every mainnet row read as the chain's
-        // mainnet bucket — rehydration behavior unchanged.
-        const bucket = spendBucketOf(entry);
-        dailySpentByChain.set(bucket, (dailySpentByChain.get(bucket) ?? 0) + (entry.amount_usdc ?? 0));
-      }
-    } catch {
-      // Corrupted ledger lines are skipped — logging is best-effort, so is reading it back
+    creditCountedLedgerRow(line);
+  }
+  // The reconciler may correct the ledger (rows whose settlement the chain
+  // confirmed after their expiry passed — the settled amount must never drop
+  // out of a cap, even across a restart): give it ONE bounded turn after
+  // every rehydration. The window lives inside the reconciler module.
+  void maybeReconcileAuthorizedUnserved(Date.now());
+}
+
+/** The per-row counting rule both rehydration and the recount apply — the
+ * isCountedSpend predicate, same-day rows only, Casper excluded (its mote
+ * budget is casper/budget.ts), bucketed by the row's spend bucket. */
+function creditCountedLedgerRow(line: string): void {
+  try {
+    const entry = JSON.parse(line) as PaymentLogEntry;
+    if (
+      // Issue #54: the ONE counted-spend predicate — success and
+      // settled_unserved count; a sent-but-unproven authorization counts
+      // until its own expiry; failed never counts.
+      isCountedSpend(entry, Date.now()) &&
+      entry.chain !== "casper" &&
+      typeof entry.chain === "string" &&
+      entry.timestamp.slice(0, 10) === dailyDate
+    ) {
+      // Issue #59 (D7): DEVNET rows bucket under their exact network id; old
+      // rows (no `network` field) and every mainnet row read as the chain's
+      // mainnet bucket — rehydration behavior unchanged.
+      const bucket = spendBucketOf(entry);
+      dailySpentByChain.set(bucket, (dailySpentByChain.get(bucket) ?? 0) + (entry.amount_usdc ?? 0));
     }
+  } catch {
+    // Corrupted ledger lines are skipped — logging is best-effort, so is reading it back
+  }
+}
+
+/** Rebuild the daily totals from the ledger files, from scratch: the ONE
+ * hook the settlement reconciler applies after rewriting a row, so the
+ * in-memory caps match the ledger immediately (and a restart would
+ * rehydrate the very same figures). Keeps the day-rollover rule of
+ * rehydration: only today's rows count. */
+export function recountDailyFromLedger(): void {
+  for (const bucket of [...dailySpentByChain.keys()]) dailySpentByChain.delete(bucket);
+  for (const line of readLedgerLines(LEDGER.legacyReadOnly).concat(readLedgerLines(LOG_PATH))) {
+    creditCountedLedgerRow(line);
   }
 }
 

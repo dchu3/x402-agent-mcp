@@ -17,6 +17,11 @@ import { casperNetworkResolved, modeAllowsNetwork, resolveNetworkMode, solanaNet
 import type { NetworkMode } from "../networks.js";
 import { checkSpendingLimit, logPayment, getDailySpent, spendBucketForNetwork, getMaxPerCall, getMaxPerCallAtomic, getMaxDailySpend, isCountedSpend } from "../payment-utils.js";
 import type { PaymentLogEntry } from "../payment-utils.js";
+// The outgoing-payment signal: the paid transport wrapper reports every
+// outgoing request that carries a payment header (the exact "left the
+// client" signal) and captures the sent payment's on-chain signature when
+// the payload envelope carries one (the reconciler's row field).
+import { sentPaymentTracking } from "../transport/sent-payment.js";
 // Issue #59 (D7): the DEVNET CAIP-2 decides the spend bucket of a leg.
 import { SOLANA_DEVNET_CAIP2 } from "@x402/svm";
 import { getPolicyEngine, buildPolicyContext, livenessVerdictForUrl, loadPolicyConfig } from "../policy/config.js";
@@ -49,6 +54,46 @@ import { checkExtraHeaders } from "../transport/headers.js";
 import { untrustedText, stripUntrusted, PROBE_UNTRUSTED_MAX, CHALLENGE_UNTRUSTED_MAX } from "../transport/untrusted.js";
 import { usdFromAtomic, sellerReportedCostUsd, parseBoundedBody, atomicStringFromUsdString, exactUsdString } from "./accounting.js";
 import { createFromOffer, intentManager } from "../payment-intent/manager.js";
+
+// ---------------------------------------------------------------------------
+// The SENT PAYLOAD's own validity: an authorized_unserved row counts until
+// the sent payment can no longer settle. The sent payload stays submittable
+// for the LONGEST of:
+//   - the intent's own TTL (its expiresAt — the 60 s default),
+//   - the challenge's validity span (maxTimeoutSeconds — the seller keeps
+//     the authorization submittable that long),
+//   - and, for a Solana leg, a conservative blockhash bound (150 s): the
+//     blockhash the wire transaction pins stops being valid at blockheight,
+//     but the bound here must err OVER — a possibly-settling payment that
+//     stopped counting would un-count settled spend.
+// Pure (no clock, no env): the flow passes the intent fields, the caller
+// decides the leg.
+// ---------------------------------------------------------------------------
+
+/** Conservative upper bound on the window a signed Solana wire transaction
+ * can still settle (blockhash validity; err on the over-count side). */
+export const SOLANA_TX_VALIDITY_MS = 150_000;
+
+/** The ISO instant the sent payload's counting window ends: the max of the
+ * three validity sources. With nothing parseable the intent's expiresAt is
+ * passed through verbatim (isCountedSpend fails closed on unparseable
+ * expiries — the row keeps counting). */
+export function sentPayloadExpiryIso(
+  intent: Pick<PaymentIntent, "createdAt" | "expiresAt" | "validitySeconds">,
+  isSolanaLeg: boolean,
+): string {
+  const created = Date.parse(intent.createdAt);
+  const candidates = [Date.parse(intent.expiresAt)];
+  if (Number.isFinite(created)) {
+    if (Number.isFinite(intent.validitySeconds) && intent.validitySeconds > 0) {
+      candidates.push(created + intent.validitySeconds * 1000);
+    }
+    if (isSolanaLeg) candidates.push(created + SOLANA_TX_VALIDITY_MS);
+  }
+  const valid = candidates.filter((c) => Number.isFinite(c));
+  if (valid.length === 0) return intent.expiresAt;
+  return new Date(Math.max(...valid)).toISOString();
+}
 // Issue #67: the offer-evaluation wiring — one wiring shared with the free
 // x402_inspect tool (src/tools/inspector.ts) so selection never drifts.
 import { seamUsdOf, seamPolicyFor } from "./offer-evaluation.js";
@@ -925,6 +970,12 @@ export function registerFetchTool(server: McpServer): void {
       let intent: PaymentIntent | null = null;
       let blockedCode: IntentRejectCode | undefined;
       let signedAmountUsdc: number | undefined;
+      // The outgoing-payment signal: flips when an outgoing request carried
+      // a payment header (the paid request left the client); sentSignature
+      // carries the on-chain signature the transport wrapper captured from
+      // that header, feeding the ledger row's reconciler field.
+      let paidRequestSent = false;
+      let sentSignature: string | undefined;
       // Issue #53/#54: flips inside the enforcement hook right after the
       // intent is consumed — the only point where a signature may exist.
       let payloadSigned = false;
@@ -1400,7 +1451,16 @@ export function registerFetchTool(server: McpServer): void {
                 : selectedOffer !== undefined || probeRecord.status !== 402
                   ? replayFirstProbe(probeRecord, guardedFetch)
                   : guardedFetch;
-              const paidFetch = wrapFetchWithPayment(transport, client);
+              // Every request the SDK makes — unpaid replay probe and paid
+              // leg alike — passes through the tracking wrapper BEFORE the
+              // transport does, so a refusal or failure further down the
+              // chain still counts as an outgoing payment attempt (fail
+              // closed) and the paid request's signature lands on the row.
+              const trackedTransport = sentPaymentTracking(transport, (info) => {
+                paidRequestSent = info.sent;
+                sentSignature = info.signature;
+              });
+              const paidFetch = wrapFetchWithPayment(trackedTransport, client);
               // Issue #56+#80: the paid leg carries ONE repo-owned deadline
               // (X402_PAID_TIMEOUT_MS, default 30000 ms, parsed fail-closed by
               // replay.paidTimeoutMs): the controller's signal rides the SDK
@@ -1474,8 +1534,10 @@ export function registerFetchTool(server: McpServer): void {
                 ? "authorized_unserved"
                 : "failed";
           // The sent payload's own validity bounds the authorized_unserved
-          // count (the intent's expiry); every other status has none.
-          const rowExpiresAt = rowStatus === "authorized_unserved" && intent !== null ? intent.expiresAt : undefined;
+          // count — the MAX of the intent expiry, the challenge's validity
+          // span and (Solana legs) the blockhash bound: a sent payment that
+          // can still settle keeps counting. Every other status has none.
+          const rowExpiresAt = rowStatus === "authorized_unserved" && intent !== null ? sentPayloadExpiryIso(intent, useChain === "solana") : undefined;
 
           // Issue #53: the recorded amount comes from the SIGNED payment only —
           // the intent amount via usdFromAtomic above — never from the seller's
@@ -1548,6 +1610,10 @@ export function registerFetchTool(server: McpServer): void {
             ...(probedOffer?.network ? { network: probedOffer.network } : {}),
             ...(rowCountsNow ? { amount_usdc: recordedAmountUsdc, ...intentTrail } : { amount_usdc: 0 }),
             ...(rowExpiresAt === undefined ? {} : { expires_at: rowExpiresAt }),
+            // The sent payment's on-chain signature (captured from the
+            // outgoing payment header) rides the sent row so the settlement
+            // reconciler can convert it to a permanent count later.
+            ...(rowStatus === "authorized_unserved" && sentSignature !== undefined ? { signature: sentSignature } : {}),
             ...non200DetailFields,
             tx_hash: txHash,
             status: rowStatus,
@@ -1670,7 +1736,8 @@ export function registerFetchTool(server: McpServer): void {
                 amount_atomic: intent.amountAtomic,
                 decimals: intent.decimals,
                 ...(intent.asset !== "" ? { asset: intent.asset } : {}),
-                expires_at: intent.expiresAt,
+                expires_at: sentPayloadExpiryIso(intent, useChain === "solana"),
+                ...(sentSignature !== undefined ? { signature: sentSignature } : {}),
                 status: "authorized_unserved" as const,
               }
             : { amount_usdc: 0, status: "failed" as const }),
