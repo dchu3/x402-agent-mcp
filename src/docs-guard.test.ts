@@ -567,6 +567,12 @@ const GUARD_H_TOKENS: ReadonlyArray<[string, RegExp]> = [
   ['history note', /once dragged/],
   ['history note', /hardcoded 30 s/],
   ['history note', /Today['’]s behavio/],
+  // widened for #93 (B5): the pre-policy note and the "deliberate
+  // tightening" decision-note flavour are history prose the same way — the
+  // public docs state the current behaviour, not the design story that led
+  // to it.
+  ['history note', /before the policy engine/],
+  ['history note', /[Dd]eliberate[ _-]+(default[ _-]+)?tightening/],
 ];
 
 function findGuardHViolations(text: string): string[] {
@@ -610,6 +616,8 @@ it('positive + negative control (#87): the guard H scanner fails on every token 
     'a hardcoded ' + '30 s' + ' literal; Today' + "'" + 's behavio' + 'ur row',
     'and the curly-spelled ' + 'Today\u2019s behavio' + 'ur row as well',
     'before chain-' + 'scoping the vocabulary was one chain',
+    'decided ' + 'before the policy engine' + ' shipped, back when it lacked the gate',
+    'the one ' + 'deliberate tightening' + ' of the default — and a ' + 'deliberate default tightening' + ' again',
   ].join('\n');
   assert.equal(findGuardHViolations(BAD).length, GUARD_H_TOKENS.length, 'every token class must be flagged');
 
