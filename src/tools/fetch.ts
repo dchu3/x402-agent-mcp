@@ -24,7 +24,9 @@ import { getPerServiceSpent, recordServicePayment } from "../policy/budget-store
 import type { OperatorAssetEntry } from "../policy/types.js";
 // Issue #54 (req 1): the reserve-before-sign registry — overlapping calls
 // cannot each pass the same remaining budget while one is still being paid.
-import { releaseReservation, reserveSpend, reservedUsd, settleReservation } from "../reservations.js";
+// dailyHoldScope: the ONE scope derivation the registry's hold-insert and
+// the gate's holds-read below must agree on.
+import { dailyHoldScope, releaseReservation, reserveSpend, reservedUsd, settleReservation } from "../reservations.js";
 import { getAnomalyInputs, recordSettledAmount } from "../policy/anomaly-store.js";
 import { extractSettlementReceipt, RECEIPT_VERIFIED, RECEIPT_NOTE } from "./receipt-utils.js";
 // Issue #58 (req 1/4/5): every fetch this tool makes goes through the one
@@ -1079,7 +1081,18 @@ export function registerFetchTool(server: McpServer): void {
           // whole-map total (which NEVER includes the devnet bucket) for
           // every other leg — the per-service context's holds stay scoped to
           // the devnet-prefixed service scope exactly as computed above.
-          { dailySpentUsd: dailySpentOfBucket, perServiceSpentUsd: getPerServiceSpent(serviceHost) + reservedUsd(serviceScope) },
+          // Issue #54/GATE: the gate's daily figure must ALSO see the holds
+          // other overlapping calls placed since the ledger was last read —
+          // the hold sits in the leg's own daily-bucket scope
+          // (dailyHoldScope: 'global' for a mainnet leg, 'net:<bucket>' for
+          // a devnet leg), and an overlapping second call must be refused by
+          // the SAME rule that will refuse it at reserve time. Holds are
+          // only ever added to the spent side — never subtracted — so this
+          // can only tighten the gate. Per-service figure unchanged.
+          {
+            dailySpentUsd: dailySpentOfBucket + reservedUsd(dailyHoldScope(spendBucket)),
+            perServiceSpentUsd: getPerServiceSpent(serviceHost) + reservedUsd(serviceScope),
+          },
           getAnomalyInputs(url),
         );
         if (policyResult.decision !== "ALLOW") {

@@ -182,9 +182,13 @@ it('overlapping reservations cannot squeeze past the effective cap (interleaved 
     else refused.push(String(r.reason));
     await settle(); // yield exactly as overlapping tool calls do
   }
-  assert.equal(granted.length, 0, 'with $4.98 spent + $0.01 held, no further $0.01 fits under the $5 cap');
-  assert.equal(refused.length, 3);
-  assert.ok(Math.abs(reservedUsd('global') - PRICE) < 1e-9, 'only the granted hold remains outstanding');
+  // $4.98 spent + $0.01 held: exactly ONE further $0.01 fits (5.00 —
+  // reaching the cap exactly stays allowed, the same boundary rule 7 uses),
+  // anything beyond is refused: overlapping calls cannot squeeze past.
+  assert.equal(granted.length, 1, 'exactly one holding call reaches the at-cap boundary');
+  assert.equal(refused.length, 2, 'no call may hold past the effective cap');
+  assert.ok(Math.abs(reservedUsd('global') - 2 * PRICE) < 1e-9, 'exactly the two holds remain outstanding');
+  for (const reason of refused) assert.ok(reason.includes('MAX_DAILY_SPEND'), 'each refusal names the daily cap sources');
 });
 
 it('reserveSpend fails closed when the policy configuration is broken', () => {
