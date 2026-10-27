@@ -140,7 +140,7 @@ it('rule 7 refusal messages print rounded money, never float artefacts', () => {
 
 it('rule 8 allows a payment whose float-noise sum lands microscopically above the cap', () => {
   const engine = perServiceEngine(0.35);
-  const result = engine.evaluate(ctx(), { perServiceSpentUsd: NOISE_SPENT, dailySpentUsd: 0 });
+  const result = engine.evaluate(ctx({ amount: 0.05 }), { perServiceSpentUsd: NOISE_SPENT, dailySpentUsd: 0 });
   assert.equal(result.decision, 'ALLOW');
   assert.deepEqual(result.reasons, []);
 });

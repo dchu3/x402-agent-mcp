@@ -53,6 +53,7 @@
 
 import { evaluatePriceAnomaly } from "./anomaly.js";
 import { normalizeRecipient, parseRecipientEntry, RECIPIENT_ANY_CHAIN } from "./recipient.js";
+import { FLOAT_EPSILON_USD, formatUsd } from "../money.js";
 import { aliasForCaip2, caip2Of, isEvmNetwork, L1_CAIP2, normalizeCaip2Evm } from "../evm/networks.js";
 import type {
   AnomalyInputs,
@@ -294,17 +295,21 @@ export class PolicyEngine {
     }
 
     // Rule 7: global daily cap (spent + amount > cap ⇒ deny; reaching exactly
-    // the cap is allowed — same boundary as payment-utils.checkSpendingLimit).
+    // the cap is allowed — same boundary as payment-utils.checkSpendingLimit;
+    // the comparison tolerates the shared FLOAT_EPSILON_USD representation
+    // noise so a sum that lands an artefact ULP above the cap is not refused).
+    // Refusal values print through the shared money rounding — operator
+    // money, never float artefact digits.
     const dailySpent = finiteOrZero(budget.dailySpentUsd);
-    if (isSpendableAmount(ctx.amount) && dailySpent + ctx.amount > cfg.payments.maxDaily) {
-      reasons.push({ code: "DAILY_LIMIT_EXCEEDED", message: `Payment $${ctx.amount} would exceed the daily cap $${cfg.payments.maxDaily} ($${dailySpent} spent today)` });
+    if (isSpendableAmount(ctx.amount) && dailySpent + ctx.amount > cfg.payments.maxDaily + FLOAT_EPSILON_USD) {
+      reasons.push({ code: "DAILY_LIMIT_EXCEEDED", message: `Payment ${formatUsd(ctx.amount)} would exceed the daily cap ${formatUsd(cfg.payments.maxDaily)} (${formatUsd(dailySpent)} spent today)` });
     }
 
     // Rule 8: per-service daily cap (only when configured for the level).
     if (svc.maxDaily !== undefined && isSpendableAmount(ctx.amount)) {
       const perService = finiteOrZero(budget.perServiceSpentUsd);
-      if (perService + ctx.amount > svc.maxDaily) {
-        reasons.push({ code: "SERVICE_LIMIT_EXCEEDED", message: `Service ${ctx.service} daily limit is $${svc.maxDaily} and $${Math.max(svc.maxDaily - perService, 0)} remains` });
+      if (perService + ctx.amount > svc.maxDaily + FLOAT_EPSILON_USD) {
+        reasons.push({ code: "SERVICE_LIMIT_EXCEEDED", message: `Service ${ctx.service} daily limit is ${formatUsd(svc.maxDaily)} and ${formatUsd(Math.max(svc.maxDaily - perService, 0))} remains` });
       }
     }
 

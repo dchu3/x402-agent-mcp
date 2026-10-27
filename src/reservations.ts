@@ -24,6 +24,9 @@
 // (never cached at module load), exactly like checkSpendingLimit.
 
 import { getDailySpent, getDevnetDailySpent, getMaxDailySpend, getMaxPerCall, readCapUsd } from "./payment-utils.js";
+// The ONE float tolerance every USD-cap comparison uses (engine cap rules,
+// reservation checks) — no duplicated epsilon anywhere on the spend path.
+import { FLOAT_EPSILON_USD } from "./money.js";
 // Issue #65 (req 1): the ceiling reads every registered rail's spend through
 // the budget registry — ONE accounting read for the whole cross-chain total.
 import { getBudgets, railSpendUsd, RAIL_DISABLED_NO_RATE, type BudgetRail } from "./budget-registry.js";
@@ -50,14 +53,6 @@ interface Reservation {
 
 const active = new Map<string, Reservation>();
 let counter = 0;
-
-/** Float64 addition noise allowance for cap comparison: sums of 1e-2-scale
- * USD values land within ~1e-15 relative error, so `0.01 + 0.01 + 0.01`
- * exceeds the literal `0.03` cap by 2 ULP (~5.6e-18) — an epsilon of 1e-9
- * USD (a hundred-millionth of a cent) absorbs representation noise only; it
- * can never admit a genuinely larger amount (any semantic overshoot is
- * ≥ 1e-4, the ledger's recorded precision scale). */
-const FLOAT_EPSILON_USD = 1e-9;
 
 /** Reserve USD spend synchronously: check the caps and insert the hold as
  * one synchronous step (single-threaded atomicity). Returns the reservation
