@@ -31,17 +31,21 @@ export interface PaymentLogEntry {
   //                          carrying a tx hash — settlement evidence exists,
   //                          so the row counts permanently;
   //   "authorized_unserved"  a signed payload was sent WITHOUT settlement
-  //                          evidence — the send is counted until the sent
-  //                          payload's own validity (expires_at) ends, then
-  //                          released;
+  //                          evidence — the outcome is UNKNOWN, so the send
+  //                          counts until the UTC day rollover (fail-closed
+  //                          over-count);
   //   "failed"               nothing was signed/sent, or a clear
   //                          pre-settlement refusal — never counted.
   status: "success" | "failed" | "settled_unserved" | "authorized_unserved";
   error?: string;
-  // Issue #54: the ISO instant an "authorized_unserved" row stops counting —
-  // the sent payload's own validity (the payment intent's expiresAt). Absent
-  // or unparseable, the row counts — the fail-closed over-count direction: a
-  // signed-and-sent payment must never silently un-count.
+  // The ISO instant an "authorized_unserved" row stops counting — LEGACY
+  // READ ONLY. Rows written today carry no expires_at (the sent payment's
+  // outcome is unknown, so the amount counts until the UTC day rollover);
+  // rows written before the fail-closed change keep their old release
+  // semantics on read: a past expires_at releases the row exactly as
+  // before. Absent or unparseable, the row counts — the fail-closed
+  // over-count direction: a signed-and-sent payment must never silently
+  // un-count.
   expires_at?: string;
   // Issue #45: a refused (non-200) paid fetch row is self-describing — it
   // carries the HTTP status and the gateway's error string (or `HTTP <status>`
@@ -58,7 +62,7 @@ export interface PaymentLogEntry {
   amount_atomic?: string;
   decimals?: number;
   asset?: string;
-  // Issue #59 (req 7 + D7): the exact CAIP-2 network the row settled on — a
+  // Issue #59 (D7): the exact CAIP-2 network the row settled on — a
   // DEVNET row's marker: its spend bucket is the network id itself, never the
   // chain vocabulary ("solana") that would merge it into the mainnet total.
   // Optional: rows written before #59 rehydrate into their chain's mainnet
@@ -118,10 +122,13 @@ export function getDevnetDailySpent(): number {
  *
  * - "success" and "settled_unserved" count, permanently — settlement
  *   happened (the 200, or the receipt's tx evidence);
- * - "authorized_unserved" counts UNTIL the sent payload's own validity
- *   (expires_at), then releases — a payload that can no longer settle is not
- *   spend any more. A missing/unparseable expires_at COUNTS: the fail-closed
- *   over-count direction never silently un-counts a sent payment;
+ * - "authorized_unserved": the payment was SENT but its outcome is unknown
+ *   — it may have settled, so the fail-closed direction is over-count: the
+ *   row counts for the whole UTC day it was written (today's rows carry no
+ *   expires_at at all; the day's counter rolls over at midnight). A legacy
+ *   row that still carries a parseable expires_at keeps its old release
+ *   semantics and stops counting at that instant. A missing/unparseable
+ *   expires_at always COUNTS — a sent payment never silently un-counts;
  * - "failed" (nothing signed/sent, or a clear pre-settlement refusal) and
  *   any unknown/legacy status never count. */
 export function isCountedSpend(entry: { status?: string; expires_at?: string }, nowMs: number): boolean {
@@ -147,26 +154,34 @@ function rehydrateFromLedger(): void {
   // spend (an upgrade that dropped it would silently widen every cap that
   // reads these totals).
   for (const line of readLedgerLines(LEDGER.legacyReadOnly).concat(readLedgerLines(LOG_PATH))) {
-    try {
-      const entry = JSON.parse(line) as PaymentLogEntry;
-      if (
-        // Issue #54: the ONE counted-spend predicate — success and
-        // settled_unserved count; a sent-but-unproven authorization counts
-        // until its own expiry; failed never counts.
-        isCountedSpend(entry, Date.now()) &&
-        entry.chain !== "casper" &&
-        typeof entry.chain === "string" &&
-        entry.timestamp.slice(0, 10) === dailyDate
-      ) {
-        // Issue #59 (D7): DEVNET rows bucket under their exact network id; old
-        // rows (no `network` field) and every mainnet row read as the chain's
-        // mainnet bucket — rehydration behavior unchanged.
-        const bucket = spendBucketOf(entry);
-        dailySpentByChain.set(bucket, (dailySpentByChain.get(bucket) ?? 0) + (entry.amount_usdc ?? 0));
-      }
-    } catch {
-      // Corrupted ledger lines are skipped — logging is best-effort, so is reading it back
+    creditCountedLedgerRow(line);
+  }
+}
+
+/** The per-row counting rule both rehydration and the recount apply — the
+ * isCountedSpend predicate, same-day rows only, Casper excluded (its mote
+ * budget is casper/budget.ts), bucketed by the row's spend bucket. */
+function creditCountedLedgerRow(line: string): void {
+  try {
+    const entry = JSON.parse(line) as PaymentLogEntry;
+    if (
+      // Issue #54: the ONE counted-spend predicate — success and
+      // settled_unserved count; a sent-but-unproven authorization counts
+      // (its outcome is unknown; the day rollover ends the count, and only
+      // a legacy row with a past expires_at releases); failed never counts.
+      isCountedSpend(entry, Date.now()) &&
+      entry.chain !== "casper" &&
+      typeof entry.chain === "string" &&
+      entry.timestamp.slice(0, 10) === dailyDate
+    ) {
+      // Issue #59 (D7): DEVNET rows bucket under their exact network id; old
+      // rows (no `network` field) and every mainnet row read as the chain's
+      // mainnet bucket — rehydration behavior unchanged.
+      const bucket = spendBucketOf(entry);
+      dailySpentByChain.set(bucket, (dailySpentByChain.get(bucket) ?? 0) + (entry.amount_usdc ?? 0));
     }
+  } catch {
+    // Corrupted ledger lines are skipped — logging is best-effort, so is reading it back
   }
 }
 
@@ -306,8 +321,8 @@ export function logPayment(entry: PaymentLogEntry): void {
   rehydrateFromLedger();
 
   // Issue #54: the in-process add counts by the SAME predicate rehydration
-  // filters by — a signed-and-sent unserved write counts immediately (its
-  // expiry is its own validity), a failed write never does; the in-memory
+  // filters by — a signed-and-sent unserved write counts immediately (for
+  // the rest of the UTC day), a failed write never does; the in-memory
   // total always matches what a restart rehydrates from the same rows.
   if (isCountedSpend(entry, Date.now()) && entry.chain !== "casper") {
     // Issue #59 (D7): the same bucket rule as rehydration — a devnet write

@@ -17,6 +17,14 @@ import { casperNetworkResolved, modeAllowsNetwork, resolveNetworkMode, solanaNet
 import type { NetworkMode } from "../networks.js";
 import { checkSpendingLimit, logPayment, getDailySpent, spendBucketForNetwork, getMaxPerCall, getMaxPerCallAtomic, getMaxDailySpend, isCountedSpend } from "../payment-utils.js";
 import type { PaymentLogEntry } from "../payment-utils.js";
+// The outgoing-payment signal: the paid transport wrapper reports every
+// outgoing request that carries a payment header (the exact "left the
+// client" signal). No signature is extracted: the client cannot know the
+// on-chain signature at payload time (on Solana the first signature slot
+// is the facilitator fee payer's, added only at settlement) — settle
+// evidence reaches the ledger through the response receipt, never the
+// request payload.
+import { sentPaymentTracking } from "../transport/sent-payment.js";
 // Issue #59 (D7): the DEVNET CAIP-2 decides the spend bucket of a leg.
 import { SOLANA_DEVNET_CAIP2 } from "@x402/svm";
 import { getPolicyEngine, buildPolicyContext, livenessVerdictForUrl, loadPolicyConfig } from "../policy/config.js";
@@ -24,7 +32,9 @@ import { getPerServiceSpent, recordServicePayment } from "../policy/budget-store
 import type { OperatorAssetEntry } from "../policy/types.js";
 // Issue #54 (req 1): the reserve-before-sign registry — overlapping calls
 // cannot each pass the same remaining budget while one is still being paid.
-import { releaseReservation, reserveSpend, reservedUsd, settleReservation } from "../reservations.js";
+// dailyHoldScope: the ONE scope derivation the registry's hold-insert and
+// the gate's holds-read below must agree on.
+import { dailyHoldScope, releaseReservation, reserveSpend, reservedUsd, settleReservation } from "../reservations.js";
 import { getAnomalyInputs, recordSettledAmount } from "../policy/anomaly-store.js";
 import { extractSettlementReceipt, RECEIPT_VERIFIED, RECEIPT_NOTE } from "./receipt-utils.js";
 // Issue #58 (req 1/4/5): every fetch this tool makes goes through the one
@@ -47,6 +57,7 @@ import { checkExtraHeaders } from "../transport/headers.js";
 import { untrustedText, stripUntrusted, PROBE_UNTRUSTED_MAX, CHALLENGE_UNTRUSTED_MAX } from "../transport/untrusted.js";
 import { usdFromAtomic, sellerReportedCostUsd, parseBoundedBody, atomicStringFromUsdString, exactUsdString } from "./accounting.js";
 import { createFromOffer, intentManager } from "../payment-intent/manager.js";
+
 // Issue #67: the offer-evaluation wiring — one wiring shared with the free
 // x402_inspect tool (src/tools/inspector.ts) so selection never drifts.
 import { seamUsdOf, seamPolicyFor } from "./offer-evaluation.js";
@@ -916,13 +927,16 @@ export function registerFetchTool(server: McpServer): void {
 
       // Issue #54 (Option A — the post-send throw path): the catch block
       // below must know whether a payload was SIGNED (a send happened) and
-      // at what signed amount — the tri-state paid, the counted
-      // authorized_unserved row and its expires_at all read these after the
-      // paid leg throws. The bindings are hoisted out of the try: declared
-      // here, assigned inside (semantics unchanged).
+      // at what signed amount — the tri-state paid and the counted
+      // authorized_unserved row both read these after the paid leg throws.
+      // The bindings are hoisted out of the try: declared here, assigned
+      // inside (semantics unchanged).
       let intent: PaymentIntent | null = null;
       let blockedCode: IntentRejectCode | undefined;
       let signedAmountUsdc: number | undefined;
+      // The outgoing-payment signal: flips when an outgoing request carried
+      // a payment header (the paid request left the client).
+      let paidRequestSent = false;
       // Issue #53/#54: flips inside the enforcement hook right after the
       // intent is consumed — the only point where a signature may exist.
       let payloadSigned = false;
@@ -1079,7 +1093,18 @@ export function registerFetchTool(server: McpServer): void {
           // whole-map total (which NEVER includes the devnet bucket) for
           // every other leg — the per-service context's holds stay scoped to
           // the devnet-prefixed service scope exactly as computed above.
-          { dailySpentUsd: dailySpentOfBucket, perServiceSpentUsd: getPerServiceSpent(serviceHost) + reservedUsd(serviceScope) },
+          // Issue #54/GATE: the gate's daily figure must ALSO see the holds
+          // other overlapping calls placed since the ledger was last read —
+          // the hold sits in the leg's own daily-bucket scope
+          // (dailyHoldScope: 'global' for a mainnet leg, 'net:<bucket>' for
+          // a devnet leg), and an overlapping second call must be refused by
+          // the SAME rule that will refuse it at reserve time. Holds are
+          // only ever added to the spent side — never subtracted — so this
+          // can only tighten the gate. Per-service figure unchanged.
+          {
+            dailySpentUsd: dailySpentOfBucket + reservedUsd(dailyHoldScope(spendBucket)),
+            perServiceSpentUsd: getPerServiceSpent(serviceHost) + reservedUsd(serviceScope),
+          },
           getAnomalyInputs(url),
         );
         if (policyResult.decision !== "ALLOW") {
@@ -1387,7 +1412,15 @@ export function registerFetchTool(server: McpServer): void {
                 : selectedOffer !== undefined || probeRecord.status !== 402
                   ? replayFirstProbe(probeRecord, guardedFetch)
                   : guardedFetch;
-              const paidFetch = wrapFetchWithPayment(transport, client);
+              // Every request the SDK makes — unpaid replay probe and paid
+              // leg alike — passes through the tracking wrapper BEFORE the
+              // transport does, so a refusal or failure further down the
+              // chain still counts as an outgoing payment attempt (fail
+              // closed).
+              const trackedTransport = sentPaymentTracking(transport, (info) => {
+                paidRequestSent = info.sent;
+              });
+              const paidFetch = wrapFetchWithPayment(trackedTransport, client);
               // Issue #56+#80: the paid leg carries ONE repo-owned deadline
               // (X402_PAID_TIMEOUT_MS, default 30000 ms, parsed fail-closed by
               // replay.paidTimeoutMs): the controller's signal rides the SDK
@@ -1437,9 +1470,9 @@ export function registerFetchTool(server: McpServer): void {
           //                        carrying a tx hash — settlement evidence
           //                        exists, the send counts permanently;
           //   authorized_unserved  a signed payload was SENT without
-          //                        settlement evidence — the send counts until
-          //                        the sent payload's own validity (the
-          //                        intent's expiresAt) ends, then releases;
+          //                        settlement evidence — the outcome is
+          //                        UNKNOWN, so the send counts until the
+          //                        UTC day rollover (fail closed);
           //   failed               nothing was signed/sent, or a clear
           //                        pre-settlement refusal (the named control
           //                        above) — never counted.
@@ -1460,9 +1493,6 @@ export function registerFetchTool(server: McpServer): void {
               : payloadSigned && !isPreSettlementRefusal(resp.status, txHash)
                 ? "authorized_unserved"
                 : "failed";
-          // The sent payload's own validity bounds the authorized_unserved
-          // count (the intent's expiry); every other status has none.
-          const rowExpiresAt = rowStatus === "authorized_unserved" && intent !== null ? intent.expiresAt : undefined;
 
           // Issue #53: the recorded amount comes from the SIGNED payment only —
           // the intent amount via usdFromAtomic above — never from the seller's
@@ -1476,13 +1506,11 @@ export function registerFetchTool(server: McpServer): void {
           // fail-closed direction). Issue #54: the row's settled-spend field
           // equals the amount the ONE counted-spend predicate counts —
           // success and settled_unserved count permanently, a sent
-          // authorization counts until its own expiry (isCountedSpend), and
-          // cost_usdc equals the counted amount in EVERY branch below.
+          // authorization counts for the rest of the UTC day (its outcome
+          // is unknown; isCountedSpend), and cost_usdc equals the counted
+          // amount in EVERY branch below.
           const signedRecordedUsdc = payloadSigned ? (signedAmountUsdc ?? 0) : 0;
-          const rowCountsNow = isCountedSpend(
-            { status: rowStatus, ...(rowExpiresAt === undefined ? {} : { expires_at: rowExpiresAt }) },
-            Date.now(),
-          );
+          const rowCountsNow = isCountedSpend({ status: rowStatus }, Date.now());
           const recordedAmountUsdc = rowCountsNow ? signedRecordedUsdc : 0; // the row's amount_usdc
           // The price the flow attempted: the signed amount when a payload was
           // signed, else the probe estimate (used for nothing but display and
@@ -1507,8 +1535,7 @@ export function registerFetchTool(server: McpServer): void {
           // <status>` when the body is not JSON) and preserves the attempted
           // price in attempted_amount_usdc. The #54 counted branches (settled
           // unserved / sent authorization) add the settled-spend field and
-          // the signed audit trail on top, and the authorized_unserved row
-          // carries its validity expires_at: the reason field is never absent
+          // the signed audit trail on top: the reason field is never absent
           // on a non-200 row, whatever the row's status.
           const non200DetailFields = isSuccessfulPayment
             ? {}
@@ -1534,7 +1561,6 @@ export function registerFetchTool(server: McpServer): void {
             // devnet rows are bucketed by it, never into the mainnet totals.
             ...(probedOffer?.network ? { network: probedOffer.network } : {}),
             ...(rowCountsNow ? { amount_usdc: recordedAmountUsdc, ...intentTrail } : { amount_usdc: 0 }),
-            ...(rowExpiresAt === undefined ? {} : { expires_at: rowExpiresAt }),
             ...non200DetailFields,
             tx_hash: txHash,
             status: rowStatus,
@@ -1589,7 +1615,7 @@ export function registerFetchTool(server: McpServer): void {
                 served: isSuccessfulPayment,
                 cost_usdc: recordedAmountUsdc,
                 ...(rowStatus === "authorized_unserved"
-                  ? { note: "the signed payment was sent but the response carries no settlement evidence and the request was not served — do not retry blindly (this client never auto-retries a paid call); the amount counts against today's budget until the sent payload's validity expires" }
+                  ? { note: "the signed payment was sent but the response carries no settlement evidence and the request was not served — do not retry blindly (this client never auto-retries a paid call); because the outcome is unknown the amount counts against today's budget until the UTC day rollover" }
                   : {}),
                 // Issue #61: the deterministic selection is part of the
                 // output — what was paid (our vocabulary chain, the
@@ -1631,17 +1657,26 @@ export function registerFetchTool(server: McpServer): void {
           // Issue #80 (R1a): the paid-leg deadline is cleared exactly here —
           // the paid fetch AND its body read completed (or threw) by now.
           paidDeadline?.end();
-          if (payloadSigned) settleReservation(reservation.id);
+          if (payloadSigned && paidRequestSent) settleReservation(reservation.id);
           else releaseReservation(reservation.id);
         }
       } catch (err: any) {
         // Issue #54 (Option A, req 2): a throw AFTER the payload was signed
         // and sent is NOT a clean failure — settlement is unknown: the row
-        // counts (authorized_unserved; no tx hash can exist) until the sent
-        // payload's own validity (the intent's expiresAt) ends, and the
+        // counts (authorized_unserved; no tx hash can exist) until the UTC
+        // day rollover (the unknown outcome must never un-count), and the
         // per-service store moves identically (one predicate, both sides).
         // Only a path that never signed keeps the zero-spend failed row
         // exactly as before.
+        // Issue #92: the catch's classification needs the OUTGOING-REQUEST
+        // signal, not the payload-only one. The SDK can ABORT inside payload
+        // creation AFTER the local signing (an RPC 429/5xx in the scheme's
+        // metadata fetch) — payloadSigned is true, but the wrapper saw no
+        // request carrying a payment header: nothing left the client. That
+        // is a plain pre-send failure: a zero-amount failed row, paid "no",
+        // no counted spend, reservation released. Only a request the wrapper
+        // actually saw (paidRequestSent) earns the counted
+        // authorized_unserved row and the unknown tri-state.
         logPayment({
           timestamp: new Date().toISOString(),
           url,
@@ -1651,19 +1686,18 @@ export function registerFetchTool(server: McpServer): void {
           // carry it too — the audit trail is complete; only SUCCESS devnet
           // rows feed the devnet bucket).
           ...(probedOffer?.network ? { network: probedOffer.network } : {}),
-          ...(payloadSigned && intent !== null
+          ...(payloadSigned && paidRequestSent && intent !== null
             ? {
                 amount_usdc: signedAmountUsdc ?? 0,
                 amount_atomic: intent.amountAtomic,
                 decimals: intent.decimals,
                 ...(intent.asset !== "" ? { asset: intent.asset } : {}),
-                expires_at: intent.expiresAt,
                 status: "authorized_unserved" as const,
               }
             : { amount_usdc: 0, status: "failed" as const }),
           error: err.message,
         });
-        if (payloadSigned && intent !== null) {
+        if (payloadSigned && paidRequestSent && intent !== null) {
           recordServicePayment(url, signedAmountUsdc ?? 0);
         }
 
@@ -1707,7 +1741,7 @@ export function registerFetchTool(server: McpServer): void {
                 error: "PAID_TIMEOUT",
                 url,
                 chain: useChain,
-                ...(payloadSigned
+                ...(payloadSigned && paidRequestSent
                   ? {
                       paid: "unknown",
                       authorization_sent: true,
@@ -1719,7 +1753,7 @@ export function registerFetchTool(server: McpServer): void {
                 reasons: [{
                   code: "PAID_TIMEOUT",
                   message: payloadSigned
-                    ? "the signed payment was sent but the seller did not answer the paid request within the timeout bound — settlement is unknown; do not retry blindly (this client never auto-retries a paid call); the amount counts against today's budget until the sent payload's validity expires"
+                    ? "the signed payment was sent but the seller did not answer the paid request within the timeout bound — settlement is unknown; do not retry blindly (this client never auto-retries a paid call); because the outcome is unknown the amount counts against today's budget until the UTC day rollover"
                     : "the seller did not answer the paid request within the timeout bound",
                 }],
               }),
@@ -1739,17 +1773,21 @@ export function registerFetchTool(server: McpServer): void {
               chain: useChain,
               url,
               // Issue #54 (Option A): after a send, a throw is UNKNOWN
-              // spend, not a bare `paid: false` — the counted
-              // authorized_unserved row was already written above.
-              ...(payloadSigned
+              // spend — but "send" is the OUTGOING-REQUEST fact (issue
+              // #92): a payload that failed during creation after signing
+              // never left, so this is the pre-send failure case again:
+              // paid:false (the #54 "nothing was paid" spelling — retrying
+              // cannot double-pay), a zero-amount failed row, no counted
+              // spend.
+              ...(payloadSigned && paidRequestSent
                 ? {
                     paid: "unknown",
                     authorization_sent: true,
                     served: false,
                     cost_usdc: signedAmountUsdc ?? 0,
-                    note: "the signed payment was sent but the call failed without settlement evidence — do not retry blindly (this client never auto-retries a paid call); the amount counts against today's budget until the sent payload's validity expires",
+                    note: "the signed payment was sent but the call failed without settlement evidence — do not retry blindly (this client never auto-retries a paid call); because the outcome is unknown the amount counts against today's budget until the UTC day rollover",
                   }
-                : {}),
+                : { paid: false }),
             }),
           }],
         };

@@ -20,10 +20,21 @@
 // over-count direction that would hide spend is a restart-parity concern of
 // ledger rehydration, not of this registry.
 //
-// Caps come from MAX_DAILY_SPEND / MAX_PAYMENT_PER_CALL read LIVE per call
+// Caps come from MAX_DAILY_SPEND tightened through the policy layer's
+// payments.maxDaily (effectiveDailyCapUsd — the SMALLER of the two, never
+// wider than either source) / MAX_PAYMENT_PER_CALL read LIVE per call
 // (never cached at module load), exactly like checkSpendingLimit.
 
 import { getDailySpent, getDevnetDailySpent, getMaxDailySpend, getMaxPerCall, readCapUsd } from "./payment-utils.js";
+// The ONE float tolerance every USD-cap comparison uses (engine cap rules,
+// reservation checks) and the one money formatter for refusal texts.
+import { FLOAT_EPSILON_USD, formatUsd } from "./money.js";
+// The policy layer's own daily cap: the file/X402_POLICY_* operator cap the
+// policy engine's rule 7 enforces at fetch time. The reservation holds are
+// checked against the SAME cap (the smaller of the two sources), so an
+// overlapping call can never reserve budget the gate would refuse — and no
+// cycle results: policy/config.ts imports no accounting module.
+import { loadPolicyConfig } from "./policy/config.js";
 // Issue #65 (req 1): the ceiling reads every registered rail's spend through
 // the budget registry — ONE accounting read for the whole cross-chain total.
 import { getBudgets, railSpendUsd, RAIL_DISABLED_NO_RATE, type BudgetRail } from "./budget-registry.js";
@@ -51,13 +62,56 @@ interface Reservation {
 const active = new Map<string, Reservation>();
 let counter = 0;
 
-/** Float64 addition noise allowance for cap comparison: sums of 1e-2-scale
- * USD values land within ~1e-15 relative error, so `0.01 + 0.01 + 0.01`
- * exceeds the literal `0.03` cap by 2 ULP (~5.6e-18) — an epsilon of 1e-9
- * USD (a hundred-millionth of a cent) absorbs representation noise only; it
- * can never admit a genuinely larger amount (any semantic overshoot is
- * ≥ 1e-4, the ledger's recorded precision scale). */
-const FLOAT_EPSILON_USD = 1e-9;
+// ---------------------------------------------------------------------------
+// The EFFECTIVE daily cap. MAX_DAILY_SPEND and the policy layer's
+// payments.maxDaily are two operator-facing expressions of the same daily
+// budget; the gate enforces the policy number while this registry reserved
+// against the legacy env number — an overlapping call could hold past the
+// policy cap. The reservation compares with min(env, policy), which can only
+// tighten (each source's own value still binds), and it re-reads both every
+// call exactly like every cap here (never cached at module load).
+// ---------------------------------------------------------------------------
+
+interface EffectiveDailyCapParts {
+  /** cap to reserve against: min of both sources, 0 broken-configuration */
+  effective: number;
+  policyMaxDaily: number;
+  envMaxDaily: number;
+  errored: boolean;
+}
+
+function effectiveDailyCapParts(): EffectiveDailyCapParts {
+  const state = loadPolicyConfig();
+  if (state.configErrors.length > 0) {
+    // Fail closed: an unusable policy configuration reads cap 0 — the gate
+    // refuses the payment anyway on the same broken configuration
+    // (CONFIG_INVALID), and a reservation must never hold budget the gate
+    // will not grant. A hold looser than the gate is the widening danger;
+    // 0 holds nothing and refuses everything.
+    return { effective: 0, policyMaxDaily: 0, envMaxDaily: 0, errored: true };
+  }
+  const envMaxDaily = getMaxDailySpend();
+  const policyMaxDaily = state.config.payments.maxDaily;
+  return { effective: Math.min(envMaxDaily, policyMaxDaily), policyMaxDaily, envMaxDaily, errored: false };
+}
+
+/** The daily cap the reservation layer reserves against: the SMALLER of the
+ * legacy MAX_DAILY_SPEND knob and the policy layer's payments.maxDaily.
+ * min() can only tighten — with no policy file the default policy's cap
+ * mirrors the legacy env value and the result is byte-identical to the old
+ * knob; a broken configuration reads 0 (fail closed, matching the gate's
+ * CONFIG_INVALID refusal). */
+export function effectiveDailyCapUsd(): number {
+  return effectiveDailyCapParts().effective;
+}
+
+/** The reservation scope a hold carries for the DAILY cap: 'global' for a
+ * mainnet leg (every pre-bucket caller), 'net:<bucket>' for a devnet leg —
+ * a devnet hold must never reserve against the mainnet total. One helper so
+ * the gate's holds-read and the registry's hold-insert agree by construction. */
+export function dailyHoldScope(networkBucket?: string): string {
+  return networkBucket ? `net:${networkBucket}` : "global";
+}
 
 /** Reserve USD spend synchronously: check the caps and insert the hold as
  * one synchronous step (single-threaded atomicity). Returns the reservation
@@ -74,7 +128,7 @@ export function reserveSpend(input: ReservationInput): ReservationResult {
   // Dedupe while keeping order; the DAILY bucket scope participates: 'global'
   // for mainnet legs (issue #59/D7: a devnet hold carries the devnet bucket
   // scope ONLY — it must never reserve against the mainnet total).
-  const dailyScope = input.networkBucket ? `net:${input.networkBucket}` : "global";
+  const dailyScope = dailyHoldScope(input.networkBucket);
   const seen = new Set<string>([dailyScope]);
   const scopes: string[] = [dailyScope];
   for (const s of input.scopes ?? []) {
@@ -84,17 +138,27 @@ export function reserveSpend(input: ReservationInput): ReservationResult {
     }
   }
   const reservedGlobal = reservedUsd(dailyScope);
-  const maxDaily = getMaxDailySpend();
-  // Issue #59 (D7): a DEVNET reservation reads the devnet daily bucket's
-  // total against the same MAX_DAILY_SPEND cap; a mainnet reservation reads
+  // The effective daily cap (never widened past either source) and the
+  // bucket rule are unchanged: a DEVNET reservation reads the devnet daily
+  // bucket's total against the same cap; a mainnet reservation reads
   // today's mainnet total (the devnet bucket is excluded from it).
   const spent = input.networkBucket ? getDevnetDailySpent() : getDailySpent();
-  if (spent + reservedGlobal + amountUsd > maxDaily + FLOAT_EPSILON_USD) {
+  const capParts = effectiveDailyCapParts();
+  if (capParts.errored) {
     return {
       ok: false,
       reason:
-        `reserve $${amountUsd} would exceed MAX_DAILY_SPEND $${maxDaily} ` +
-        `(spent $${spent.toFixed(4)} + reserved $${reservedGlobal.toFixed(4)} today)`,
+        `reserve ${formatUsd(amountUsd)} exceeds the effective daily cap $0 — the policy configuration is ` +
+        `invalid and the spend path fails closed until it is fixed (spent ${spent.toFixed(4)} today)`,
+    };
+  }
+  if (spent + reservedGlobal + amountUsd > capParts.effective + FLOAT_EPSILON_USD) {
+    return {
+      ok: false,
+      reason:
+        `reserve ${formatUsd(amountUsd)} would exceed the effective daily cap ${formatUsd(capParts.effective)} ` +
+        `(policy payments.maxDaily ${formatUsd(capParts.policyMaxDaily)}, MAX_DAILY_SPEND ${formatUsd(capParts.envMaxDaily)}; ` +
+        `spent $${spent.toFixed(4)} + reserved $${reservedGlobal.toFixed(4)} today)`,
     };
   }
   // Issue #65 (req 4/5): the OPTIONAL cross-chain ceiling, evaluated in the

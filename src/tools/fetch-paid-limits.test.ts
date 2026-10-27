@@ -128,12 +128,13 @@ it('issue #56 (C8) + #54: a 5 MiB paid response body is read bounded — the cap
   assert.ok(row, 'every paid attempt leaves a ledger row');
   // Issue #54: the payment WAS signed and sent (the 5 MiB body belongs to
   // the paid leg's own response) — the throw after the send is the UNKNOWN
-  // case, never a bare failure: the row counts until the sent payload's own
-  // validity ends, and the agent is told paid is unknown, not false.
+  // case, never a bare failure: the row counts until the UTC day rollover
+  // (the outcome is unknown), and the agent is told paid is unknown, not
+  // false.
   assert.equal(row.status, 'authorized_unserved', 'a throw after the send is counted, not failed/0');
   assert.equal(row.amount_usdc, 0.01, 'the signed amount counts');
   assert.equal(row.tx_hash, undefined, 'no settlement evidence — no tx hash');
-  assert.equal(typeof row.expires_at, 'string', 'the counted row carries the sent payload’s validity');
+  assert.equal(typeof row.expires_at, 'undefined', 'the counted row carries no expiry — the unknown outcome counts to the UTC day rollover');
   assert.equal(row.error, 'Payment response exceeds size limit', 'the bounded read names its own cap');
   assert.equal(parsed.error, 'x402 payment failed');
   assert.equal(parsed.paid, 'unknown');
@@ -167,8 +168,8 @@ it('issue #56 (C8) + #54: a paid request that never answers refuses with the fix
   assert.equal(parsed.error, 'PAID_TIMEOUT', `the fixed refusal code, got: ${JSON.stringify(parsed)}`);
   assert.ok(elapsed < 10_000, `the timeout bound is honoured quickly (took ${elapsed}ms; the pre-#56 flow waits on undici's minutes-long defaults)`);
   // Issue #54: a timeout AFTER the send is exactly the unknown case — the
-  // agent is never told paid: false; the send is counted until the sent
-  // payload's own validity ends; and the message says do not retry blindly.
+  // agent is never told paid: false; the send is counted until the UTC day
+  // rollover; and the message says do not retry blindly.
   assert.equal(parsed.paid, 'unknown');
   assert.equal(parsed.authorization_sent, true);
   assert.equal(parsed.served, false);
@@ -178,7 +179,7 @@ it('issue #56 (C8) + #54: a paid request that never answers refuses with the fix
   assert.equal(row.status, 'authorized_unserved', 'the send counts, it is not failed/0');
   assert.equal(row.amount_usdc, 0.01);
   assert.equal(row.tx_hash, undefined, 'no settlement evidence — no tx hash');
-  assert.equal(typeof row.expires_at, 'string');
+  assert.equal(typeof row.expires_at, 'undefined', 'no expiry — the unknown outcome counts until the UTC day rollover');
   assert.equal(s.recorded.filter((r) => r.signed).length, 1, 'exactly one paid request — never retried');
 });
 
