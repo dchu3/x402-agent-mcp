@@ -5,24 +5,26 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 // ---------------------------------------------------------------------------
-// The hold's lifetime follows the SENT PAYLOAD's own validity, not the
-// 60-second intent TTL: an authorized_unserved row's expires_at is the MAX of
-// the intent's expiry (createdAt + TTL), the challenge's own validity span
-// (createdAt + maxTimeoutSeconds*1000 — the seller keeps the authorization
-// submittable that long), and for a Solana leg a conservative blockhash
-// bound (createdAt + SOLANA_TX_VALIDITY_MS = 150 s). A sent payment that can
-// still settle must keep counting its cap for as long as settlement is
-// possible — never less.
+// A sent-but-unproven payment is spend with an UNKNOWN outcome — it may have
+// settled, so the fail-closed direction is over-count: the
+// authorized_unserved row is written with NO expires_at and counts until the
+// UTC day rollover (the per-day counter's own reset ends the count). Nothing
+// else may release it: not the intent TTL, not the challenge's validity
+// span, not a Solana blockhash bound — a release at ~150 s would silently
+// un-count a payment that may already have settled on chain. The row also
+// carries NO signature: the client cannot know the on-chain signature at
+// payload time (on Solana the first wire-transaction signature slot is the
+// facilitator fee payer's and the client only partially signs), so settle
+// evidence comes only from the response receipt.
 //
 // The rows:
 //   - a non-200 paid response without a receipt records an
-//     authorized_unserved row (nothing settled, a send happened) whose
-//     expires_at follows the payload validity;
+//     authorized_unserved row (nothing settled, a send happened) with no
+//     expiry and no signature;
 //   - a throw AFTER the signed request left the client records the same row
-//     on the catch path; the row carries NO captured signature (the client
-//     cannot know the on-chain signature at payload time — settle evidence
-//     comes only from the response receipt);
-//   - the payload-validity expiry helper itself is pure and pinned directly.
+//     on the catch path;
+//   - both rows count immediately and a fresh process over the same ledger
+//     rehydrates the same total (restart parity).
 //
 // Drive the REAL x402_fetch flow against a loopback mock seller (the
 // hermetic fetch-accounting.test.ts pattern: boundable Base offer, throwaway
@@ -42,11 +44,7 @@ process.env.MAX_DAILY_SPEND = '50';
 process.env.EVM_PRIVATE_KEY = `0x${'11'.repeat(32)}`;
 
 const PM = (await import('../payment-utils.js')) as typeof import('../payment-utils.js');
-
-// Lazy-by-variables at the use sites (the helper export arrives with the feat
-// commit); the flow tests below fail on their row pins while it is absent.
-const FETCH_MODULE_PATH = './fetch.js';
-const fetchModRaw = await import(FETCH_MODULE_PATH).catch(() => undefined) as any;
+const { registerFetchTool } = await import('./fetch.js');
 
 const BASE_CAIP2 = 'eip155:8453';
 const BASE_USDC_ADDRESS = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
@@ -64,24 +62,13 @@ const realFetch = globalThis.fetch.bind(globalThis);
 
 function handler() {
   let callback: any;
-  if (typeof fetchModRaw?.registerFetchTool !== 'function') {
-    return () => { throw new Error('src/tools/fetch.ts must export registerFetchTool'); };
-  }
-  fetchModRaw.registerFetchTool({ tool: (_n: unknown, _d: unknown, _s: unknown, fn: unknown) => { callback = fn; } } as any);
+  registerFetchTool({ tool: (_n: unknown, _d: unknown, _s: unknown, fn: unknown) => { callback = fn; } } as any);
   return callback;
 }
 
 function ledgerRows(): any[] {
   if (!existsSync(process.env.PAYMENT_LOG_PATH!)) return [];
   return readFileSync(process.env.PAYMENT_LOG_PATH!, 'utf-8').split('\n').filter((l) => l.trim() !== '').map((l) => JSON.parse(l));
-}
-
-function requiresentPayloadExpiryIso(): (intent: { createdAt: string; expiresAt: string; validitySeconds: number }, isSolanaLeg: boolean) => string {
-  assert.ok(
-    fetchModRaw && typeof fetchModRaw.sentPayloadExpiryIso === 'function',
-    'src/tools/fetch.ts must export sentPayloadExpiryIso (the payload-validity expiry seam)',
-  );
-  return fetchModRaw.sentPayloadExpiryIso;
 }
 
 function challenge402(requestUrl: string, maxTimeoutSeconds: number): Response {
@@ -100,13 +87,19 @@ function noSignatureHeader(input: unknown, init: unknown): boolean {
 
 const tool = handler();
 
+let bust = 0;
+/** A "fresh process" read: a cache-busted instance whose FIRST counted read
+ * rehydrates from the CURRENT ledger — exactly what a restart would see. */
+async function restartedTotal(): Promise<number> {
+  const fresh = (await import(`../payment-utils.js?holdexpiry=${++bust}`)) as typeof import('../payment-utils.js');
+  return fresh.getDailySpent();
+}
+
 // ---------------------------------------------------------------------------
-// Row expiry — served-path row (non-200, no receipt → authorized_unserved).
-// The challenge grants 90 s validity; the intent TTL is 60 s; the row's
-// expires_at must follow the LONGER payload validity (≥ 85 s after the row
-// was written — the old row expired ≈ 60 s after intent creation).
+// Served-path row (non-200, no receipt → authorized_unserved). The outcome
+// is unknown — the row carries no expiry and counts for the rest of the day.
 // ---------------------------------------------------------------------------
-it('a settled-unreached (non-200, no receipt) row counts until the payload validity, not the intent TTL', async () => {
+it('a settled-unreached (non-200, no receipt) row counts fail-closed: no expires_at, no signature, to the UTC day rollover', async () => {
   const url = 'https://hold-expiry-500.invalid/api';
   globalThis.fetch = (async (input: unknown, init: unknown) => {
     const u = input instanceof Request ? input.url : String(input);
@@ -118,23 +111,23 @@ it('a settled-unreached (non-200, no receipt) row counts until the payload valid
   const result = await tool({ url });
   const parsed = JSON.parse(result.content[0].text);
   assert.equal(parsed.paid, 'unknown', 'the sent payment without evidence is an unknown outcome');
+  assert.match(String(parsed.note ?? ''), /UTC day rollover/i, 'the operator-facing note names the fail-closed bound');
 
   const row = ledgerRows().find((r) => r.url === url && r.status === 'authorized_unserved');
   assert.ok(row, 'the sent payment is recorded as authorized_unserved');
-  const holdSeconds = (Date.parse(row.expires_at) - Date.parse(row.timestamp)) / 1000;
-  assert.ok(holdSeconds >= 85, `the hold must span the challenge's 90 s validity (got ${holdSeconds.toFixed(1)} s)`);
-  assert.ok(holdSeconds <= 95, `the hold must not run far past it (got ${holdSeconds.toFixed(1)} s)`);
-  assert.ok(Math.abs(PM.getDailySpent() - dailyBefore - 0.01) < 1e-9, 'the sent payment counts while its payload is valid');
+  assert.ok(!('expires_at' in row), 'the row carries no expiry — nothing under the day rollover releases it');
+  assert.equal(row.signature, undefined, 'the client cannot know the on-chain signature at payload time — the row carries none');
+  assert.equal(PM.isCountedSpend(row, Date.now()), true, 'the row counts now');
+  assert.equal(PM.isCountedSpend(row, Date.now() + 150_000), true, 'no ~150 s release exists — the outcome is still unknown');
+  assert.equal(PM.isCountedSpend(row, Date.now() + 20 * 3_600_000), true, 'the row still counts twenty hours on (the UTC day rollover is the bound)');
+  assert.ok(Math.abs(PM.getDailySpent() - dailyBefore - 0.01) < 1e-9, 'the sent payment counts while its outcome is unknown');
+  assert.ok(Math.abs((await restartedTotal()) - PM.getDailySpent()) < 1e-9, 'a restarted process rehydrates the identical total');
 });
 
 // ---------------------------------------------------------------------------
-// Row expiry — the throw-after-send catch-path row. The row carries no
-// signature: the sent request's envelope cannot spell the on-chain
-// signature (on Solana the first wire-transaction signature slot is the
-// facilitator fee payer's; on EVM the payload signature is the
-// authorization, not the settlement tx).
+// The throw-after-send catch-path row: the same fail-closed shape.
 // ---------------------------------------------------------------------------
-it('a throw after the signed request left records the same validity-based expiry and no signature', async () => {
+it('a throw after the signed request left records the same no-expiry, no-signature counted row', async () => {
   const url = 'https://hold-expiry-throw.invalid/api';
   globalThis.fetch = (async (input: unknown, init: unknown) => {
     const u = input instanceof Request ? input.url : String(input);
@@ -151,29 +144,32 @@ it('a throw after the signed request left records the same validity-based expiry
 
   const row = ledgerRows().find((r) => r.url === url && r.status === 'authorized_unserved');
   assert.ok(row, 'the throw after send records an authorized_unserved row');
-  const holdSeconds = (Date.parse(row.expires_at) - Date.parse(row.timestamp)) / 1000;
-  assert.ok(holdSeconds >= 85, `the catch-path hold must span the 90 s validity (got ${holdSeconds.toFixed(1)} s)`);
-  assert.ok(holdSeconds <= 95, `the catch-path hold must not run far past it (got ${holdSeconds.toFixed(1)} s)`);
-  assert.equal(row.signature, undefined, 'the client cannot know the on-chain signature at payload time — the row carries none');
-  assert.ok(Math.abs(PM.getDailySpent() - dailyBefore - 0.01) < 1e-9, 'the sent payment counts while its payload is valid');
+  assert.ok(!('expires_at' in row), 'the catch-path row carries no expiry either');
+  assert.equal(row.signature, undefined, 'no signature is fabricated from the payload envelope');
+  assert.equal(PM.isCountedSpend(row, Date.now()), true, 'the row counts immediately');
+  assert.ok(Math.abs(PM.getDailySpent() - dailyBefore - 0.01) < 1e-9, 'the sent payment counts while its outcome is unknown');
+  assert.ok(Math.abs((await restartedTotal()) - PM.getDailySpent()) < 1e-9, 'restart parity on the catch-path row too');
 });
 
 // ---------------------------------------------------------------------------
-// The helper itself: max(intent TTL expiry, challenge validity span, Solana
-// blockhash bound) — pure, ISO out, all three sources.
+// Legacy-read semantics: a row written BEFORE the fail-closed change still
+// carries its old expires_at — the read path honours it (a past expiry still
+// releases; the ledger is never rewritten).
 // ---------------------------------------------------------------------------
-it('sentPayloadExpiryIso is the max of the three validity sources per leg', () => {
-  const sentPayloadExpiryIso = requiresentPayloadExpiryIso();
-  const T0 = '2026-10-27T12:00:00.000Z';
-  const iso = (ms: number) => new Date(ms).toISOString();
-  const t0 = Date.parse(T0);
-  const mk = (validitySeconds: number) => ({ createdAt: T0, expiresAt: iso(t0 + 60_000), validitySeconds });
-
-  assert.equal(sentPayloadExpiryIso(mk(90), false), iso(t0 + 90_000), 'a longer challenge validity beats the 60 s intent TTL');
-  assert.equal(sentPayloadExpiryIso(mk(30), false), iso(t0 + 60_000), 'the intent TTL beats a shorter validity');
-  assert.equal(sentPayloadExpiryIso(mk(200), false), iso(t0 + 200_000));
-  assert.equal(sentPayloadExpiryIso(mk(0), false), iso(t0 + 60_000), 'an absent/zero validity is skipped');
-  assert.equal(sentPayloadExpiryIso(mk(90), true), iso(t0 + 150_000), 'a Solana leg counts until the blockhash bound at minimum');
-  assert.equal(sentPayloadExpiryIso(mk(200), true), iso(t0 + 200_000), 'a longer challenge validity beats the blockhash bound');
-  assert.equal(sentPayloadExpiryIso(mk(0), true), iso(t0 + 150_000));
+it('a legacy authorized_unserved row with a past expires_at still releases (backward-compatible read)', () => {
+  const legacy = {
+    timestamp: new Date(Date.now() - 10 * 60_000).toISOString(),
+    url: 'https://legacy-expired.invalid/api',
+    method: 'GET',
+    chain: 'base',
+    amount_usdc: 0.05,
+    status: 'authorized_unserved',
+    expires_at: new Date(Date.now() - 60_000).toISOString(),
+  };
+  assert.equal(PM.isCountedSpend(legacy, Date.now()), false, 'a legacy row past its expiry releases exactly as before');
+  assert.equal(
+    PM.isCountedSpend({ ...legacy, expires_at: new Date(Date.now() + 60_000).toISOString() }, Date.now()),
+    true,
+    'a legacy row inside its expiry still counts',
+  );
 });

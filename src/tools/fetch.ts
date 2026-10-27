@@ -58,45 +58,6 @@ import { untrustedText, stripUntrusted, PROBE_UNTRUSTED_MAX, CHALLENGE_UNTRUSTED
 import { usdFromAtomic, sellerReportedCostUsd, parseBoundedBody, atomicStringFromUsdString, exactUsdString } from "./accounting.js";
 import { createFromOffer, intentManager } from "../payment-intent/manager.js";
 
-// ---------------------------------------------------------------------------
-// The SENT PAYLOAD's own validity: an authorized_unserved row counts until
-// the sent payment can no longer settle. The sent payload stays submittable
-// for the LONGEST of:
-//   - the intent's own TTL (its expiresAt — the 60 s default),
-//   - the challenge's validity span (maxTimeoutSeconds — the seller keeps
-//     the authorization submittable that long),
-//   - and, for a Solana leg, a conservative blockhash bound (150 s): the
-//     blockhash the wire transaction pins stops being valid at blockheight,
-//     but the bound here must err OVER — a possibly-settling payment that
-//     stopped counting would un-count settled spend.
-// Pure (no clock, no env): the flow passes the intent fields, the caller
-// decides the leg.
-// ---------------------------------------------------------------------------
-
-/** Conservative upper bound on the window a signed Solana wire transaction
- * can still settle (blockhash validity; err on the over-count side). */
-export const SOLANA_TX_VALIDITY_MS = 150_000;
-
-/** The ISO instant the sent payload's counting window ends: the max of the
- * three validity sources. With nothing parseable the intent's expiresAt is
- * passed through verbatim (isCountedSpend fails closed on unparseable
- * expiries — the row keeps counting). */
-export function sentPayloadExpiryIso(
-  intent: Pick<PaymentIntent, "createdAt" | "expiresAt" | "validitySeconds">,
-  isSolanaLeg: boolean,
-): string {
-  const created = Date.parse(intent.createdAt);
-  const candidates = [Date.parse(intent.expiresAt)];
-  if (Number.isFinite(created)) {
-    if (Number.isFinite(intent.validitySeconds) && intent.validitySeconds > 0) {
-      candidates.push(created + intent.validitySeconds * 1000);
-    }
-    if (isSolanaLeg) candidates.push(created + SOLANA_TX_VALIDITY_MS);
-  }
-  const valid = candidates.filter((c) => Number.isFinite(c));
-  if (valid.length === 0) return intent.expiresAt;
-  return new Date(Math.max(...valid)).toISOString();
-}
 // Issue #67: the offer-evaluation wiring — one wiring shared with the free
 // x402_inspect tool (src/tools/inspector.ts) so selection never drifts.
 import { seamUsdOf, seamPolicyFor } from "./offer-evaluation.js";
@@ -966,10 +927,10 @@ export function registerFetchTool(server: McpServer): void {
 
       // Issue #54 (Option A — the post-send throw path): the catch block
       // below must know whether a payload was SIGNED (a send happened) and
-      // at what signed amount — the tri-state paid, the counted
-      // authorized_unserved row and its expires_at all read these after the
-      // paid leg throws. The bindings are hoisted out of the try: declared
-      // here, assigned inside (semantics unchanged).
+      // at what signed amount — the tri-state paid and the counted
+      // authorized_unserved row both read these after the paid leg throws.
+      // The bindings are hoisted out of the try: declared here, assigned
+      // inside (semantics unchanged).
       let intent: PaymentIntent | null = null;
       let blockedCode: IntentRejectCode | undefined;
       let signedAmountUsdc: number | undefined;
@@ -1509,9 +1470,9 @@ export function registerFetchTool(server: McpServer): void {
           //                        carrying a tx hash — settlement evidence
           //                        exists, the send counts permanently;
           //   authorized_unserved  a signed payload was SENT without
-          //                        settlement evidence — the send counts until
-          //                        the sent payload's own validity (the
-          //                        intent's expiresAt) ends, then releases;
+          //                        settlement evidence — the outcome is
+          //                        UNKNOWN, so the send counts until the
+          //                        UTC day rollover (fail closed);
           //   failed               nothing was signed/sent, or a clear
           //                        pre-settlement refusal (the named control
           //                        above) — never counted.
@@ -1532,11 +1493,6 @@ export function registerFetchTool(server: McpServer): void {
               : payloadSigned && !isPreSettlementRefusal(resp.status, txHash)
                 ? "authorized_unserved"
                 : "failed";
-          // The sent payload's own validity bounds the authorized_unserved
-          // count — the MAX of the intent expiry, the challenge's validity
-          // span and (Solana legs) the blockhash bound: a sent payment that
-          // can still settle keeps counting. Every other status has none.
-          const rowExpiresAt = rowStatus === "authorized_unserved" && intent !== null ? sentPayloadExpiryIso(intent, useChain === "solana") : undefined;
 
           // Issue #53: the recorded amount comes from the SIGNED payment only —
           // the intent amount via usdFromAtomic above — never from the seller's
@@ -1550,13 +1506,11 @@ export function registerFetchTool(server: McpServer): void {
           // fail-closed direction). Issue #54: the row's settled-spend field
           // equals the amount the ONE counted-spend predicate counts —
           // success and settled_unserved count permanently, a sent
-          // authorization counts until its own expiry (isCountedSpend), and
-          // cost_usdc equals the counted amount in EVERY branch below.
+          // authorization counts for the rest of the UTC day (its outcome
+          // is unknown; isCountedSpend), and cost_usdc equals the counted
+          // amount in EVERY branch below.
           const signedRecordedUsdc = payloadSigned ? (signedAmountUsdc ?? 0) : 0;
-          const rowCountsNow = isCountedSpend(
-            { status: rowStatus, ...(rowExpiresAt === undefined ? {} : { expires_at: rowExpiresAt }) },
-            Date.now(),
-          );
+          const rowCountsNow = isCountedSpend({ status: rowStatus }, Date.now());
           const recordedAmountUsdc = rowCountsNow ? signedRecordedUsdc : 0; // the row's amount_usdc
           // The price the flow attempted: the signed amount when a payload was
           // signed, else the probe estimate (used for nothing but display and
@@ -1581,8 +1535,7 @@ export function registerFetchTool(server: McpServer): void {
           // <status>` when the body is not JSON) and preserves the attempted
           // price in attempted_amount_usdc. The #54 counted branches (settled
           // unserved / sent authorization) add the settled-spend field and
-          // the signed audit trail on top, and the authorized_unserved row
-          // carries its validity expires_at: the reason field is never absent
+          // the signed audit trail on top: the reason field is never absent
           // on a non-200 row, whatever the row's status.
           const non200DetailFields = isSuccessfulPayment
             ? {}
@@ -1608,7 +1561,6 @@ export function registerFetchTool(server: McpServer): void {
             // devnet rows are bucketed by it, never into the mainnet totals.
             ...(probedOffer?.network ? { network: probedOffer.network } : {}),
             ...(rowCountsNow ? { amount_usdc: recordedAmountUsdc, ...intentTrail } : { amount_usdc: 0 }),
-            ...(rowExpiresAt === undefined ? {} : { expires_at: rowExpiresAt }),
             ...non200DetailFields,
             tx_hash: txHash,
             status: rowStatus,
@@ -1663,7 +1615,7 @@ export function registerFetchTool(server: McpServer): void {
                 served: isSuccessfulPayment,
                 cost_usdc: recordedAmountUsdc,
                 ...(rowStatus === "authorized_unserved"
-                  ? { note: "the signed payment was sent but the response carries no settlement evidence and the request was not served — do not retry blindly (this client never auto-retries a paid call); the amount counts against today's budget until the sent payload's validity expires" }
+                  ? { note: "the signed payment was sent but the response carries no settlement evidence and the request was not served — do not retry blindly (this client never auto-retries a paid call); because the outcome is unknown the amount counts against today's budget until the UTC day rollover" }
                   : {}),
                 // Issue #61: the deterministic selection is part of the
                 // output — what was paid (our vocabulary chain, the
@@ -1711,8 +1663,8 @@ export function registerFetchTool(server: McpServer): void {
       } catch (err: any) {
         // Issue #54 (Option A, req 2): a throw AFTER the payload was signed
         // and sent is NOT a clean failure — settlement is unknown: the row
-        // counts (authorized_unserved; no tx hash can exist) until the sent
-        // payload's own validity (the intent's expiresAt) ends, and the
+        // counts (authorized_unserved; no tx hash can exist) until the UTC
+        // day rollover (the unknown outcome must never un-count), and the
         // per-service store moves identically (one predicate, both sides).
         // Only a path that never signed keeps the zero-spend failed row
         // exactly as before.
@@ -1740,7 +1692,6 @@ export function registerFetchTool(server: McpServer): void {
                 amount_atomic: intent.amountAtomic,
                 decimals: intent.decimals,
                 ...(intent.asset !== "" ? { asset: intent.asset } : {}),
-                expires_at: sentPayloadExpiryIso(intent, useChain === "solana"),
                 status: "authorized_unserved" as const,
               }
             : { amount_usdc: 0, status: "failed" as const }),
@@ -1802,7 +1753,7 @@ export function registerFetchTool(server: McpServer): void {
                 reasons: [{
                   code: "PAID_TIMEOUT",
                   message: payloadSigned
-                    ? "the signed payment was sent but the seller did not answer the paid request within the timeout bound — settlement is unknown; do not retry blindly (this client never auto-retries a paid call); the amount counts against today's budget until the sent payload's validity expires"
+                    ? "the signed payment was sent but the seller did not answer the paid request within the timeout bound — settlement is unknown; do not retry blindly (this client never auto-retries a paid call); because the outcome is unknown the amount counts against today's budget until the UTC day rollover"
                     : "the seller did not answer the paid request within the timeout bound",
                 }],
               }),
@@ -1834,7 +1785,7 @@ export function registerFetchTool(server: McpServer): void {
                     authorization_sent: true,
                     served: false,
                     cost_usdc: signedAmountUsdc ?? 0,
-                    note: "the signed payment was sent but the call failed without settlement evidence — do not retry blindly (this client never auto-retries a paid call); the amount counts against today's budget until the sent payload's validity expires",
+                    note: "the signed payment was sent but the call failed without settlement evidence — do not retry blindly (this client never auto-retries a paid call); because the outcome is unknown the amount counts against today's budget until the UTC day rollover",
                   }
                 : { paid: false }),
             }),

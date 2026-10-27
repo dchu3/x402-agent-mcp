@@ -12,7 +12,7 @@ import { join } from 'node:path';
 //   200                                → status "success"            paid: true,  served: true
 //   non-200 + success receipt (tx)     → status "settled_unserved"   paid: true,  served: false
 //   non-200, no receipt, no refusal    → status "authorized_unserved" paid: "unknown", served: false
-//                                        (+ expires_at: the sent payload's own validity)
+//                                        (the outcome is unknown: counted for the rest of the UTC day)
 //   402/4xx rejection, no receipt      → status "failed"             paid: false (acceptance test 6:
 //                                        a refusal before settlement is not a send, nothing counts)
 //
@@ -153,7 +153,7 @@ it('502 with a success receipt → settled_unserved: counted, paid true, served 
   assert.equal(restarted.getDailySpent(), getDailySpent(), 'PARITY: settled_unserved rehydrates identically after a restart');
 });
 
-it('500 without a receipt → authorized_unserved + expires_at: counted until the sent payload expires, paid "unknown"', async () => {
+it('500 without a receipt → authorized_unserved with NO expiry: fail-closed counted until the UTC day rollover, paid "unknown"', async () => {
   process.env.MAX_PAYMENT_PER_CALL = '50';
   process.env.MAX_DAILY_SPEND = '50';
   const host = 'ledger-500-test.invalid';
@@ -182,8 +182,8 @@ it('500 without a receipt → authorized_unserved + expires_at: counted until th
   assert.equal(row?.tx_hash, undefined, 'no settlement evidence exists — no tx hash');
   assert.equal(row?.http_status, 500, 'the non-200 detail is still audited (#45)');
   assert.equal(row?.error, 'HTTP 500', 'the reason field is never absent on a non-200 row');
-  assert.equal(typeof row?.expires_at, 'string', 'the row carries the sent payload’s own validity');
-  assert.ok(Date.parse(row.expires_at) > Date.now(), 'the validity is in the future at send time (it is what bounds the count)');
+  assert.ok(!('expires_at' in row), 'the outcome is unknown — the row carries no expiry, it counts to the UTC day rollover');
+  assert.equal(row?.signature, undefined, 'the client cannot know the on-chain signature at payload time — the row carries none');
   assert.equal(getDailySpent(), dailyBefore + 0.01, 'the daily budget counts the sent authorization');
   assert.equal(store.getPerServiceSpent(host), serviceBefore + 0.01, 'the per-service budget counts it too');
   // Restart parity through the SAME predicate.
@@ -281,7 +281,8 @@ it('a dropped socket after the signed send → paid "unknown", counted row, no s
     assert.equal(row?.status, 'authorized_unserved', 'the counted row keeps the true outcome');
     assert.equal(row?.amount_usdc, 0.01);
     assert.equal(row?.tx_hash, undefined, 'no settlement evidence exists — no tx hash');
-    assert.equal(typeof row?.expires_at, 'string', 'the counted row carries the sent payload’s validity');
+    assert.ok(!('expires_at' in row), 'the counted row carries no expiry — the unknown outcome counts until the UTC day rollover');
+    assert.equal(row?.signature, undefined, 'no signature is fabricated from the payload envelope');
   } finally {
     server.close();
   }

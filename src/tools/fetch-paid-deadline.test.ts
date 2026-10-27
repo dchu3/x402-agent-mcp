@@ -190,7 +190,7 @@ async function assertDeadlineFires(scenario: Scenario, configuredMs: number | un
   assert.equal(row.status, 'authorized_unserved', 'the send counts, it is not failed/0');
   assert.equal(row.amount_usdc, 0.01);
   assert.equal(row.tx_hash, undefined, 'no settlement evidence — no tx hash');
-  assert.equal(typeof row.expires_at, 'string', 'the counted row carries the sent payload’s validity');
+  assert.equal(typeof row.expires_at, 'undefined', 'the counted row carries no expiry — the unknown outcome counts until the UTC day rollover');
   assert.equal(s.recorded.length, 2, 'probe + exactly one paid leg (the SDK first request rides the probe replay, issue #61)');
   assert.equal(s.recorded.filter((r) => r.signed).length, 1, 'exactly one signed request — never retried');
   return { s, before };
@@ -242,10 +242,9 @@ it('issue #80 (R1b verify): the post-send-timeout ledger row shows the signed am
   assert.equal(row.amount_usdc, 0.01, 'the signed amount is on the row');
   assert.equal(isCountedSpend(row, Date.now()), true, 'the row counts under the one counted-spend predicate');
   // Restart parity: a fresh module against the SAME ledger must count EXACTLY
-  // the rows the one predicate counts right now (older tests' sent rows
-  // legitimately release when their own payload validity expires — the
-  // assertion derives the expectation from the predicate instead of assuming
-  // every earlier row still counts).
+  // the rows the one predicate counts right now (the assertion derives the
+  // expectation from the predicate instead of assuming every earlier row
+  // still counts).
   const restarted = await import(`../payment-utils.js?r1b=${Date.now()}`) as typeof import('../payment-utils.js');
   const today = new Date().toISOString().slice(0, 10);
   const expectedRestarted = ledgerLines()
