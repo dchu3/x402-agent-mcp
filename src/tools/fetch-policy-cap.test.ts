@@ -137,11 +137,17 @@ function releaseSigned(url: string): void {
 }
 
 async function waitUntil(predicate: () => boolean, what: string): Promise<void> {
-  for (let i = 0; i < 2000; i++) {
+  // Wall-clock deadline, not a tick count: on a loaded runner 2000 immediate
+  // ticks can elapse before the pipeline reaches the awaited leg, so the
+  // budget is elapsed time. Still yields with setImmediate between checks.
+  const start = Date.now();
+  const deadline = start + 20_000;
+  while (Date.now() < deadline) {
     if (predicate()) return;
     await new Promise((resolve) => setImmediate(resolve));
   }
-  assert.ok(false, `timed out waiting for ${what}`);
+  if (predicate()) return; // may have flipped during the final yield
+  assert.ok(false, `timed out after ${Date.now() - start} ms waiting for ${what}`);
 }
 
 const tool = handler();
